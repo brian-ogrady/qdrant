@@ -1,5 +1,6 @@
 mod test_compact_graph_layer;
 mod test_graph_connectivity;
+mod test_puffin_serialization;
 
 use common::types::PointOffsetType;
 use rand::Rng;
