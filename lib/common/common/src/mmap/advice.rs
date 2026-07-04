@@ -304,6 +304,39 @@ pub fn will_need_multiple_pages(region: &[u8]) {
 #[cfg(not(unix))]
 pub fn will_need_multiple_pages(_region: &[u8]) {}
 
+/// Range-scoped MADV_DONTNEED for a read-only, file-backed mmap.
+///
+/// # Why this is safe
+///
+/// memmap2 places `UncheckedAdvice::DontNeed` behind an unsafe gate because on
+/// writable (`MmapMut`) or MAP_PRIVATE mappings `MADV_DONTNEED` can discard
+/// modified pages — that is the data-loss path. Neither condition can apply
+/// to a caller of THIS function: `&memmap2::Mmap` is a shared, read-only,
+/// file-backed mapping. Discarding resident pages only forces subsequent reads
+/// to refault the same bytes from the underlying file. No data is lost, no
+/// aliased write is observable. The Rust type system enforces the read-only
+/// precondition — no per-call-site SAFETY reasoning required.
+#[cfg(unix)]
+pub fn dontneed_range(
+    mmap: &memmap2::Mmap,
+    offset: usize,
+    length: usize,
+) -> io::Result<()> {
+    // SAFETY: read-only file-backed mmap ⇒ MADV_DONTNEED has no data-loss path.
+    unsafe {
+        mmap.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, offset, length)
+    }
+}
+
+#[cfg(not(unix))]
+pub fn dontneed_range(
+    _mmap: &memmap2::Mmap,
+    _offset: usize,
+    _length: usize,
+) -> io::Result<()> {
+    Ok(())
+}
+
 /// Returns the system page size in bytes, or `None` if it could not be determined.
 ///
 /// Cached after first call. Typically 4096 on x86_64, 16384 on aarch64 macOS.

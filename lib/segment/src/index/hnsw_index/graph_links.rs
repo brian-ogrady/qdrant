@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use common::generic_consts::Sequential;
+use common::mmap::advice::dontneed_range;
 use common::mmap::{Advice, AdviceSetting, Madviseable, open_read_mmap};
 use common::types::PointOffsetType;
 use common::universal_io::{UniversalReadFs, read_whole_via};
@@ -204,6 +205,14 @@ self_cell::self_cell! {
 enum GraphLinksEnum {
     Ram(Vec<u8>),
     Mmap(Arc<Mmap>),
+    /// A sub-range of a mmap shared with other blobs in a single container file
+    /// (see spec §6.3). The `Arc<Mmap>` is owned by the self_cell exactly as the
+    /// `Mmap` variant is; `offset` + `length` bound the links slice inside it.
+    MmapRanged {
+        mmap: Arc<Mmap>,
+        offset: usize,
+        length: usize,
+    },
 }
 
 impl GraphLinksEnum {
@@ -211,7 +220,56 @@ impl GraphLinksEnum {
         match self {
             GraphLinksEnum::Ram(data) => data.as_slice(),
             GraphLinksEnum::Mmap(mmap) => &mmap[..],
+            GraphLinksEnum::MmapRanged { mmap, offset, length } => {
+                &mmap[*offset..*offset + *length]
+            }
         }
+    }
+}
+
+/// Platform-independent advice for the ranged madvise helper. Only the two
+/// variants the `MmapRanged` arms need — kept local to this module so we don't
+/// enlarge the surface of `common::mmap::advice::Advice` for one caller.
+/// Mirrors that module's `#[cfg(unix)] impl From<...> for memmap2::Advice`
+/// pattern so `memmap2::Advice` and `memmap2::UncheckedAdvice` never appear
+/// outside a `cfg(unix)` gate.
+#[derive(Copy, Clone, Debug)]
+enum RangeAdvice {
+    WillNeed,
+    DontNeed,
+}
+
+/// Issue a range-scoped `madvise` on the given mmap. Log-and-swallow on error
+/// to match the convention of the existing full-map `populate` / `clear_cache`
+/// implementations (advisory calls; failure is non-fatal). On non-Unix both
+/// branches are no-ops (matching `Madviseable::advise_impl` and
+/// `dontneed_range`'s cfg fallback).
+///
+/// This function contains no `unsafe`. `WillNeed` uses memmap2's safe
+/// `Mmap::advise_range`; `DontNeed` delegates to
+/// `common::mmap::advice::dontneed_range`, whose type-level `&Mmap` (read-only,
+/// file-backed) precondition eliminates the data-loss path that motivates
+/// memmap2's `UncheckedAdvice` gating.
+fn madvise_range(mmap: &Mmap, offset: usize, length: usize, advice: RangeAdvice) {
+    let res: std::io::Result<()> = match advice {
+        RangeAdvice::WillNeed => {
+            #[cfg(unix)]
+            {
+                mmap.advise_range(memmap2::Advice::WillNeed, offset, length)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (mmap, offset, length);
+                Ok(())
+            }
+        }
+        RangeAdvice::DontNeed => dontneed_range(mmap, offset, length),
+    };
+    if let Err(err) = res {
+        log::warn!(
+            "madvise({advice:?}) on links range [{offset}..{}] failed: {err}",
+            offset + length,
+        );
     }
 }
 
@@ -237,6 +295,49 @@ impl GraphLinks {
         Self::try_new(GraphLinksEnum::Mmap(Arc::new(mmap)), |x| {
             GraphLinksView::load(x.as_bytes(), format)
         })
+    }
+
+    /// Load links from a sub-range of an `Arc<Mmap>` shared with other blobs in
+    /// a single container file (see spec §6.3). The mmap is owned by the
+    /// resulting `GraphLinks` via `GraphLinksEnum::MmapRanged`, exactly as the
+    /// `Mmap` variant owns its whole-file mapping — the self_cell encapsulates
+    /// the borrow of the view over the sub-slice.
+    ///
+    /// Rejects any range that overflows `usize` arithmetic or exceeds the
+    /// mmap length. Callers passing an untrusted footer must be sure this
+    /// check is reached — it is the last line of defense against a malicious
+    /// or corrupt Puffin footer.
+    pub fn load_from_ranged_mmap(
+        shared_mmap: Arc<Mmap>,
+        offset: u64,
+        length: u64,
+        format: GraphLinksFormat,
+    ) -> OperationResult<Self> {
+        let o = usize::try_from(offset).map_err(|_| {
+            OperationError::service_error(format!("offset {offset} does not fit in usize"))
+        })?;
+        let l = usize::try_from(length).map_err(|_| {
+            OperationError::service_error(format!("length {length} does not fit in usize"))
+        })?;
+        let end = o.checked_add(l).ok_or_else(|| {
+            OperationError::service_error(format!(
+                "links slice range overflows usize: offset={o}, length={l}"
+            ))
+        })?;
+        if end > shared_mmap.len() {
+            return Err(OperationError::service_error(format!(
+                "links slice [{o}..{end}] exceeds file capacity ({})",
+                shared_mmap.len(),
+            )));
+        }
+        Self::try_new(
+            GraphLinksEnum::MmapRanged {
+                mmap: shared_mmap,
+                offset: o,
+                length: l,
+            },
+            |owner| GraphLinksView::load(owner.as_bytes(), format),
+        )
     }
 
     pub fn new_from_edges(
@@ -334,6 +435,9 @@ impl GraphLinks {
     pub fn populate(&self) -> OperationResult<()> {
         match self.borrow_owner() {
             GraphLinksEnum::Mmap(mmap) => mmap.populate(),
+            GraphLinksEnum::MmapRanged { mmap, offset, length } => {
+                madvise_range(mmap, *offset, *length, RangeAdvice::WillNeed);
+            }
             GraphLinksEnum::Ram(_) => {}
         };
         Ok(())
@@ -343,6 +447,9 @@ impl GraphLinks {
     pub fn clear_cache(&self) -> OperationResult<()> {
         match self.borrow_owner() {
             GraphLinksEnum::Mmap(mmap) => mmap.clear_cache(),
+            GraphLinksEnum::MmapRanged { mmap, offset, length } => {
+                madvise_range(mmap, *offset, *length, RangeAdvice::DontNeed);
+            }
             GraphLinksEnum::Ram(_) => {}
         };
         Ok(())

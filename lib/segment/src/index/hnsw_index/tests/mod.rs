@@ -1,5 +1,7 @@
+mod puffin_shared;
 mod test_compact_graph_layer;
 mod test_graph_connectivity;
+mod test_puffin_deserialization;
 mod test_puffin_serialization;
 
 use common::types::PointOffsetType;
