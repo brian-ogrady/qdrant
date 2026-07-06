@@ -1866,3 +1866,231 @@ fn test_phase4c_full_scale_run() {
     println!("Phase 4c full-scale run: complete");
     println!("========================================");
 }
+
+// -------- Phase 4d: quantized-scored HNSW traversal latency ---------------
+//
+// The production hot path a disaggregated Edge would run: HNSW graph
+// traversal scored against the container's 1-bit binary quantized bytes.
+// All prior warm-path tables (Phase 3 recall + Phase 4/4c) score with a
+// full-precision scaffold — that configuration cannot exist on a
+// disaggregated edge (no f32 vectors locally; §6.2). Phase 4d builds the
+// same graph the container carries and searches it via QuantizedVectors'
+// raw_scorer, giving the honest quantized traversal number.
+//
+// Env-gated by PUFFIN_FIXTURE_N: default 100_000, or set to 999_980 for 1M.
+// No S3 required; no container round-trip; graph is rebuilt in RAM with
+// the same seed the container fixture uses so the graph is bit-identical
+// to what would be loaded from a container.
+
+fn phase4d_scaffold_and_graph_for_n(
+    n: usize,
+) -> Option<(super::puffin_shared::RealDataFixture, super::puffin_shared::RealDataScaffold, super::puffin_shared::QuantizedRealDataScaffold, GraphLayers)> {
+    use super::puffin_shared::{FIXTURE_100K, FIXTURE_1M, QuantizedRealDataScaffold, try_load_real_data_from};
+    let files = if n == 999_980 { &FIXTURE_1M } else { &FIXTURE_100K };
+    let rd = try_load_real_data_from(files, n)?;
+
+    // Full-precision scaffold (used to BUILD the graph — same as fixture).
+    let fp_scaffold = RealDataScaffold::new(Distance::Dot, &rd.body);
+
+    // Build the graph with the same seed the container fixture uses so
+    // this graph is bit-identical to what a container-loaded GraphLayers
+    // would carry. Phase 4c used FIXTURE_SEED + 0x4000 (matched the 100k
+    // fixture's mapping variant) — use the same offset here so the 1M
+    // graph matches the 4c container's graph exactly.
+    let mut level_rng = rand::rngs::StdRng::seed_from_u64(FIXTURE_SEED.wrapping_add(0x4000));
+    use crate::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
+    use crate::index::hnsw_index::graph_links::GraphLinksFormatParam;
+    let mut builder = GraphLayersBuilder::new(
+        rd.body.len(),
+        HnswM::new2(16),
+        /* ef_construct */ 100,
+        /* entry_points_num */ 10,
+        /* use_heuristic */ true,
+    );
+    for idx in 0..rd.body.len() as PointOffsetType {
+        let level = builder.get_random_layer(&mut level_rng);
+        builder.set_levels(idx, level);
+        builder.link_new_point(idx, fp_scaffold.internal_scorer(idx));
+    }
+    let graph_layers = builder.into_graph_layers_ram(GraphLinksFormatParam::Compressed);
+
+    // Quantized scaffold — the search path uses this. Built from the same
+    // vectors so its bytes match the container's quantized blob shape.
+    let q_scaffold = QuantizedRealDataScaffold::new(&rd.body);
+
+    Some((rd, fp_scaffold, q_scaffold, graph_layers))
+}
+
+fn phase4d_measure(
+    q_scaffold: &super::puffin_shared::QuantizedRealDataScaffold,
+    graph_layers: &GraphLayers,
+    queries: &[Vec<f32>],
+    ef: usize,
+    reps: usize,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    // Returns (per-rep p50 samples, per-rep p95 samples, ALL per-query samples pooled).
+    let is_stopped = AtomicBool::new(false);
+    let mut p50_samples: Vec<f64> = Vec::with_capacity(reps);
+    let mut p95_samples: Vec<f64> = Vec::with_capacity(reps);
+    let mut pooled: Vec<f64> = Vec::with_capacity(reps * queries.len());
+    for _ in 0..reps {
+        let mut micros: Vec<f64> = Vec::with_capacity(queries.len());
+        for q in queries {
+            let (_top, elapsed) = time_it(|| {
+                graph_layers
+                    .search(
+                        10,
+                        ef,
+                        SearchAlgorithm::Hnsw,
+                        q_scaffold.scorer(q.clone()),
+                        None,
+                        &is_stopped,
+                    )
+                    .unwrap()
+            });
+            let us = elapsed.as_secs_f64() * 1e6;
+            micros.push(us);
+            pooled.push(us);
+        }
+        micros.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        p50_samples.push(percentile(&micros, 0.50));
+        p95_samples.push(percentile(&micros, 0.95));
+    }
+    (p50_samples, p95_samples, pooled)
+}
+
+fn phase4d_recall(
+    q_scaffold: &super::puffin_shared::QuantizedRealDataScaffold,
+    fp_scaffold: &super::puffin_shared::RealDataScaffold,
+    graph_layers: &GraphLayers,
+    queries: &[Vec<f32>],
+    body_len: usize,
+    ef: usize,
+) -> Vec<f64> {
+    // Per-query recall@10 under BQ-scored traversal against BF full-precision top-10.
+    let is_stopped = AtomicBool::new(false);
+    let mut per_query = Vec::with_capacity(queries.len());
+    for q in queries {
+        let hnsw_top10 = graph_layers
+            .search(
+                10,
+                ef,
+                SearchAlgorithm::Hnsw,
+                q_scaffold.scorer(q.clone()),
+                None,
+                &is_stopped,
+            )
+            .unwrap();
+        let hnsw_ids: HashSet<PointOffsetType> = hnsw_top10.iter().map(|s| s.idx).collect();
+
+        // Ground truth = full-precision brute force.
+        let mut bf_scorer = fp_scaffold.scorer(q.clone());
+        let all_points: Vec<PointOffsetType> = (0..body_len as PointOffsetType).collect();
+        let mut bf_scored: Vec<_> = bf_scorer
+            .score_points_unfiltered(&all_points)
+            .collect::<Vec<_>>();
+        bf_scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        let bf_top10: HashSet<PointOffsetType> = bf_scored[..10].iter().map(|s| s.idx).collect();
+
+        per_query.push(hnsw_ids.intersection(&bf_top10).count() as f64 / 10.0);
+    }
+    per_query
+}
+
+#[test]
+fn test_phase4d_quantized_warm_path() {
+    // Phase 4d ask: measure at N=100_000 and N=999_980. Default 100_000 when
+    // env unset. (Do NOT default to the shared Phase-3 NUM_VECTORS=10_000
+    // constant — that would silently measure a smaller graph than asked.)
+    let n = match std::env::var("PUFFIN_FIXTURE_N")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(999_980) => 999_980,
+        _ => 100_000,
+    };
+    println!("==========================================");
+    println!("Phase 4d quantized warm-path: N={n}");
+    println!("==========================================");
+
+    let Some((rd, fp_scaffold, q_scaffold, graph_layers)) =
+        phase4d_scaffold_and_graph_for_n(n)
+    else {
+        println!("Phase 4d skipped: real-data fixture not present for N={n}");
+        return;
+    };
+
+    // Warm the graph's ranged-links populate (or full mmap in-RAM here).
+    // The graph is Ram-backed via `into_graph_layers_ram`, so populate() is
+    // a no-op — the links live in the process heap already.
+    let _ = graph_layers.links.populate();
+
+    // (B) Warm-path per-query latency at ef=64.
+    let ef = 64;
+    let reps = 5;
+    println!("Phase 4d (B) warm-path @ ef={ef}, 20 queries × {reps} reps:");
+    let (p50s, p95s, pooled) = phase4d_measure(&q_scaffold, &graph_layers, &rd.queries, ef, reps);
+    println!("  p50 (per-rep median):     {}", median_spread_us(p50s.clone()));
+    println!("  p95 (per-rep 95th pctl):  {}", median_spread_us(p95s.clone()));
+    // Pooled p99 across ALL reps × queries.
+    let mut sorted = pooled.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p99 = percentile(&sorted, 0.99);
+    println!(
+        "  p99 (pooled across {} samples; conflates query-mix + run variance): {p99:.1} µs",
+        pooled.len(),
+    );
+
+    // Recall @ ef=64, 1 rep, deterministic.
+    let recall = phase4d_recall(
+        &q_scaffold,
+        &fp_scaffold,
+        &graph_layers,
+        &rd.queries,
+        rd.body.len(),
+        ef,
+    );
+    let mean_recall: f64 = recall.iter().sum::<f64>() / recall.len() as f64;
+    for (qi, r) in recall.iter().enumerate() {
+        println!("  q[{qi:02}] recall@10={r:.3}");
+    }
+    println!("Phase 4d recall@10 (BQ-scored traversal, ef={ef}): MEAN = {mean_recall:.3}");
+
+    // If mean recall < ~0.90 at ef=64, also run ef=128 and print both.
+    if mean_recall < 0.90 {
+        let ef2 = 128;
+        println!("Phase 4d recall < 0.90 at ef={ef} — also running ef={ef2}");
+        let (p50s2, p95s2, pooled2) =
+            phase4d_measure(&q_scaffold, &graph_layers, &rd.queries, ef2, reps);
+        let mut sorted2 = pooled2.clone();
+        sorted2.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p99_2 = percentile(&sorted2, 0.99);
+        println!("Phase 4d (B) warm-path @ ef={ef2}, 20 queries × {reps} reps:");
+        println!("  p50 (per-rep median):     {}", median_spread_us(p50s2));
+        println!("  p95 (per-rep 95th pctl):  {}", median_spread_us(p95s2));
+        println!(
+            "  p99 (pooled across {} samples): {p99_2:.1} µs",
+            pooled2.len(),
+        );
+
+        let recall2 = phase4d_recall(
+            &q_scaffold,
+            &fp_scaffold,
+            &graph_layers,
+            &rd.queries,
+            rd.body.len(),
+            ef2,
+        );
+        let mean_recall2: f64 = recall2.iter().sum::<f64>() / recall2.len() as f64;
+        for (qi, r) in recall2.iter().enumerate() {
+            println!("  q[{qi:02}] recall@10={r:.3}");
+        }
+        println!("Phase 4d recall@10 (BQ-scored traversal, ef={ef2}): MEAN = {mean_recall2:.3}");
+    } else {
+        println!("Phase 4d recall ≥ 0.90 at ef={ef} — ef=128 skipped");
+    }
+
+    println!("==========================================");
+    println!("Phase 4d complete");
+    println!("==========================================");
+}

@@ -841,6 +841,81 @@ impl RealDataScaffold {
     }
 }
 
+// ---------- Phase 4d: quantized-scored scaffold (production-shaped hot path) --
+//
+// Sidestep pattern (matches Phase 3 recall test's `RealDataScaffold`):
+// FilteredScorer::new (point_scorer.rs:118) demands a &VectorStorageEnum even
+// when the caller wants quantized-only scoring. §6.2 tracks the disaggregated
+// FilteredScorer story as production work; here we build both a
+// VectorStorageEnum and a QuantizedVectors from the supplied vectors so the
+// same-encoder-shape (1-bit binary via EncodedVectorsBin<u128,_>) drives the
+// scoring RawScorer. Graph traversal uses the QuantizedVectors' raw_scorer
+// (point_scorer.rs:127), i.e. the production hot path in disaggregated
+// intent. Full-precision storage stays alongside only to satisfy the
+// FilteredScorer signature — it is NOT touched during scoring.
+
+use crate::types::{
+    BinaryQuantizationConfig, BinaryQuantizationEncoding, QuantizationConfig,
+};
+use crate::vector_storage::quantized::quantized_vectors::{
+    QuantizedVectors, QuantizedVectorsStorageType,
+};
+
+pub(super) struct QuantizedRealDataScaffold {
+    storage: VectorStorageEnum,
+    quantized: QuantizedVectors,
+    deleted: BitVec,
+    _tmp: TempDir,
+}
+
+impl QuantizedRealDataScaffold {
+    pub fn new(vectors: &[Vec<f32>]) -> Self {
+        let mut storage = new_volatile_dense_vector_storage(DIM, Distance::Dot);
+        let hw = HardwareCounterCell::new();
+        for (i, v) in vectors.iter().enumerate() {
+            let v = Distance::Dot.preprocess_vector::<VectorElementType>(v.clone());
+            storage
+                .insert_vector(i as PointOffsetType, VectorRef::from(&v), &hw)
+                .expect("insert_vector");
+        }
+        let tmp = TempDir::new().unwrap();
+        let config: QuantizationConfig = BinaryQuantizationConfig {
+            always_ram: Some(true),
+            encoding: Some(BinaryQuantizationEncoding::OneBit),
+            query_encoding: None,
+        }
+        .into();
+        let quantized = QuantizedVectors::create(
+            &storage,
+            &config,
+            QuantizedVectorsStorageType::Immutable,
+            tmp.path(),
+            /* max_threads */ 1,
+            &AtomicBool::new(false),
+        )
+        .expect("QuantizedVectors::create (binary 1-bit)");
+        let deleted = BitVec::repeat(false, vectors.len());
+        Self {
+            storage,
+            quantized,
+            deleted,
+            _tmp: tmp,
+        }
+    }
+
+    pub fn scorer(&self, query: impl Into<QueryVector>) -> FilteredScorer<'_> {
+        FilteredScorer::new(
+            query.into(),
+            &self.storage,
+            Some(&self.quantized), // ← quantized RawScorer path
+            None,
+            &self.deleted,
+            HardwareCounterCell::new(),
+        )
+        .expect("FilteredScorer::new (quantized)")
+    }
+}
+
 /// Optional source-row mapping for the row-pointer blob. When supplied, the
 /// container's row-pointer entries reference real parquet rows so a rerank
 /// step can locate the right bytes; when absent, row-pointer entries fall
