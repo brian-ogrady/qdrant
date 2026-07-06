@@ -36,6 +36,8 @@ rstest = { workspace = true }
 segment = { path = ".", default-features = false, features = ["testing"] }
 proptest = { workspace = true }
 anyhow = { workspace = true }
+object_store = { workspace = true }  # Phase 4: object-store fetch/cache tests only.
+tokio = { workspace = true }         # Phase 4: sync/async bridge for object_store futures.
 
 [target.'cfg(not(target_os = "windows"))'.dev-dependencies]
 pprof = { workspace = true }

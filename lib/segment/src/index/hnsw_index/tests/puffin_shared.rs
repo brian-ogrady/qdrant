@@ -866,3 +866,296 @@ pub(super) fn build_test_puffin_fixture_from_vectors(
         _tmp: tmp,
     }
 }
+
+// ---------- Phase 4 (v3.13): object-store fetch + snapshot-keyed cache -----
+//
+// Test-scope seed of the §6.1 `PuffinReader` surface. All items live here so
+// production `graph_layers` / `graph_links` stay untouched. When PuffinReader
+// becomes a real production abstraction, this fetcher lifts into `io_bridge_
+// object_store` on top of `AsyncRead::read_range`; for the test we cut
+// through `object_store` directly to keep the surface small.
+
+use std::sync::Mutex;
+use std::time::Instant;
+
+use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt};
+
+/// Book-keeping the tests use to verify hit/miss behaviour without depending
+/// on the store implementation's internals. Only the count of `store.get`
+/// and `store.head` calls is exposed; the fetcher increments the counters
+/// itself (not through an ObjectStore-wrapping proxy) so semantics don't
+/// depend on a particular wrapper.
+#[derive(Clone, Debug, Default)]
+pub(super) struct FetcherStats {
+    pub gets: usize,
+    pub heads: usize,
+    pub post_cache_verifies: usize,
+}
+
+/// Test-scope PuffinFetcher: fetches an object from an `ObjectStore`, validates
+/// its footer via `read_and_validate_footer` BEFORE committing the cache
+/// entry, then atomically renames a `.tmp` into place. Directory is keyed by
+/// snapshot_id per §2.4.
+pub(super) struct PuffinFetcher {
+    store: Arc<dyn ObjectStore>,
+    cache_dir: PathBuf,
+    runtime: Arc<tokio::runtime::Runtime>,
+    stats: Arc<Mutex<FetcherStats>>,
+}
+
+impl PuffinFetcher {
+    pub fn new(store: Arc<dyn ObjectStore>, cache_dir: PathBuf) -> OperationResult<Self> {
+        fs::create_dir_all(&cache_dir).map_err(|e| {
+            OperationError::service_error(format!("create cache_dir: {e}"))
+        })?;
+        let runtime = tokio::runtime::Runtime::new().map_err(|e| {
+            OperationError::service_error(format!("start tokio runtime: {e}"))
+        })?;
+        Ok(Self {
+            store,
+            cache_dir,
+            runtime: Arc::new(runtime),
+            stats: Arc::new(Mutex::new(FetcherStats::default())),
+        })
+    }
+
+    pub fn stats(&self) -> FetcherStats {
+        self.stats.lock().unwrap().clone()
+    }
+
+    /// Path where this (path, snapshot_id) pair caches.
+    pub fn cached_path(&self, remote_path: &str, snapshot_id: u64) -> PathBuf {
+        let basename = std::path::Path::new(remote_path)
+            .file_name()
+            .map(|s| s.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from("index.puffin"));
+        self.cache_dir.join(snapshot_id.to_string()).join(basename)
+    }
+
+    /// Fetch `remote_path` from the store into a local cache file keyed by
+    /// `snapshot_id`. On a hit, returns the local path with zero store access.
+    /// On a miss, downloads, validates, and post-verifies before returning.
+    pub fn fetch(
+        &self,
+        remote_path: &str,
+        snapshot_id: u64,
+    ) -> OperationResult<PathBuf> {
+        let final_path = self.cached_path(remote_path, snapshot_id);
+        if final_path.exists() {
+            return Ok(final_path);
+        }
+        let snapshot_dir = final_path.parent().expect("cached_path has parent");
+        fs::create_dir_all(snapshot_dir).map_err(|e| {
+            OperationError::service_error(format!("create snapshot dir: {e}"))
+        })?;
+        let tmp_path = final_path.with_extension("tmp");
+        // Ensure any leftover .tmp from a prior aborted run is gone.
+        let _ = fs::remove_file(&tmp_path);
+
+        // The download/validate happens in a helper so the ? early-return
+        // still cleans up the .tmp if any step fails.
+        let outcome = self.miss_path(remote_path, &tmp_path);
+        match outcome {
+            Ok(()) => {
+                fs::rename(&tmp_path, &final_path).map_err(|e| {
+                    OperationError::service_error(format!("atomic rename: {e}"))
+                })?;
+                // Post-cache verify (v3.13): validate what we'll mmap, not
+                // just what we streamed.
+                let bytes = fs::read(&final_path).map_err(|e| {
+                    OperationError::service_error(format!("post-verify read: {e}"))
+                })?;
+                read_and_validate_footer(&bytes).map_err(|e| {
+                    // Nuke the poisoned entry — a subsequent fetch retries.
+                    let _ = fs::remove_file(&final_path);
+                    OperationError::service_error(format!(
+                        "post-cache validation failed (cache entry removed): {e}"
+                    ))
+                })?;
+                self.stats.lock().unwrap().post_cache_verifies += 1;
+                Ok(final_path)
+            }
+            Err(err) => {
+                // Corrupted download / tiny object / missing key: leave no
+                // .tmp behind so the cache directory contains only committed
+                // entries. Best-effort remove.
+                let _ = fs::remove_file(&tmp_path);
+                Err(err)
+            }
+        }
+    }
+
+    /// Download + validate + write to .tmp. Does NOT rename. All error paths
+    /// leave the .tmp in whatever state; the caller wipes it on Err.
+    fn miss_path(&self, remote_path: &str, tmp_path: &Path) -> OperationResult<()> {
+        let store = Arc::clone(&self.store);
+        let stats = Arc::clone(&self.stats);
+        let runtime = Arc::clone(&self.runtime);
+        let key = object_store::path::Path::from(remote_path);
+
+        // Step (a): trailer via Suffix(12). Tiny-object case must produce
+        // "not a puffin container", not a byte-slicing panic.
+        let trailer_bytes = runtime.block_on(async {
+            stats.lock().unwrap().gets += 1;
+            let opts = GetOptions {
+                range: Some(GetRange::Suffix(TRAILER_LEN as u64)),
+                ..Default::default()
+            };
+            let res = store.get_opts(&key, opts).await.map_err(|e| {
+                OperationError::service_error(format!("store.get_opts(trailer): {e}"))
+            })?;
+            let bytes = res.bytes().await.map_err(|e| {
+                OperationError::service_error(format!("read trailer bytes: {e}"))
+            })?;
+            Ok::<_, OperationError>(bytes)
+        })?;
+        if trailer_bytes.len() < TRAILER_LEN {
+            return Err(OperationError::service_error(format!(
+                "not a puffin container: object smaller than the {TRAILER_LEN}-byte trailer (got {} bytes)",
+                trailer_bytes.len(),
+            )));
+        }
+        // Trailer layout: [footer_size u32 LE | flags u32 LE | trailing magic]
+        let footer_size = u32::from_le_bytes(
+            trailer_bytes[0..4].try_into().unwrap(),
+        ) as usize;
+        // Step (c): footer + trailer in one shot — Suffix(12 + footer_size).
+        let footer_and_trailer = runtime.block_on(async {
+            stats.lock().unwrap().gets += 1;
+            let opts = GetOptions {
+                range: Some(GetRange::Suffix((TRAILER_LEN + footer_size) as u64)),
+                ..Default::default()
+            };
+            let res = store.get_opts(&key, opts).await.map_err(|e| {
+                OperationError::service_error(format!("store.get_opts(footer): {e}"))
+            })?;
+            let bytes = res.bytes().await.map_err(|e| {
+                OperationError::service_error(format!("read footer bytes: {e}"))
+            })?;
+            Ok::<_, OperationError>(bytes)
+        })?;
+        if footer_and_trailer.len() < TRAILER_LEN + footer_size {
+            return Err(OperationError::service_error(format!(
+                "short footer read: got {} bytes, expected at least {}",
+                footer_and_trailer.len(),
+                TRAILER_LEN + footer_size,
+            )));
+        }
+
+        // Step (d): validate the footer BEFORE any writes. The validator
+        // parses trailer bytes at end-of-buffer, so we synthesise a
+        // minimal-yet-realistic prefix.
+        //
+        // Sizing: leading magic + one 64-aligned body byte + zero-pad + magic
+        // up to the footer's declared blob offsets. But `read_and_validate_
+        // footer` derives everything from the trailer + JSON: `file_size` is
+        // the buffer length. The declared blob offsets must fit within that
+        // length. Simplest: fetch `head.size` first so we can size a buffer
+        // of exactly `size` bytes with the tail bytes at the right offset.
+        let size = runtime.block_on(async {
+            stats.lock().unwrap().heads += 1;
+            store.head(&key).await.map_err(|e| {
+                OperationError::service_error(format!("store.head: {e}"))
+            })
+        })?.size as usize;
+        if size < TRAILER_LEN + footer_size {
+            return Err(OperationError::service_error(format!(
+                "object size {size} smaller than footer+trailer ({})",
+                TRAILER_LEN + footer_size,
+            )));
+        }
+        let mut probe_buf = vec![0u8; size];
+        let tail_start = size - (TRAILER_LEN + footer_size);
+        probe_buf[tail_start..].copy_from_slice(&footer_and_trailer);
+        // Leading magic so the validator's file-size checks feel realistic;
+        // strictly speaking the validator only looks at the tail.
+        probe_buf[0..4].copy_from_slice(MAGIC);
+        read_and_validate_footer(&probe_buf).map_err(|e| {
+            OperationError::service_error(format!("pre-cache footer validation: {e}"))
+        })?;
+
+        // Step (f): fetch the body only — Bounded(0..size - (12 + footer_size)).
+        // We already have the tail; refetching it would risk torn-object reads.
+        let body_end = size - (TRAILER_LEN + footer_size);
+        let body_bytes = runtime.block_on(async {
+            stats.lock().unwrap().gets += 1;
+            let opts = GetOptions {
+                range: Some(GetRange::Bounded(0..body_end as u64)),
+                ..Default::default()
+            };
+            let res = store.get_opts(&key, opts).await.map_err(|e| {
+                OperationError::service_error(format!("store.get_opts(body): {e}"))
+            })?;
+            let bytes = res.bytes().await.map_err(|e| {
+                OperationError::service_error(format!("read body bytes: {e}"))
+            })?;
+            Ok::<_, OperationError>(bytes)
+        })?;
+        if body_bytes.len() != body_end {
+            return Err(OperationError::service_error(format!(
+                "short body read: got {}, expected {body_end}",
+                body_bytes.len(),
+            )));
+        }
+
+        // Step (g): write body + already-validated tail to .tmp. Single copy
+        // of the tail bytes across the whole miss path.
+        use std::io::Write;
+        let mut out = fs::File::create(tmp_path).map_err(|e| {
+            OperationError::service_error(format!("create .tmp: {e}"))
+        })?;
+        out.write_all(&body_bytes).map_err(|e| {
+            OperationError::service_error(format!("write body: {e}"))
+        })?;
+        out.write_all(&footer_and_trailer).map_err(|e| {
+            OperationError::service_error(format!("write tail: {e}"))
+        })?;
+        out.sync_all().map_err(|e| {
+            OperationError::service_error(format!("sync .tmp: {e}"))
+        })?;
+        Ok(())
+    }
+}
+
+/// Tiny stub for the Iceberg REST-catalog surface Phase 4 needs. Returns
+/// the pair `(snapshot_id, statistics_file_uri)` — the actual response
+/// shape a production reader consumes. Not a REST client.
+#[derive(Clone, Debug)]
+pub(super) struct MockCatalogStub {
+    pub snapshot_id: u64,
+    pub statistics_file_uri: String,
+}
+
+impl MockCatalogStub {
+    pub fn new(snapshot_id: u64, uri: impl Into<String>) -> Self {
+        Self { snapshot_id, statistics_file_uri: uri.into() }
+    }
+
+    pub fn snapshot_summary(&self) -> (u64, &str) {
+        (self.snapshot_id, self.statistics_file_uri.as_str())
+    }
+}
+
+/// Convenience: put a byte slice into an in-memory `ObjectStore` at `key`.
+/// Wraps the async put so tests read as plain sync code.
+pub(super) fn put_bytes(
+    runtime: &tokio::runtime::Runtime,
+    store: &dyn ObjectStore,
+    key: &str,
+    bytes: Vec<u8>,
+) -> OperationResult<()> {
+    runtime.block_on(async {
+        let path = object_store::path::Path::from(key);
+        store.put(&path, bytes.into()).await.map_err(|e| {
+            OperationError::service_error(format!("store.put({key}): {e}"))
+        })?;
+        Ok(())
+    })
+}
+
+/// Measure a closure's elapsed wall-clock time.
+pub(super) fn time_it<F: FnOnce() -> T, T>(f: F) -> (T, std::time::Duration) {
+    let start = Instant::now();
+    let out = f();
+    (out, start.elapsed())
+}
