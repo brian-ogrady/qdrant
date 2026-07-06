@@ -571,7 +571,7 @@ pub(super) const REAL_BODY_JSON: &str = "data/fixtures/gte_100k_vectors.json";
 pub(super) const REAL_QUERIES_BIN: &str = "data/fixtures/gte_20_queries.bin";
 pub(super) const REAL_QUERIES_JSON: &str = "data/fixtures/gte_20_queries.json";
 
-fn repo_root() -> PathBuf {
+pub(super) fn repo_root() -> PathBuf {
     // segment/Cargo.toml is at lib/segment; CARGO_MANIFEST_DIR points there.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     PathBuf::from(manifest_dir).join("..").join("..")
@@ -622,6 +622,15 @@ pub(super) struct RealDataSidecar {
     pub created: String,
     #[serde(default)]
     pub notes: String,
+    /// Parquet row-group boundaries. Present in v3.13+ body sidecars; absent
+    /// on the query sidecar (queries aren't row-mapped). Sum equals the
+    /// source parquet's total row count.
+    #[serde(default)]
+    pub row_group_sizes: Vec<u64>,
+    /// Repo-relative path to the raw LE-u64 file mapping body-index → source
+    /// parquet row. Present in v3.13+ body sidecars.
+    #[serde(default)]
+    pub source_indices_file: Option<String>,
 }
 
 fn read_sidecar(path: &Path) -> Option<RealDataSidecar> {
@@ -632,13 +641,44 @@ fn read_sidecar(path: &Path) -> Option<RealDataSidecar> {
     Some(serde_json::from_slice(&bytes).expect("parse sidecar json"))
 }
 
-/// Loaded real-data pair, ready for a Phase 3 test run.
+/// Loaded real-data pair, ready for a Phase 3 test run. v3.13 adds
+/// `body_source_indices` — for each `body[i]`, the parquet row it came from.
 #[allow(dead_code)] // `query_sidecar` reserved for future use / diagnostics
 pub(super) struct RealDataFixture {
     pub body: Vec<Vec<f32>>,
     pub queries: Vec<Vec<f32>>,
     pub body_sidecar: RealDataSidecar,
     pub query_sidecar: RealDataSidecar,
+    /// Source parquet row indices for `body[i]`, one u64 per body vector.
+    /// `None` when the sidecar predates v3.13 or the indices file is absent.
+    pub body_source_indices: Option<Vec<u64>>,
+}
+
+/// Logical file-path identifier we bake into row-pointer blobs. Neutral —
+/// tests resolve it against env-configured bucket/endpoint at runtime.
+pub(super) const LOGICAL_PARQUET_NAME: &str = "gte_product_embeddings.parquet";
+
+/// Convert a source parquet row → `(row_group_index, row_offset_within_group)`
+/// via prefix-sum over `row_group_sizes`. `row_group_sizes` must be the same
+/// list the sampler emitted (i.e. sum equals total row count in the source
+/// parquet).
+pub(super) fn source_row_to_row_group(
+    row_group_sizes: &[u64],
+    source_row: u64,
+) -> (u32, u32) {
+    let mut cum: u64 = 0;
+    for (i, size) in row_group_sizes.iter().enumerate() {
+        if source_row < cum + size {
+            let offset = source_row - cum;
+            return (i as u32, offset as u32);
+        }
+        cum += size;
+    }
+    panic!(
+        "source row {source_row} out of range (total {} across {} row groups)",
+        cum,
+        row_group_sizes.len(),
+    );
 }
 
 /// Attempt to load the real-data body + queries. Returns None if the .bin is
@@ -679,11 +719,36 @@ pub(super) fn try_load_real_data(num_body: usize) -> Option<RealDataFixture> {
     let body = read_bin_vectors(&body_bin_path, num_body, DIM)?;
     let queries = read_bin_vectors(&query_bin_path, query_json.count, DIM)?;
 
+    // v3.13: source-indices are optional (older sidecars won't have them);
+    // when present, load and truncate to num_body since the body is a strict
+    // prefix of the full 100k sample by contract.
+    let body_source_indices = body_json.source_indices_file.as_ref().and_then(|rel| {
+        let path = root.join(rel);
+        if !path.exists() {
+            return None;
+        }
+        let bytes = fs::read(&path).expect("read source_indices");
+        // File is 100k × u64 = 800_000 bytes; may be longer than num_body needs.
+        let full_count = bytes.len() / 8;
+        if full_count < num_body {
+            panic!(
+                "source_indices file has {full_count} entries; need at least {num_body}",
+            );
+        }
+        let mut out = Vec::with_capacity(num_body);
+        for i in 0..num_body {
+            let off = i * 8;
+            out.push(u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()));
+        }
+        Some(out)
+    });
+
     Some(RealDataFixture {
         body,
         queries,
         body_sidecar: body_json,
         query_sidecar: query_json,
+        body_source_indices,
     })
 }
 
@@ -735,6 +800,19 @@ impl RealDataScaffold {
     }
 }
 
+/// Optional source-row mapping for the row-pointer blob. When supplied, the
+/// container's row-pointer entries reference real parquet rows so a rerank
+/// step can locate the right bytes; when absent, row-pointer entries fall
+/// back to the mocked `(i, 0, 0, i)` shape Phase 1/2 relied on.
+pub(super) struct SourceRowMapping<'a> {
+    /// Per-vector source parquet row.
+    pub source_rows: &'a [u64],
+    /// Parquet row-group sizes for prefix-sum → (row_group, row_offset).
+    pub row_group_sizes: &'a [u64],
+    /// Neutral logical file-path stored in the row-pointer path table.
+    pub logical_file_name: &'a str,
+}
+
 /// Build a `.puffin` container over an externally-supplied vector body. Used
 /// by Phase 3 to build a container over 10k (or 100k) real vectors — same
 /// blob layout, quantization, and row-pointer shape as the random fixture.
@@ -745,6 +823,18 @@ pub(super) fn build_test_puffin_fixture_from_vectors(
     body: &[Vec<f32>],
     scaffold: &RealDataScaffold,
     rng: &mut StdRng,
+) -> TestFixture {
+    build_test_puffin_fixture_from_vectors_with_mapping(body, scaffold, rng, None)
+}
+
+/// Variant that takes an optional [`SourceRowMapping`] and emits
+/// row-pointer entries pointing at real parquet rows. Callers that don't
+/// need row-mapping fidelity use [`build_test_puffin_fixture_from_vectors`].
+pub(super) fn build_test_puffin_fixture_from_vectors_with_mapping(
+    body: &[Vec<f32>],
+    scaffold: &RealDataScaffold,
+    rng: &mut StdRng,
+    mapping: Option<SourceRowMapping<'_>>,
 ) -> TestFixture {
     let num_vectors = body.len();
     let tmp = TempDir::new().unwrap();
@@ -800,11 +890,36 @@ pub(super) fn build_test_puffin_fixture_from_vectors(
     let quant_bytes = fs::read(&quant_data_path).unwrap();
     let quant_meta_bytes = fs::read(&quant_meta_path).unwrap();
 
-    // Row-pointers.
-    let file_paths = vec!["mock://parquet/dataset/gte.parquet".to_string()];
+    // Row-pointers. When a SourceRowMapping is supplied, entries reference
+    // real parquet rows via prefix-sum over row_group_sizes; otherwise fall
+    // back to the (i, 0, 0, i) mock shape that Phase 1/2 tests rely on for
+    // structural checks.
+    type RpEntry = (u32, u32, u32, u32);
+    let (file_paths, entries): (Vec<String>, Vec<RpEntry>) = match &mapping {
+        Some(m) => {
+            assert_eq!(
+                m.source_rows.len(),
+                num_vectors,
+                "SourceRowMapping.source_rows length {} != body {num_vectors}",
+                m.source_rows.len(),
+            );
+            let entries: Vec<(u32, u32, u32, u32)> = m
+                .source_rows
+                .iter()
+                .enumerate()
+                .map(|(i, &src_row)| {
+                    let (rg, off) = source_row_to_row_group(m.row_group_sizes, src_row);
+                    (i as u32, 0u32, rg, off)
+                })
+                .collect();
+            (vec![m.logical_file_name.to_string()], entries)
+        }
+        None => (
+            vec!["mock://parquet/dataset/gte.parquet".to_string()],
+            (0..num_vectors as u32).map(|i| (i, 0, 0, i)).collect(),
+        ),
+    };
     let path_refs: Vec<&str> = file_paths.iter().map(|s| s.as_str()).collect();
-    let entries: Vec<(u32, u32, u32, u32)> =
-        (0..num_vectors as u32).map(|i| (i, 0, 0, i)).collect();
     let row_ptr_bytes = build_row_pointer_blob(&path_refs, &entries);
 
     let blobs = [
@@ -1136,8 +1251,11 @@ impl MockCatalogStub {
     }
 }
 
-/// Convenience: put a byte slice into an in-memory `ObjectStore` at `key`.
-/// Wraps the async put so tests read as plain sync code.
+/// Convenience: put a byte slice into an `ObjectStore` at `key` via a single
+/// PUT. Only use for small objects — real S3-compatible endpoints reject
+/// single-PUT payloads above ~5 GB, and object_store's client-side path may
+/// abort even earlier. For anything large (≳ a few hundred MB) use
+/// [`put_bytes_multipart`].
 pub(super) fn put_bytes(
     runtime: &tokio::runtime::Runtime,
     store: &dyn ObjectStore,
@@ -1148,6 +1266,36 @@ pub(super) fn put_bytes(
         let path = object_store::path::Path::from(key);
         store.put(&path, bytes.into()).await.map_err(|e| {
             OperationError::service_error(format!("store.put({key}): {e}"))
+        })?;
+        Ok(())
+    })
+}
+
+/// Upload `bytes` at `key` via multipart. Sized parts (default 16 MiB) satisfy
+/// S3's 5 MiB minimum. Used for the 3.3 GB parquet in the Phase-4 rerank test,
+/// where a single PUT is client-side-rejected.
+pub(super) fn put_bytes_multipart(
+    runtime: &tokio::runtime::Runtime,
+    store: &dyn ObjectStore,
+    key: &str,
+    bytes: Vec<u8>,
+) -> OperationResult<()> {
+    const PART_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+    runtime.block_on(async {
+        let path = object_store::path::Path::from(key);
+        let mut upload = store.put_multipart(&path).await.map_err(|e| {
+            OperationError::service_error(format!("store.put_multipart({key}): {e}"))
+        })?;
+        for chunk in bytes.chunks(PART_SIZE) {
+            upload
+                .put_part(chunk.to_vec().into())
+                .await
+                .map_err(|e| {
+                    OperationError::service_error(format!("multipart.put_part({key}): {e}"))
+                })?;
+        }
+        upload.complete().await.map_err(|e| {
+            OperationError::service_error(format!("multipart.complete({key}): {e}"))
         })?;
         Ok(())
     })

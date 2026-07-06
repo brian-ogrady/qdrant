@@ -38,6 +38,10 @@ proptest = { workspace = true }
 anyhow = { workspace = true }
 object_store = { workspace = true }  # Phase 4: object-store fetch/cache tests only.
 tokio = { workspace = true }         # Phase 4: sync/async bridge for object_store futures.
+parquet = { workspace = true }       # Phase 4: rerank-over-parquet measurement only (opt-in).
+arrow = { workspace = true }         # Phase 4: RecordBatch decode from parquet stream.
+bytes = { workspace = true }         # Phase 4: parquet's AsyncFileReader returns bytes::Bytes.
+futures = { workspace = true }       # Phase 4: BoxFuture / TryStreamExt for our AsyncFileReader.
 
 [target.'cfg(not(target_os = "windows"))'.dev-dependencies]
 pprof = { workspace = true }
