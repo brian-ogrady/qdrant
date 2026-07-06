@@ -12,10 +12,12 @@
 //! `super::puffin_shared::*` without exposing anything past the `tests` module.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use common::types::PointOffsetType;
 use fs_err as fs;
+use memmap2::{Mmap, MmapOptions};
 use quantization::encoded_storage::TestEncodedStorageBuilder;
 use quantization::encoded_vectors_binary::{
     EncodedVectorsBin, Encoding, QueryEncoding, get_quantized_vector_size_from_params,
@@ -263,10 +265,16 @@ pub(super) fn build_test_puffin_fixture() -> TestFixture {
     assert!(!graph_meta_bytes.is_empty(), "graph.bin empty");
     assert!(!graph_links_bytes.is_empty(), "links_compressed.bin empty");
 
-    // ---- Quantize a matching-shape vector set (u128 binary) -----------------
-    // Phase 1 tests file-format correctness, not graph-vs-quant scoring
-    // consistency, so an independently seeded set of vectors is sufficient.
-    let mut rng2 = StdRng::seed_from_u64(FIXTURE_SEED.wrapping_add(1));
+    // ---- Quantize the SAME vector set the graph was trained against ---------
+    // §3.4 (v3.12) invariant: all blobs in a container must derive from the
+    // same vector set. `TestRawScorerProducer::new` iterates the passed RNG
+    // via `random_vector(rng, dim)` × num_vectors (no extra draws for
+    // Distance::Dot, whose preprocess is a no-op). A freshly-seeded RNG that
+    // runs the same loop reproduces the identical vector sequence bit-for-bit.
+    // Earlier drafts used FIXTURE_SEED.wrapping_add(1) here, which produced
+    // an internally inconsistent container that no Phase 1/2 structural check
+    // could detect — only the Phase 3 containment check catches it.
+    let mut rng2 = StdRng::seed_from_u64(FIXTURE_SEED);
     let vectors_for_quant: Vec<Vec<f32>> = (0..NUM_VECTORS)
         .map(|_| random_vector(&mut rng2, DIM))
         .collect();
@@ -528,5 +536,333 @@ pub(super) fn read_and_validate_footer(file_bytes: &[u8]) -> OperationResult<Par
 impl ParsedFooter {
     pub fn by_type(&self, ty: &str) -> Option<&ParsedBlobDescriptor> {
         self.blobs.iter().find(|b| b.blob_type == ty)
+    }
+}
+
+/// Memory-map an entire test file. Wraps the standard-mmap-over-owned-tempfile
+/// pattern both Phase 2 and Phase 3 use so the unsafe live in one place.
+pub(super) fn mmap_whole_file(path: &Path) -> Arc<Mmap> {
+    let file = fs::File::open(path).unwrap();
+    // SAFETY: standard mmap over a test-owned temp file that is not
+    // concurrently truncated or written for the duration of the test.
+    let mmap = unsafe { MmapOptions::new().map(file.file()) }.unwrap();
+    Arc::new(mmap)
+}
+
+// ---------- Real-data fixture (§5 Phase 3, v3.12) --------------------------
+//
+// The random-vector fixture above stays as-is for Phase 1 & Phase 2 structural
+// tests. Phase 3 pulls a real-data body + held-out queries out of
+// `data/fixtures/gte_100k_vectors.{bin,json}` when present; the .bin is git-
+// excluded, so environments without it fall back to random data (report-only).
+
+use crate::vector_storage::dense::volatile_dense_vector_storage::new_volatile_dense_vector_storage;
+use crate::vector_storage::VectorStorage;
+use crate::vector_storage::VectorStorageEnum;
+use crate::data_types::vectors::{VectorElementType, VectorRef};
+use common::bitvec::BitVec;
+use common::counter::hardware_counter::HardwareCounterCell;
+use crate::index::hnsw_index::point_scorer::FilteredScorer;
+use crate::data_types::vectors::QueryVector;
+
+/// Path (repo-relative) to the sampler-produced fixture body.
+pub(super) const REAL_BODY_BIN: &str = "data/fixtures/gte_100k_vectors.bin";
+pub(super) const REAL_BODY_JSON: &str = "data/fixtures/gte_100k_vectors.json";
+pub(super) const REAL_QUERIES_BIN: &str = "data/fixtures/gte_20_queries.bin";
+pub(super) const REAL_QUERIES_JSON: &str = "data/fixtures/gte_20_queries.json";
+
+fn repo_root() -> PathBuf {
+    // segment/Cargo.toml is at lib/segment; CARGO_MANIFEST_DIR points there.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    PathBuf::from(manifest_dir).join("..").join("..")
+}
+
+/// Read a .bin of raw LE f32 into `count` rows of `dim` values.
+/// Returns None if the file is missing.
+fn read_bin_vectors(path: &Path, expected_count: usize, dim: usize) -> Option<Vec<Vec<f32>>> {
+    if !path.exists() {
+        return None;
+    }
+    let bytes = fs::read(path).expect("read bin");
+    let expected_bytes = expected_count * dim * 4;
+    if bytes.len() < expected_bytes {
+        panic!(
+            "bin at {} is {} bytes; expected at least {} (count={}, dim={})",
+            path.display(),
+            bytes.len(),
+            expected_bytes,
+            expected_count,
+            dim,
+        );
+    }
+    let mut out = Vec::with_capacity(expected_count);
+    for i in 0..expected_count {
+        let mut v = Vec::with_capacity(dim);
+        for j in 0..dim {
+            let off = (i * dim + j) * 4;
+            let arr: [u8; 4] = bytes[off..off + 4].try_into().unwrap();
+            v.push(f32::from_le_bytes(arr));
+        }
+        out.push(v);
+    }
+    Some(out)
+}
+
+/// Sidecar contents the loader validates before returning vectors.
+/// `created` and `notes` are read for logging/diagnostics; the compiler can't
+/// see the print sites through serde so the fields warn as dead — allow.
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct RealDataSidecar {
+    pub count: usize,
+    pub dim: usize,
+    pub source_file: String,
+    pub sample_seed: u64,
+    pub normalized: bool,
+    pub created: String,
+    #[serde(default)]
+    pub notes: String,
+}
+
+fn read_sidecar(path: &Path) -> Option<RealDataSidecar> {
+    if !path.exists() {
+        return None;
+    }
+    let bytes = fs::read(path).expect("read sidecar");
+    Some(serde_json::from_slice(&bytes).expect("parse sidecar json"))
+}
+
+/// Loaded real-data pair, ready for a Phase 3 test run.
+#[allow(dead_code)] // `query_sidecar` reserved for future use / diagnostics
+pub(super) struct RealDataFixture {
+    pub body: Vec<Vec<f32>>,
+    pub queries: Vec<Vec<f32>>,
+    pub body_sidecar: RealDataSidecar,
+    pub query_sidecar: RealDataSidecar,
+}
+
+/// Attempt to load the real-data body + queries. Returns None if the .bin is
+/// absent (so environments without the fixture stay green). Fails loudly on
+/// dim/count mismatches from the sidecar — a silent shape drift would mask a
+/// container-consistency bug (see §3.4).
+pub(super) fn try_load_real_data(num_body: usize) -> Option<RealDataFixture> {
+    let root = repo_root();
+    let body_json = read_sidecar(&root.join(REAL_BODY_JSON))?;
+    let body_bin_path = root.join(REAL_BODY_BIN);
+    let query_json = read_sidecar(&root.join(REAL_QUERIES_JSON))?;
+    let query_bin_path = root.join(REAL_QUERIES_BIN);
+
+    assert_eq!(
+        body_json.dim, DIM,
+        "sidecar dim {} != fixture DIM {}",
+        body_json.dim, DIM,
+    );
+    assert_eq!(
+        query_json.dim, DIM,
+        "query sidecar dim {} != fixture DIM {}",
+        query_json.dim, DIM,
+    );
+    assert!(
+        body_json.normalized,
+        "sidecar reports body vectors NOT L2-normalized — decision required before choosing distance",
+    );
+    assert!(
+        query_json.normalized,
+        "sidecar reports query vectors NOT L2-normalized",
+    );
+    assert!(
+        body_json.count >= num_body,
+        "requested {num_body} body vectors but sidecar reports only {}",
+        body_json.count,
+    );
+
+    let body = read_bin_vectors(&body_bin_path, num_body, DIM)?;
+    let queries = read_bin_vectors(&query_bin_path, query_json.count, DIM)?;
+
+    Some(RealDataFixture {
+        body,
+        queries,
+        body_sidecar: body_json,
+        query_sidecar: query_json,
+    })
+}
+
+/// Scaffold that owns a `VectorStorageEnum` over externally-supplied vectors
+/// and exposes the same `scorer`/`internal_scorer` surface as
+/// `TestRawScorerProducer` (which insists on generating its own random vectors,
+/// so cannot be used with real data).
+pub(super) struct RealDataScaffold {
+    storage: VectorStorageEnum,
+    deleted: BitVec,
+}
+
+impl RealDataScaffold {
+    pub fn new(distance: Distance, vectors: &[Vec<f32>]) -> Self {
+        let mut storage = new_volatile_dense_vector_storage(DIM, distance);
+        let hw = HardwareCounterCell::new();
+        for (i, v) in vectors.iter().enumerate() {
+            let v = distance.preprocess_vector::<VectorElementType>(v.clone());
+            storage
+                .insert_vector(i as PointOffsetType, VectorRef::from(&v), &hw)
+                .expect("insert_vector");
+        }
+        let deleted = BitVec::repeat(false, vectors.len());
+        Self { storage, deleted }
+    }
+
+    pub fn scorer(&self, query: impl Into<QueryVector>) -> FilteredScorer<'_> {
+        FilteredScorer::new(
+            query.into(),
+            &self.storage,
+            None,
+            None,
+            &self.deleted,
+            HardwareCounterCell::new(),
+        )
+        .expect("FilteredScorer::new")
+    }
+
+    pub fn internal_scorer(&self, point_id: PointOffsetType) -> FilteredScorer<'_> {
+        FilteredScorer::new_internal(
+            point_id,
+            &self.storage,
+            None,
+            None,
+            &self.deleted,
+            HardwareCounterCell::new(),
+        )
+        .expect("FilteredScorer::new_internal")
+    }
+}
+
+/// Build a `.puffin` container over an externally-supplied vector body. Used
+/// by Phase 3 to build a container over 10k (or 100k) real vectors — same
+/// blob layout, quantization, and row-pointer shape as the random fixture.
+///
+/// Determinism: the graph's level assignments are drawn from `rng`. Pass a
+/// seeded RNG to make repeated runs identical.
+pub(super) fn build_test_puffin_fixture_from_vectors(
+    body: &[Vec<f32>],
+    scaffold: &RealDataScaffold,
+    rng: &mut StdRng,
+) -> TestFixture {
+    let num_vectors = body.len();
+    let tmp = TempDir::new().unwrap();
+    let puffin_path = tmp.path().join("test_index.puffin");
+    let graph_dir = tmp.path().join("graph");
+    fs::create_dir_all(&graph_dir).unwrap();
+
+    // Build HNSW.
+    let mut builder = GraphLayersBuilder::new(
+        num_vectors,
+        HnswM::new2(M),
+        EF_CONSTRUCT,
+        ENTRY_POINTS_NUM,
+        /* use_heuristic */ true,
+    );
+    for idx in 0..num_vectors as PointOffsetType {
+        let level = builder.get_random_layer(rng);
+        builder.set_levels(idx, level);
+        builder.link_new_point(idx, scaffold.internal_scorer(idx));
+    }
+    builder
+        .into_graph_layers(
+            &graph_dir,
+            GraphLinksFormatParam::Compressed,
+            /* on_disk */ false,
+        )
+        .unwrap();
+    let graph_meta_bytes = fs::read(graph_dir.join("graph.bin")).unwrap();
+    let graph_links_bytes = fs::read(graph_dir.join("links_compressed.bin")).unwrap();
+
+    // Quantize the SAME body — §3.4 (v3.12) container-consistency invariant.
+    let vector_parameters = VectorParameters {
+        dim: DIM,
+        distance_type: DistanceType::Dot,
+        invert: false,
+        deprecated_count: None,
+    };
+    let quantized_vec_size = get_quantized_vector_size_from_params::<u128>(DIM, Encoding::OneBit);
+    let quant_data_path = tmp.path().join("quant.bin");
+    let quant_meta_path = tmp.path().join("quant.meta.json");
+    let storage_builder =
+        TestEncodedStorageBuilder::new(Some(&quant_data_path), quantized_vec_size);
+    let _encoded = EncodedVectorsBin::<u128, _>::encode(
+        body.iter().map(|v| v.as_slice()),
+        storage_builder,
+        &vector_parameters,
+        Encoding::OneBit,
+        QueryEncoding::SameAsStorage,
+        Some(&quant_meta_path),
+        &AtomicBool::new(false),
+    )
+    .expect("EncodedVectorsBin::encode");
+    let quant_bytes = fs::read(&quant_data_path).unwrap();
+    let quant_meta_bytes = fs::read(&quant_meta_path).unwrap();
+
+    // Row-pointers.
+    let file_paths = vec!["mock://parquet/dataset/gte.parquet".to_string()];
+    let path_refs: Vec<&str> = file_paths.iter().map(|s| s.as_str()).collect();
+    let entries: Vec<(u32, u32, u32, u32)> =
+        (0..num_vectors as u32).map(|i| (i, 0, 0, i)).collect();
+    let row_ptr_bytes = build_row_pointer_blob(&path_refs, &entries);
+
+    let blobs = [
+        BlobSpec {
+            blob_type: "ann-hnsw-quantized-vectors-v1",
+            bytes: &quant_bytes,
+            properties: json!({
+                "quantization_variant": "EncodedVectorsBin_u128",
+                "quantization_family": "binary",
+                "dimensions": DIM.to_string(),
+                "created-by": "qdrant-edge-builder-v1",
+            }),
+        },
+        BlobSpec {
+            blob_type: "ann-hnsw-quantized-meta-v1",
+            bytes: &quant_meta_bytes,
+            properties: json!({
+                "quantization_family": "binary",
+                "created-by": "qdrant-edge-builder-v1",
+            }),
+        },
+        BlobSpec {
+            blob_type: "ann-hnsw-graph-meta-v1",
+            bytes: &graph_meta_bytes,
+            properties: json!({
+                "m": M.to_string(),
+                "ef_construct": EF_CONSTRUCT.to_string(),
+                "vector_count": num_vectors.to_string(),
+                "created-by": "qdrant-edge-builder-v1",
+            }),
+        },
+        BlobSpec {
+            blob_type: "ann-hnsw-graph-links-v1",
+            bytes: &graph_links_bytes,
+            properties: json!({
+                "format": "compressed",
+                "created-by": "qdrant-edge-builder-v1",
+            }),
+        },
+        BlobSpec {
+            blob_type: "ann-hnsw-row-pointers-v1",
+            bytes: &row_ptr_bytes,
+            properties: json!({
+                "entry_count": num_vectors.to_string(),
+                "created-by": "qdrant-edge-builder-v1",
+            }),
+        },
+    ];
+    write_puffin(&puffin_path, &blobs).expect("write_puffin");
+
+    TestFixture {
+        puffin_path,
+        num_vectors,
+        dim: DIM,
+        m: M,
+        ef_construct: EF_CONSTRUCT,
+        quantized_vec_size,
+        file_paths,
+        _tmp: tmp,
     }
 }

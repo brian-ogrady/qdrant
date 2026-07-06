@@ -18,7 +18,6 @@
 use std::sync::Arc;
 
 use fs_err as fs;
-use memmap2::{Mmap, MmapOptions};
 use quantization::encoded_storage::TestEncodedStorage;
 use quantization::encoded_vectors_binary::{
     EncodedVectorsBin, Encoding, get_quantized_vector_size_from_params,
@@ -32,19 +31,11 @@ use crate::index::hnsw_index::graph_layers::GraphLayerData;
 use crate::index::hnsw_index::graph_links::{GraphLinks, GraphLinksFormat};
 
 use super::puffin_shared::{
-    BlobSpec, MAGIC, TRAILER_LEN, build_test_puffin_fixture, read_and_validate_footer,
-    write_puffin,
+    BlobSpec, MAGIC, TRAILER_LEN, build_test_puffin_fixture, mmap_whole_file,
+    read_and_validate_footer, write_puffin,
 };
 
 // ---------- Helpers -------------------------------------------------------
-
-fn mmap_whole_file(path: &std::path::Path) -> Arc<Mmap> {
-    let file = fs::File::open(path).unwrap();
-    // SAFETY: standard mmap over a test-owned temp file that's not concurrently
-    // truncated during the test.
-    let mmap = unsafe { MmapOptions::new().map(file.file()) }.unwrap();
-    Arc::new(mmap)
-}
 
 /// Parse the row-pointer blob bytes into a decoded form the test can spot-check.
 #[derive(Debug)]
