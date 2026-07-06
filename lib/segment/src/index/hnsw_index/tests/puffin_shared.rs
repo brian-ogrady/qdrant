@@ -571,6 +571,13 @@ pub(super) const REAL_BODY_JSON: &str = "data/fixtures/gte_100k_vectors.json";
 pub(super) const REAL_QUERIES_BIN: &str = "data/fixtures/gte_20_queries.bin";
 pub(super) const REAL_QUERIES_JSON: &str = "data/fixtures/gte_20_queries.json";
 
+/// v3.13 Phase-4c full-scale (~1M) fixture paths. The 100k fixture stays
+/// the default; loading the 1M fixture is a one-shot opt-in.
+pub(super) const REAL_1M_BODY_BIN: &str = "data/fixtures/gte_1m_vectors.bin";
+pub(super) const REAL_1M_BODY_JSON: &str = "data/fixtures/gte_1m_vectors.json";
+pub(super) const REAL_1M_QUERIES_BIN: &str = "data/fixtures/gte_1m_queries.bin";
+pub(super) const REAL_1M_QUERIES_JSON: &str = "data/fixtures/gte_1m_queries.json";
+
 pub(super) fn repo_root() -> PathBuf {
     // segment/Cargo.toml is at lib/segment; CARGO_MANIFEST_DIR points there.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -681,16 +688,50 @@ pub(super) fn source_row_to_row_group(
     );
 }
 
+/// Named-file group so callers can target different fixture sizes without
+/// duplicating the loader body.
+pub(super) struct RealDataFiles {
+    pub body_bin: &'static str,
+    pub body_json: &'static str,
+    pub queries_bin: &'static str,
+    pub queries_json: &'static str,
+}
+
+pub(super) const FIXTURE_100K: RealDataFiles = RealDataFiles {
+    body_bin: REAL_BODY_BIN,
+    body_json: REAL_BODY_JSON,
+    queries_bin: REAL_QUERIES_BIN,
+    queries_json: REAL_QUERIES_JSON,
+};
+
+pub(super) const FIXTURE_1M: RealDataFiles = RealDataFiles {
+    body_bin: REAL_1M_BODY_BIN,
+    body_json: REAL_1M_BODY_JSON,
+    queries_bin: REAL_1M_QUERIES_BIN,
+    queries_json: REAL_1M_QUERIES_JSON,
+};
+
+/// Attempt to load the real-data body + queries from the default 100k
+/// fixture. Convenience wrapper for [`try_load_real_data_from`] preserved for
+/// existing call sites; new callers should reach for
+/// [`try_load_real_data_from`] with an explicit [`RealDataFiles`].
+pub(super) fn try_load_real_data(num_body: usize) -> Option<RealDataFixture> {
+    try_load_real_data_from(&FIXTURE_100K, num_body)
+}
+
 /// Attempt to load the real-data body + queries. Returns None if the .bin is
 /// absent (so environments without the fixture stay green). Fails loudly on
 /// dim/count mismatches from the sidecar — a silent shape drift would mask a
 /// container-consistency bug (see §3.4).
-pub(super) fn try_load_real_data(num_body: usize) -> Option<RealDataFixture> {
+pub(super) fn try_load_real_data_from(
+    files: &RealDataFiles,
+    num_body: usize,
+) -> Option<RealDataFixture> {
     let root = repo_root();
-    let body_json = read_sidecar(&root.join(REAL_BODY_JSON))?;
-    let body_bin_path = root.join(REAL_BODY_BIN);
-    let query_json = read_sidecar(&root.join(REAL_QUERIES_JSON))?;
-    let query_bin_path = root.join(REAL_QUERIES_BIN);
+    let body_json = read_sidecar(&root.join(files.body_json))?;
+    let body_bin_path = root.join(files.body_bin);
+    let query_json = read_sidecar(&root.join(files.queries_json))?;
+    let query_bin_path = root.join(files.queries_bin);
 
     assert_eq!(
         body_json.dim, DIM,

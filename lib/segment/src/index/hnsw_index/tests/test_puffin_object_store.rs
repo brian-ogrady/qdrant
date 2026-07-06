@@ -1272,3 +1272,597 @@ fn test_puffin_rerank_over_parquet_opt_in() {
         "  Parquet metadata fetch (once, off timing loop): {meta_fetch_bytes} bytes",
     );
 }
+
+// -------- Phase 4c: full-scale (≈1M) one-shot measurement ----------------
+//
+// Doubles as the rebuild-economics measurement (last unmeasured ledger item).
+// All timings report-only. Machine kept quiet. Env-gated:
+//   PUFFIN_S3_ENDPOINT=... (endpoint config, same as other opt-in tests)
+//   PUFFIN_FIXTURE_N=999980 (required — signals opt-in for the 1M path)
+// Fixture: data/fixtures/gte_1m_vectors.{bin,json} + gte_1m_source_indices.bin
+// + gte_1m_queries.{bin,json}, produced by `data/fixtures/build_gte_fixture.py
+// --with-1m`.
+
+const PHASE4C_N: usize = 999_980;
+const PHASE4C_OBJECT_KEY: &str = "iceberg/table/data/index_1m.puffin";
+
+#[test]
+fn test_phase4c_full_scale_run() {
+    use super::puffin_shared::{
+        BlobSpec, FIXTURE_1M, build_row_pointer_blob, put_bytes_multipart,
+        try_load_real_data_from, write_puffin,
+    };
+    use futures::TryStreamExt;
+    use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+    use parquet::arrow::ProjectionMask;
+    use quantization::encoded_storage::TestEncodedStorageBuilder;
+    use quantization::encoded_vectors_binary::QueryEncoding;
+    use quantization::{DistanceType, VectorParameters};
+
+    // Explicit opt-in via PUFFIN_FIXTURE_N=999980 (this test would otherwise
+    // consume ~40 minutes and ~50 GiB of wire traffic on a default suite run).
+    let requested_n = std::env::var("PUFFIN_FIXTURE_N")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    if requested_n != PHASE4C_N {
+        println!(
+            "Phase 4c full-scale run skipped: set PUFFIN_FIXTURE_N={PHASE4C_N} to opt in (got {requested_n})",
+        );
+        return;
+    }
+    let Some(endpoint) = opt_in_endpoint() else {
+        println!("Phase 4c skipped: PUFFIN_S3_ENDPOINT not set");
+        return;
+    };
+    let Some(store) = build_opt_in_store(endpoint) else {
+        panic!("PUFFIN_S3_ENDPOINT set but bucket/credentials env vars missing");
+    };
+    let Some(rd) = try_load_real_data_from(&FIXTURE_1M, PHASE4C_N) else {
+        println!(
+            "Phase 4c skipped: 1M fixture not present at data/fixtures/gte_1m_vectors.bin",
+        );
+        return;
+    };
+    let Some(source_indices) = rd.body_source_indices.clone() else {
+        panic!("1M fixture is missing body_source_indices — regenerate with build_gte_fixture.py --with-1m");
+    };
+    let row_group_sizes: Vec<u64> = rd.body_sidecar.row_group_sizes.clone();
+    assert!(!row_group_sizes.is_empty(), "1M sidecar missing row_group_sizes");
+
+    println!("========================================");
+    println!("Phase 4c full-scale run: N={PHASE4C_N}, queries={}", rd.queries.len());
+    println!("========================================");
+
+    // ==================== BUILD PHASE (instrumented) ====================
+    // We inline what build_test_puffin_fixture_from_vectors_with_mapping does
+    // so we can time each phase separately. Sequence is identical to that
+    // shared builder; comments cross-reference it.
+    let tmp = TempDir::new().unwrap();
+    let puffin_path = tmp.path().join("index_1m.puffin");
+    let graph_dir = tmp.path().join("graph");
+    fs::create_dir_all(&graph_dir).unwrap();
+
+    let build_total_t0 = std::time::Instant::now();
+
+    // (a1) Vector-storage scaffold (input to HNSW build).
+    let t_scaffold_0 = std::time::Instant::now();
+    let scaffold = RealDataScaffold::new(Distance::Dot, &rd.body);
+    let t_scaffold = t_scaffold_0.elapsed();
+    println!("BUILD (a1) vector storage insert: {t_scaffold:?}");
+
+    // (a2) HNSW graph build (single-threaded test path — upper bound vs
+    // Qdrant's parallel production builder).
+    let mut level_rng = rand::rngs::StdRng::seed_from_u64(FIXTURE_SEED.wrapping_add(0x4C_00));
+    use crate::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
+    use crate::index::hnsw_index::graph_links::GraphLinksFormatParam;
+    use common::types::PointOffsetType as Pot;
+    let t_hnsw_0 = std::time::Instant::now();
+    let mut builder = GraphLayersBuilder::new(
+        rd.body.len(),
+        HnswM::new2(16),
+        /* ef_construct */ 100,
+        /* entry_points_num */ 10,
+        /* use_heuristic */ true,
+    );
+    for idx in 0..rd.body.len() as Pot {
+        let level = builder.get_random_layer(&mut level_rng);
+        builder.set_levels(idx, level);
+        builder.link_new_point(idx, scaffold.internal_scorer(idx));
+    }
+    let t_hnsw_build = t_hnsw_0.elapsed();
+    println!("BUILD (a2) hnsw graph (single-threaded link loop): {t_hnsw_build:?}");
+
+    // (a3) Graph serialization to disk (graph.bin + links_compressed.bin).
+    let t_graph_save_0 = std::time::Instant::now();
+    builder
+        .into_graph_layers(
+            &graph_dir,
+            GraphLinksFormatParam::Compressed,
+            /* on_disk */ false,
+        )
+        .unwrap();
+    let graph_meta_bytes = fs::read(graph_dir.join("graph.bin")).unwrap();
+    let graph_links_bytes = fs::read(graph_dir.join("links_compressed.bin")).unwrap();
+    let t_graph_save = t_graph_save_0.elapsed();
+    println!(
+        "BUILD (a3) graph serialize (graph.bin={} B, links_compressed.bin={} B): {t_graph_save:?}",
+        graph_meta_bytes.len(),
+        graph_links_bytes.len(),
+    );
+
+    // (b) Quantization encode.
+    let vector_parameters = VectorParameters {
+        dim: DIM,
+        distance_type: DistanceType::Dot,
+        invert: false,
+        deprecated_count: None,
+    };
+    let quantized_vec_size = get_quantized_vector_size_from_params::<u128>(DIM, Encoding::OneBit);
+    let quant_data_path = tmp.path().join("quant.bin");
+    let quant_meta_path = tmp.path().join("quant.meta.json");
+    let storage_builder =
+        TestEncodedStorageBuilder::new(Some(&quant_data_path), quantized_vec_size);
+    let t_quant_0 = std::time::Instant::now();
+    let _encoded_holder = EncodedVectorsBin::<u128, _>::encode(
+        rd.body.iter().map(|v| v.as_slice()),
+        storage_builder,
+        &vector_parameters,
+        Encoding::OneBit,
+        QueryEncoding::SameAsStorage,
+        Some(&quant_meta_path),
+        &AtomicBool::new(false),
+    )
+    .expect("EncodedVectorsBin::encode");
+    let quant_bytes = fs::read(&quant_data_path).unwrap();
+    let quant_meta_bytes = fs::read(&quant_meta_path).unwrap();
+    let t_quantize = t_quant_0.elapsed();
+    println!(
+        "BUILD (b)  quantize encode (data={} B, meta={} B): {t_quantize:?}",
+        quant_bytes.len(),
+        quant_meta_bytes.len(),
+    );
+
+    // (c) Row-pointer blob + container assemble/write.
+    let t_write_0 = std::time::Instant::now();
+    let file_paths = [LOGICAL_PARQUET_NAME.to_string()];
+    let path_refs: Vec<&str> = file_paths.iter().map(|s| s.as_str()).collect();
+    let entries: Vec<(u32, u32, u32, u32)> = (0..rd.body.len() as u32)
+        .map(|i| {
+            let src = source_indices[i as usize];
+            let (rg, off) = source_row_to_row_group(&row_group_sizes, src);
+            (i, 0u32, rg, off)
+        })
+        .collect();
+    let row_ptr_bytes = build_row_pointer_blob(&path_refs, &entries);
+
+    let blobs = [
+        BlobSpec {
+            blob_type: "ann-hnsw-quantized-vectors-v1",
+            bytes: &quant_bytes,
+            properties: serde_json::json!({
+                "quantization_variant": "EncodedVectorsBin_u128",
+                "quantization_family": "binary",
+                "dimensions": DIM.to_string(),
+                "created-by": "qdrant-edge-builder-v1",
+            }),
+        },
+        BlobSpec {
+            blob_type: "ann-hnsw-quantized-meta-v1",
+            bytes: &quant_meta_bytes,
+            properties: serde_json::json!({
+                "quantization_family": "binary",
+                "created-by": "qdrant-edge-builder-v1",
+            }),
+        },
+        BlobSpec {
+            blob_type: "ann-hnsw-graph-meta-v1",
+            bytes: &graph_meta_bytes,
+            properties: serde_json::json!({
+                "m": "16",
+                "ef_construct": "100",
+                "vector_count": rd.body.len().to_string(),
+                "created-by": "qdrant-edge-builder-v1",
+            }),
+        },
+        BlobSpec {
+            blob_type: "ann-hnsw-graph-links-v1",
+            bytes: &graph_links_bytes,
+            properties: serde_json::json!({
+                "format": "compressed",
+                "created-by": "qdrant-edge-builder-v1",
+            }),
+        },
+        BlobSpec {
+            blob_type: "ann-hnsw-row-pointers-v1",
+            bytes: &row_ptr_bytes,
+            properties: serde_json::json!({
+                "entry_count": rd.body.len().to_string(),
+                "created-by": "qdrant-edge-builder-v1",
+            }),
+        },
+    ];
+    write_puffin(&puffin_path, &blobs).unwrap();
+    let t_write = t_write_0.elapsed();
+    let container_size = fs::metadata(&puffin_path).unwrap().len();
+    println!(
+        "BUILD (c)  container assemble + write ({} B, {:.1} MiB): {t_write:?}",
+        container_size,
+        container_size as f64 / 1024.0 / 1024.0,
+    );
+
+    let build_total = build_total_t0.elapsed();
+    println!(
+        "BUILD TOTAL (scaffold+HNSW+graph-save+quantize+write): {build_total:?}",
+    );
+    println!(
+        "  NOTE: single-threaded upper bound; Qdrant's production builder parallelises the HNSW link loop.",
+    );
+
+    // ==================== UPLOAD ====================
+    let container_bytes = fs::read(&puffin_path).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let t_upload_0 = std::time::Instant::now();
+    put_bytes_multipart(&rt, store.as_ref(), PHASE4C_OBJECT_KEY, container_bytes).unwrap();
+    let t_upload = t_upload_0.elapsed();
+    println!(
+        "UPLOAD container ({:.1} MiB) via multipart: {t_upload:?}",
+        container_size as f64 / 1024.0 / 1024.0,
+    );
+
+    // ==================== FETCH: 3 reps miss/hit ====================
+    let mut miss_us: Vec<f64> = Vec::with_capacity(3);
+    let mut hit_us: Vec<f64> = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let cache_root = TempDir::new().unwrap();
+        let fetcher =
+            PuffinFetcher::new(Arc::clone(&store), cache_root.path().to_path_buf()).unwrap();
+        let (_, miss) = time_it(|| fetcher.fetch(PHASE4C_OBJECT_KEY, SNAPSHOT_A).unwrap());
+        miss_us.push(miss.as_secs_f64() * 1e6);
+        let (_, hit) = time_it(|| fetcher.fetch(PHASE4C_OBJECT_KEY, SNAPSHOT_A).unwrap());
+        hit_us.push(hit.as_secs_f64() * 1e6);
+    }
+    println!(
+        "FETCH [{S3_ENDPOINT_LABEL}] cache-miss (3 reps, container {:.1} MiB): {}",
+        container_size as f64 / 1024.0 / 1024.0,
+        median_spread_ms(miss_us),
+    );
+    println!(
+        "FETCH [{S3_ENDPOINT_LABEL}] cache-hit  (3 reps): {}",
+        median_spread_us(hit_us),
+    );
+
+    // ==================== LOAD FROM CACHED FILE ====================
+    let cache_root = TempDir::new().unwrap();
+    let fetcher =
+        PuffinFetcher::new(Arc::clone(&store), cache_root.path().to_path_buf()).unwrap();
+    let cached_path = fetcher.fetch(PHASE4C_OBJECT_KEY, SNAPSHOT_A).unwrap();
+    let shared_mmap = mmap_whole_file(&cached_path);
+    let file_bytes = fs::read(&cached_path).unwrap();
+    let footer = read_and_validate_footer(&file_bytes).unwrap();
+
+    let meta_range = footer.by_type("ann-hnsw-graph-meta-v1").unwrap();
+    let meta_slice = &shared_mmap[meta_range.offset..meta_range.offset + meta_range.length];
+    let graph_data: GraphLayerData<'_> = bincode::deserialize(meta_slice).unwrap();
+    let links_range = footer.by_type("ann-hnsw-graph-links-v1").unwrap();
+    let links = GraphLinks::load_from_ranged_mmap(
+        Arc::clone(&shared_mmap),
+        links_range.offset as u64,
+        links_range.length as u64,
+        GraphLinksFormat::Compressed,
+    )
+    .unwrap();
+    let graph_layers = GraphLayers {
+        hnsw_m: HnswM::new(graph_data.m, graph_data.m0),
+        links,
+        entry_points: graph_data.entry_points.into_owned(),
+        visited_pool: VisitedPool::new(),
+    };
+    graph_layers.links.populate().unwrap();
+
+    // ==================== LOCAL MEASUREMENTS ====================
+    // Recall@10 + containment: 1 rep (deterministic).
+    let quant_range = footer.by_type("ann-hnsw-quantized-vectors-v1").unwrap();
+    let quant_meta_range = footer.by_type("ann-hnsw-quantized-meta-v1").unwrap();
+    let extract_tmp = TempDir::new().unwrap();
+    let data_path = extract_tmp.path().join("recovered.bin");
+    let meta_path = extract_tmp.path().join("recovered.meta.json");
+    fs::write(
+        &data_path,
+        &shared_mmap[quant_range.offset..quant_range.offset + quant_range.length],
+    )
+    .unwrap();
+    fs::write(
+        &meta_path,
+        &shared_mmap[quant_meta_range.offset..quant_meta_range.offset + quant_meta_range.length],
+    )
+    .unwrap();
+    let storage = TestEncodedStorage::from_file(&data_path, quantized_vec_size).unwrap();
+    let encoded =
+        EncodedVectorsBin::<u128, TestEncodedStorage>::load(storage, &meta_path).unwrap();
+
+    let is_stopped = AtomicBool::new(false);
+    let mut per_query_recall: Vec<f64> = Vec::with_capacity(rd.queries.len());
+    let mut per_query_containment: Vec<f64> = Vec::with_capacity(rd.queries.len());
+    let t_local_0 = std::time::Instant::now();
+    for (qi, q) in rd.queries.iter().enumerate() {
+        // HNSW top-10
+        let hnsw_top10 = graph_layers
+            .search(
+                10, 64, SearchAlgorithm::Hnsw,
+                scaffold.scorer(q.clone()), None, &is_stopped,
+            )
+            .unwrap();
+        let hnsw_ids: HashSet<PointOffsetType> = hnsw_top10.iter().map(|s| s.idx).collect();
+
+        // Brute-force ground truth for recall (full-precision Dot)
+        let mut bf_scorer = scaffold.scorer(q.clone());
+        let all_points: Vec<PointOffsetType> =
+            (0..rd.body.len() as PointOffsetType).collect();
+        let mut bf_scored: Vec<_> = bf_scorer
+            .score_points_unfiltered(&all_points)
+            .collect::<Vec<_>>();
+        bf_scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        let bf_top10: Vec<PointOffsetType> = bf_scored[..10].iter().map(|s| s.idx).collect();
+        let bf_top10_set: HashSet<PointOffsetType> = bf_top10.iter().copied().collect();
+        let recall = hnsw_ids.intersection(&bf_top10_set).count() as f64 / 10.0;
+        per_query_recall.push(recall);
+
+        // Containment: BF top-10 ⊂ Quant top-100
+        let hw = HardwareCounterCell::new();
+        let encoded_query = encoded.encode_query(q);
+        let mut q_scored: Vec<(PointOffsetType, f32)> = (0..rd.body.len() as PointOffsetType)
+            .map(|i| (i, encoded.score_point(&encoded_query, i, &hw)))
+            .collect();
+        q_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let q_top100: HashSet<PointOffsetType> =
+            q_scored[..100].iter().map(|&(id, _)| id).collect();
+        let contained = bf_top10.iter().filter(|id| q_top100.contains(id)).count();
+        per_query_containment.push(contained as f64 / 10.0);
+
+        println!(
+            "  q[{qi:02}] recall@10={recall:.3}  containment(BF10⊂Q100)={:.3}",
+            per_query_containment.last().unwrap(),
+        );
+    }
+    let t_local = t_local_0.elapsed();
+    let mean_recall: f64 =
+        per_query_recall.iter().sum::<f64>() / per_query_recall.len() as f64;
+    let mean_containment: f64 =
+        per_query_containment.iter().sum::<f64>() / per_query_containment.len() as f64;
+    println!(
+        "LOCAL recall+containment (1 rep, 20 queries, {t_local:?}):",
+    );
+    println!("  MEAN recall@10                    = {mean_recall:.3}");
+    println!("  MEAN containment (BF10⊂Quant100)  = {mean_containment:.3}");
+
+    // Warm-path p50/p95: 5 reps.
+    let mut p50_samples: Vec<f64> = Vec::with_capacity(5);
+    let mut p95_samples: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let mut micros: Vec<f64> = Vec::with_capacity(rd.queries.len());
+        for q in &rd.queries {
+            let (_top, elapsed) = time_it(|| {
+                graph_layers
+                    .search(
+                        10, 64, SearchAlgorithm::Hnsw,
+                        scaffold.scorer(q.clone()), None, &is_stopped,
+                    )
+                    .unwrap()
+            });
+            micros.push(elapsed.as_secs_f64() * 1e6);
+        }
+        micros.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        p50_samples.push(percentile(&micros, 0.50));
+        p95_samples.push(percentile(&micros, 0.95));
+    }
+    println!("LOCAL warm-path per-query latency (20 queries × 5 reps):");
+    println!("  p50: {}", median_spread_us(p50_samples));
+    println!("  p95: {}", median_spread_us(p95_samples));
+
+    // ==================== RERANK (1 rep × 20 queries) ====================
+    let rp_range = footer.by_type("ann-hnsw-row-pointers-v1").unwrap();
+    let rp = &shared_mmap[rp_range.offset..rp_range.offset + rp_range.length];
+    let row_pointers = decode_all_row_pointers(rp, rd.body.len());
+
+    let parquet_key = LOGICAL_PARQUET_NAME;
+    let parquet_key_path = object_store::path::Path::from(parquet_key);
+    let repo_parquet = repo_root().join("data/gte_product_embeddings.parquet");
+    let parquet_size = fs::metadata(&repo_parquet).unwrap().len();
+    let head = rt.block_on(store.head(&parquet_key_path));
+    let need_upload = !matches!(&head, Ok(m) if m.size == parquet_size);
+    if need_upload {
+        println!("RERANK: parquet not present or wrong size — uploading");
+        let bytes = fs::read(&repo_parquet).unwrap();
+        put_bytes_multipart(&rt, store.as_ref(), parquet_key, bytes).unwrap();
+    } else {
+        println!("RERANK: parquet already in bucket (skipping upload)");
+    }
+
+    let bytes_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut meta_reader = StoreAsyncFileReader {
+        store: Arc::clone(&store),
+        path: parquet_key_path.clone(),
+        file_size: parquet_size,
+        bytes_counter: Arc::clone(&bytes_counter),
+    };
+    let parquet_meta = rt.block_on(async {
+        <StoreAsyncFileReader as parquet::arrow::async_reader::AsyncFileReader>::get_metadata(
+            &mut meta_reader,
+            None,
+        )
+        .await
+        .unwrap()
+    });
+    let meta_fetch_bytes = bytes_counter.load(std::sync::atomic::Ordering::Relaxed);
+    let schema_descr = parquet_meta.file_metadata().schema_descr_ptr();
+    let gte_col_idx = (0..schema_descr.num_columns())
+        .find(|&i| {
+            schema_descr
+                .column(i)
+                .path()
+                .parts()
+                .first()
+                .map(String::as_str)
+                == Some("gte")
+        })
+        .expect("parquet schema missing 'gte' leaf");
+    let projection = ProjectionMask::leaves(&schema_descr, vec![gte_col_idx]);
+
+    let mut rerank_search_us = Vec::new();
+    let mut rerank_rerank_us = Vec::new();
+    let mut rerank_total_us = Vec::new();
+    let mut rerank_bytes: Vec<u64> = Vec::new();
+    let mut rerank_row_groups: Vec<usize> = Vec::new();
+    let mut rerank_overlaps: Vec<f64> = Vec::new();
+    let mut rerank_all_rg_sizes: Vec<u64> = Vec::new();
+
+    for (qi, q) in rd.queries.iter().enumerate() {
+        // BQ top-10 for overlap
+        let hw = HardwareCounterCell::new();
+        let encoded_query = encoded.encode_query(q);
+        let mut bq_scored: Vec<(PointOffsetType, f32)> = (0..rd.body.len() as PointOffsetType)
+            .map(|i| (i, encoded.score_point(&encoded_query, i, &hw)))
+            .collect();
+        bq_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let bq_top10: HashSet<PointOffsetType> =
+            bq_scored[..10].iter().map(|&(id, _)| id).collect();
+
+        bytes_counter.store(0, std::sync::atomic::Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
+
+        let candidates = graph_layers
+            .search(
+                100, 128, SearchAlgorithm::Hnsw,
+                scaffold.scorer(q.clone()), None, &is_stopped,
+            )
+            .unwrap();
+        let candidate_ids: Vec<u32> = candidates.iter().map(|s| s.idx).collect();
+        let t1 = std::time::Instant::now();
+        let search_us = t1.duration_since(t0).as_secs_f64() * 1e6;
+
+        let mut by_group: std::collections::BTreeMap<u32, Vec<(u32, u32)>> =
+            std::collections::BTreeMap::new();
+        for &vec_id in &candidate_ids {
+            let (rp_vec_id, _fp, rg, off) = row_pointers[vec_id as usize];
+            assert_eq!(rp_vec_id, vec_id);
+            by_group.entry(rg).or_default().push((vec_id, off));
+        }
+        let unique_row_groups = by_group.len();
+
+        let mut candidate_vectors: std::collections::HashMap<u32, Vec<f32>> =
+            std::collections::HashMap::with_capacity(candidate_ids.len());
+        for (&rg, entries) in by_group.iter() {
+            rerank_all_rg_sizes.push(row_group_sizes[rg as usize]);
+            let reader = StoreAsyncFileReader {
+                store: Arc::clone(&store),
+                path: parquet_key_path.clone(),
+                file_size: parquet_size,
+                bytes_counter: Arc::clone(&bytes_counter),
+            };
+            let batches: Vec<arrow::record_batch::RecordBatch> = rt.block_on(async {
+                let arrow_meta = parquet::arrow::arrow_reader::ArrowReaderMetadata::try_new(
+                    Arc::clone(&parquet_meta),
+                    parquet::arrow::arrow_reader::ArrowReaderOptions::new(),
+                )
+                .unwrap();
+                let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta)
+                    .with_row_groups(vec![rg as usize])
+                    .with_projection(projection.clone());
+                builder.build().unwrap().try_collect::<Vec<_>>().await.unwrap()
+            });
+            let offsets: Vec<u32> = entries.iter().map(|&(_, off)| off).collect();
+            let vectors = extract_wanted_vectors(&batches, &offsets);
+            for (i, (vec_id, _)) in entries.iter().enumerate() {
+                candidate_vectors.insert(*vec_id, vectors[i].clone());
+            }
+        }
+
+        let mut rerank_scored: Vec<(u32, f32)> = candidate_ids
+            .iter()
+            .map(|&vec_id| {
+                let v = &candidate_vectors[&vec_id];
+                let s: f32 = q.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+                (vec_id, s)
+            })
+            .collect();
+        rerank_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let rerank_top10: HashSet<u32> =
+            rerank_scored[..10].iter().map(|&(id, _)| id).collect();
+        let t2 = std::time::Instant::now();
+        let rerank_us = t2.duration_since(t1).as_secs_f64() * 1e6;
+        let total_us = t2.duration_since(t0).as_secs_f64() * 1e6;
+        let bytes_q = bytes_counter.load(std::sync::atomic::Ordering::Relaxed);
+        let overlap = rerank_top10.intersection(&bq_top10).count() as f64 / 10.0;
+
+        rerank_search_us.push(search_us);
+        rerank_rerank_us.push(rerank_us);
+        rerank_total_us.push(total_us);
+        rerank_bytes.push(bytes_q);
+        rerank_row_groups.push(unique_row_groups);
+        rerank_overlaps.push(overlap);
+
+        println!(
+            "  RERANK q[{qi:02}] search={search_us:>8.1} µs  rerank={rerank_us:>10.1} µs  total={total_us:>10.1} µs  bytes={bytes_q:>10}  rg={unique_row_groups:>3}  overlap={overlap:.2}",
+        );
+    }
+
+    // Aggregate rerank.
+    let sort_f = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v
+    };
+    let median_of = |v: &[f64]| v[v.len() / 2];
+    let min_of = |v: &[f64]| *v.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+    let max_of = |v: &[f64]| *v.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+    let p95_of = |v: &[f64]| percentile(v, 0.95);
+
+    let s_sorted = sort_f(rerank_search_us.clone());
+    let r_sorted = sort_f(rerank_rerank_us.clone());
+    let t_sorted = sort_f(rerank_total_us.clone());
+    let mut b_sorted = rerank_bytes.clone();
+    b_sorted.sort();
+    let mut rg_sorted = rerank_row_groups.clone();
+    rg_sorted.sort();
+    let o_sorted = sort_f(rerank_overlaps.clone());
+    let rg_size_min = *rerank_all_rg_sizes.iter().min().unwrap();
+    let rg_size_max = *rerank_all_rg_sizes.iter().max().unwrap();
+
+    println!();
+    println!("Phase 4c rerank-over-parquet [{S3_ENDPOINT_LABEL}], 20 queries × 1 rep:");
+    println!(
+        "  HNSW search wall-clock : p50 = {:>9.1} µs  [min {:.1}, max {:.1}], p95 = {:.1} µs",
+        median_of(&s_sorted), min_of(&s_sorted), max_of(&s_sorted), p95_of(&s_sorted),
+    );
+    println!(
+        "  Rerank wall-clock      : p50 = {:>9.1} µs  [min {:.1}, max {:.1}], p95 = {:.1} µs",
+        median_of(&r_sorted), min_of(&r_sorted), max_of(&r_sorted), p95_of(&r_sorted),
+    );
+    println!(
+        "  Total (search+rerank)  : p50 = {:>9.1} µs  [min {:.1}, max {:.1}], p95 = {:.1} µs",
+        median_of(&t_sorted), min_of(&t_sorted), max_of(&t_sorted), p95_of(&t_sorted),
+    );
+    println!(
+        "  Bytes fetched per query: median = {}  [min {}, max {}]",
+        b_sorted[b_sorted.len() / 2], b_sorted[0], b_sorted[b_sorted.len() - 1],
+    );
+    println!(
+        "  Unique row-groups per query: median = {}  [min {}, max {}]",
+        rg_sorted[rg_sorted.len() / 2], rg_sorted[0], rg_sorted[rg_sorted.len() - 1],
+    );
+    println!(
+        "  Overlap(BQ top-10 ↔ rerank top-10): median = {:.2}  [min {:.2}, max {:.2}]",
+        median_of(&o_sorted), min_of(&o_sorted), max_of(&o_sorted),
+    );
+    println!(
+        "  Row-group row-count across touched groups: min = {rg_size_min}, max = {rg_size_max}",
+    );
+    println!(
+        "  Parquet metadata fetch (once, off timing loop): {meta_fetch_bytes} bytes",
+    );
+
+    println!();
+    println!("========================================");
+    println!("Phase 4c full-scale run: complete");
+    println!("========================================");
+}
