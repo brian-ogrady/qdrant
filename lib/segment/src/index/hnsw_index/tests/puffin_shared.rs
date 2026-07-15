@@ -876,14 +876,35 @@ pub(super) enum QuantVariant {
 impl QuantVariant {
     pub fn from_env() -> Self {
         match std::env::var("PUFFIN_QUANT").as_deref() {
-            Err(_) | Ok("") | Ok("bq") => Self::Bq,
-            Ok("tq4") => Self::Tq(TurboQuantBitSize::Bits4),
-            Ok("tq2") => Self::Tq(TurboQuantBitSize::Bits2),
-            Ok("tq1_5") => Self::Tq(TurboQuantBitSize::Bits1_5),
-            Ok("tq1") => Self::Tq(TurboQuantBitSize::Bits1),
-            Ok(other) => panic!(
-                "PUFFIN_QUANT={other:?} not recognised (expected: bq, tq4, tq2, tq1_5, tq1)"
-            ),
+            Err(_) | Ok("") => Self::Bq,
+            Ok(code) => Self::from_code(code).unwrap_or_else(|| {
+                panic!("PUFFIN_QUANT={code:?} not recognised (expected: bq, tq4, tq2, tq1_5, tq1)")
+            }),
+        }
+    }
+
+    /// Parse the short variant code — the token `code()` emits and Phase-5
+    /// containers store under the `quantization_variant` blob property, making
+    /// a container self-describing to a reader that has no env context.
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "bq" => Some(Self::Bq),
+            "tq4" => Some(Self::Tq(TurboQuantBitSize::Bits4)),
+            "tq2" => Some(Self::Tq(TurboQuantBitSize::Bits2)),
+            "tq1_5" => Some(Self::Tq(TurboQuantBitSize::Bits1_5)),
+            "tq1" => Some(Self::Tq(TurboQuantBitSize::Bits1)),
+            _ => None,
+        }
+    }
+
+    /// Short machine-readable code; always the first token of `label()`.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Bq => "bq",
+            Self::Tq(TurboQuantBitSize::Bits4) => "tq4",
+            Self::Tq(TurboQuantBitSize::Bits2) => "tq2",
+            Self::Tq(TurboQuantBitSize::Bits1_5) => "tq1_5",
+            Self::Tq(TurboQuantBitSize::Bits1) => "tq1",
         }
     }
 
