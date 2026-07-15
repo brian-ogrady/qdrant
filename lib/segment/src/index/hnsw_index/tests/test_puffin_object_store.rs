@@ -694,15 +694,19 @@ fn build_opt_in_store(endpoint: String) -> Option<Arc<dyn ObjectStore>> {
     let access = std::env::var("AWS_ACCESS_KEY_ID").ok()?;
     let secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok()?;
     let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-    let s3 = object_store::aws::AmazonS3Builder::new()
+    let mut builder = object_store::aws::AmazonS3Builder::new()
         .with_endpoint(endpoint)
         .with_bucket_name(bucket)
         .with_access_key_id(access)
         .with_secret_access_key(secret)
         .with_region(region)
-        .with_allow_http(true)
-        .build()
-        .expect("build AmazonS3");
+        .with_allow_http(true);
+    // Temporary credentials (STS/SSO/instance-role; key ids starting "ASIA")
+    // are only valid together with their session token.
+    if let Ok(token) = std::env::var("AWS_SESSION_TOKEN") {
+        builder = builder.with_token(token);
+    }
+    let s3 = builder.build().expect("build AmazonS3");
     Some(Arc::new(s3))
 }
 
