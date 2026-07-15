@@ -847,19 +847,73 @@ impl RealDataScaffold {
 // FilteredScorer::new (point_scorer.rs:118) demands a &VectorStorageEnum even
 // when the caller wants quantized-only scoring. §6.2 tracks the disaggregated
 // FilteredScorer story as production work; here we build both a
-// VectorStorageEnum and a QuantizedVectors from the supplied vectors so the
-// same-encoder-shape (1-bit binary via EncodedVectorsBin<u128,_>) drives the
-// scoring RawScorer. Graph traversal uses the QuantizedVectors' raw_scorer
+// VectorStorageEnum and a QuantizedVectors from the supplied vectors so a
+// production-shaped encoder (variant selected via `PUFFIN_QUANT`, see
+// [`QuantVariant`]; default 1-bit binary) drives the scoring RawScorer. Graph traversal uses the QuantizedVectors' raw_scorer
 // (point_scorer.rs:127), i.e. the production hot path in disaggregated
 // intent. Full-precision storage stays alongside only to satisfy the
 // FilteredScorer signature — it is NOT touched during scoring.
 
 use crate::types::{
     BinaryQuantizationConfig, BinaryQuantizationEncoding, QuantizationConfig,
+    TurboQuantBitSize, TurboQuantQuantizationConfig, TurboQuantization,
 };
 use crate::vector_storage::quantized::quantized_vectors::{
     QuantizedVectors, QuantizedVectorsStorageType,
 };
+
+/// Quantization variant driving the quantized-scored scaffold, selected via
+/// the `PUFFIN_QUANT` env var (same opt-in pattern as `PUFFIN_FIXTURE_N`):
+/// `bq` (default — preserves all previously-committed numbers), `tq4`,
+/// `tq2`, `tq1_5`, `tq1`. Both families go through the production
+/// `QuantizedVectors::create` path, so a run compares codecs, not harnesses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QuantVariant {
+    Bq,
+    Tq(TurboQuantBitSize),
+}
+
+impl QuantVariant {
+    pub fn from_env() -> Self {
+        match std::env::var("PUFFIN_QUANT").as_deref() {
+            Err(_) | Ok("") | Ok("bq") => Self::Bq,
+            Ok("tq4") => Self::Tq(TurboQuantBitSize::Bits4),
+            Ok("tq2") => Self::Tq(TurboQuantBitSize::Bits2),
+            Ok("tq1_5") => Self::Tq(TurboQuantBitSize::Bits1_5),
+            Ok("tq1") => Self::Tq(TurboQuantBitSize::Bits1),
+            Ok(other) => panic!(
+                "PUFFIN_QUANT={other:?} not recognised (expected: bq, tq4, tq2, tq1_5, tq1)"
+            ),
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Bq => "bq (binary 1-bit, EncodedVectorsBin<u128>)",
+            Self::Tq(TurboQuantBitSize::Bits4) => "tq4 (TurboQuant 4-bit)",
+            Self::Tq(TurboQuantBitSize::Bits2) => "tq2 (TurboQuant 2-bit)",
+            Self::Tq(TurboQuantBitSize::Bits1_5) => "tq1_5 (TurboQuant 1.5-bit)",
+            Self::Tq(TurboQuantBitSize::Bits1) => "tq1 (TurboQuant 1-bit)",
+        }
+    }
+
+    fn config(&self) -> QuantizationConfig {
+        match self {
+            Self::Bq => BinaryQuantizationConfig {
+                always_ram: Some(true),
+                encoding: Some(BinaryQuantizationEncoding::OneBit),
+                query_encoding: None,
+            }
+            .into(),
+            Self::Tq(bits) => QuantizationConfig::Turbo(TurboQuantization {
+                turbo: TurboQuantQuantizationConfig {
+                    always_ram: Some(true),
+                    bits: Some(*bits),
+                },
+            }),
+        }
+    }
+}
 
 pub(super) struct QuantizedRealDataScaffold {
     storage: VectorStorageEnum,
@@ -869,7 +923,7 @@ pub(super) struct QuantizedRealDataScaffold {
 }
 
 impl QuantizedRealDataScaffold {
-    pub fn new(vectors: &[Vec<f32>]) -> Self {
+    pub fn new(vectors: &[Vec<f32>], variant: QuantVariant) -> Self {
         let mut storage = new_volatile_dense_vector_storage(DIM, Distance::Dot);
         let hw = HardwareCounterCell::new();
         for (i, v) in vectors.iter().enumerate() {
@@ -879,12 +933,7 @@ impl QuantizedRealDataScaffold {
                 .expect("insert_vector");
         }
         let tmp = TempDir::new().unwrap();
-        let config: QuantizationConfig = BinaryQuantizationConfig {
-            always_ram: Some(true),
-            encoding: Some(BinaryQuantizationEncoding::OneBit),
-            query_encoding: None,
-        }
-        .into();
+        let config = variant.config();
         let quantized = QuantizedVectors::create(
             &storage,
             &config,
@@ -893,7 +942,7 @@ impl QuantizedRealDataScaffold {
             /* max_threads */ 1,
             &AtomicBool::new(false),
         )
-        .expect("QuantizedVectors::create (binary 1-bit)");
+        .unwrap_or_else(|e| panic!("QuantizedVectors::create ({}): {e}", variant.label()));
         let deleted = BitVec::repeat(false, vectors.len());
         Self {
             storage,

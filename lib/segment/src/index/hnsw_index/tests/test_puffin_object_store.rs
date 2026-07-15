@@ -1888,6 +1888,7 @@ fn test_phase4c_full_scale_run() {
 
 fn phase4d_scaffold_and_graph_for_n(
     n: usize,
+    quant: super::puffin_shared::QuantVariant,
 ) -> Option<(super::puffin_shared::RealDataFixture, super::puffin_shared::RealDataScaffold, super::puffin_shared::QuantizedRealDataScaffold, GraphLayers)> {
     use super::puffin_shared::{FIXTURE_100K, FIXTURE_1M, QuantizedRealDataScaffold, try_load_real_data_from};
     let files = if n == 999_980 { &FIXTURE_1M } else { &FIXTURE_100K };
@@ -1919,8 +1920,8 @@ fn phase4d_scaffold_and_graph_for_n(
     let graph_layers = builder.into_graph_layers_ram(GraphLinksFormatParam::Compressed);
 
     // Quantized scaffold — the search path uses this. Built from the same
-    // vectors so its bytes match the container's quantized blob shape.
-    let q_scaffold = QuantizedRealDataScaffold::new(&rd.body);
+    // vectors; the codec is selected by `quant` (PUFFIN_QUANT env var).
+    let q_scaffold = QuantizedRealDataScaffold::new(&rd.body, quant);
 
     Some((rd, fp_scaffold, q_scaffold, graph_layers))
 }
@@ -1971,7 +1972,7 @@ fn phase4d_recall(
     body_len: usize,
     ef: usize,
 ) -> Vec<f64> {
-    // Per-query recall@10 under BQ-scored traversal against BF full-precision top-10.
+    // Per-query recall@10 under quantized-scored traversal against BF full-precision top-10.
     let is_stopped = AtomicBool::new(false);
     let mut per_query = Vec::with_capacity(queries.len());
     for q in queries {
@@ -2013,12 +2014,13 @@ fn test_phase4d_quantized_warm_path() {
         Some(999_980) => 999_980,
         _ => 100_000,
     };
+    let quant = super::puffin_shared::QuantVariant::from_env();
     println!("==========================================");
-    println!("Phase 4d quantized warm-path: N={n}");
+    println!("Phase 4d quantized warm-path: N={n}, quant={}", quant.label());
     println!("==========================================");
 
     let Some((rd, fp_scaffold, q_scaffold, graph_layers)) =
-        phase4d_scaffold_and_graph_for_n(n)
+        phase4d_scaffold_and_graph_for_n(n, quant)
     else {
         println!("Phase 4d skipped: real-data fixture not present for N={n}");
         return;
@@ -2058,7 +2060,10 @@ fn test_phase4d_quantized_warm_path() {
     for (qi, r) in recall.iter().enumerate() {
         println!("  q[{qi:02}] recall@10={r:.3}");
     }
-    println!("Phase 4d recall@10 (BQ-scored traversal, ef={ef}): MEAN = {mean_recall:.3}");
+    println!(
+        "Phase 4d recall@10 ({}-scored traversal, ef={ef}): MEAN = {mean_recall:.3}",
+        quant.label(),
+    );
 
     // If mean recall < ~0.90 at ef=64, also run ef=128 and print both.
     if mean_recall < 0.90 {
@@ -2089,7 +2094,10 @@ fn test_phase4d_quantized_warm_path() {
         for (qi, r) in recall2.iter().enumerate() {
             println!("  q[{qi:02}] recall@10={r:.3}");
         }
-        println!("Phase 4d recall@10 (BQ-scored traversal, ef={ef2}): MEAN = {mean_recall2:.3}");
+        println!(
+            "Phase 4d recall@10 ({}-scored traversal, ef={ef2}): MEAN = {mean_recall2:.3}",
+            quant.label(),
+        );
     } else {
         println!("Phase 4d recall ≥ 0.90 at ef={ef} — ef=128 skipped");
     }
