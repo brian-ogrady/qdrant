@@ -2106,3 +2106,390 @@ fn test_phase4d_quantized_warm_path() {
     println!("Phase 4d complete");
     println!("==========================================");
 }
+
+// -------- Phase 4e: cold-start decomposition over S3 (opt-in) --------------
+//
+// Answers "are we capturing cold start?": the elapsed time from an EMPTY
+// local cache to the first search result, decomposed per stage. Phase 4/4c
+// time the fetch in isolation and Phase 4d times warm traversal only; 4e
+// chains fetch → mmap+footer → graph assemble → quantized load → first
+// quantized query, reporting each stage and their sum (time-to-first-result).
+//
+// The container is variant-aware: unlike the Phase 1/2 fixture (whose blob
+// bytes are hardcoded 1-bit EncodedVectorsBin, asserted structurally by those
+// phases), 4e embeds whatever files the production `QuantizedVectors::create`
+// writes for the `PUFFIN_QUANT`-selected codec, each blob tagged with its
+// `file_name`, plus `quantized.config.json` under a new
+// `ann-hnsw-quantized-config-v1` blob type. That makes the container
+// self-describing on the read side and — the point of the exercise — makes
+// the cold fetch cost scale with the codec's true blob size, the axis on
+// which bq (32× smaller than f32) and tq4 (8×) actually trade off.
+//
+// Opt-in gates (all skip cleanly): PUFFIN_S3_ENDPOINT + PUFFIN_S3_BUCKET +
+// AWS creds; the real-data fixture. PUFFIN_FIXTURE_N sizes the body
+// (default 10_000); PUFFIN_QUANT selects the codec (default bq).
+//
+// The full-precision volatile storage rebuilt from the local fixture exists
+// only to satisfy `FilteredScorer::new`'s signature (§6.2) and to feed
+// `QuantizedVectors::create/load`; it is never touched during traversal and
+// is deliberately excluded from every cold-start timing.
+
+#[test]
+fn test_phase4e_cold_start_opt_in() {
+    use crate::data_types::vectors::{VectorElementType, VectorRef};
+    use crate::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
+    use crate::index::hnsw_index::graph_links::GraphLinksFormatParam;
+    use crate::index::hnsw_index::point_scorer::FilteredScorer;
+    use crate::vector_storage::VectorStorage;
+    use crate::vector_storage::dense::volatile_dense_vector_storage::new_volatile_dense_vector_storage;
+    use crate::vector_storage::quantized::quantized_vectors::{
+        QUANTIZED_CONFIG_PATH, QuantizedVectors, QuantizedVectorsStorageType,
+    };
+    use common::bitvec::BitVec;
+
+    use super::puffin_shared::{BlobSpec, QuantVariant, build_row_pointer_blob, write_puffin};
+
+    let Some(endpoint) = opt_in_endpoint() else {
+        println!("Phase 4e cold-start suite skipped: PUFFIN_S3_ENDPOINT not set");
+        return;
+    };
+    let Some(store) = build_opt_in_store(endpoint) else {
+        panic!("S3 endpoint set but bucket/creds missing");
+    };
+    let n = resolve_measurement_n();
+    let Some(rd) = try_load_real_data(n) else {
+        println!("Phase 4e cold-start suite skipped: real-data fixture not present");
+        return;
+    };
+    let variant = QuantVariant::from_env();
+    // First token of the label is the short code ("bq", "tq4", ...).
+    let code = variant.label().split_whitespace().next().unwrap();
+    println!("Phase 4e cold start: N={n}, variant={}", variant.label());
+
+    // ==================== BUILD (not part of cold start) ====================
+    // Graph seed offset matches Phase 4c/4d so all three phases traverse a
+    // bit-identical graph at the same N.
+    let fp_scaffold = RealDataScaffold::new(Distance::Dot, &rd.body);
+    let tmp = TempDir::new().unwrap();
+    let graph_dir = tmp.path().join("graph");
+    fs::create_dir_all(&graph_dir).unwrap();
+    let mut level_rng = rand::rngs::StdRng::seed_from_u64(FIXTURE_SEED.wrapping_add(0x4000));
+    let mut builder = GraphLayersBuilder::new(
+        rd.body.len(),
+        HnswM::new2(16),
+        /* ef_construct */ 100,
+        /* entry_points_num */ 10,
+        /* use_heuristic */ true,
+    );
+    for idx in 0..rd.body.len() as PointOffsetType {
+        let level = builder.get_random_layer(&mut level_rng);
+        builder.set_levels(idx, level);
+        builder.link_new_point(idx, fp_scaffold.internal_scorer(idx));
+    }
+    builder
+        .into_graph_layers(&graph_dir, GraphLinksFormatParam::Compressed, /* on_disk */ false)
+        .unwrap();
+    let graph_meta_bytes = fs::read(graph_dir.join("graph.bin")).unwrap();
+    let graph_links_bytes = fs::read(graph_dir.join("links_compressed.bin")).unwrap();
+
+    // Full-precision volatile storage: FilteredScorer signature + quantize
+    // input + QuantizedVectors::load's storage argument. Never scored against.
+    let mut storage = new_volatile_dense_vector_storage(DIM, Distance::Dot);
+    let hw = HardwareCounterCell::new();
+    for (i, v) in rd.body.iter().enumerate() {
+        let v = Distance::Dot.preprocess_vector::<VectorElementType>(v.clone());
+        storage
+            .insert_vector(i as PointOffsetType, VectorRef::from(&v), &hw)
+            .unwrap();
+    }
+    let deleted = BitVec::repeat(false, rd.body.len());
+
+    // Quantize through the production path for the selected variant, then
+    // collect every artifact file it wrote — those files ARE the blobs.
+    let quant_src_dir = tmp.path().join("quant");
+    fs::create_dir_all(&quant_src_dir).unwrap();
+    let (quantized_src, t_quantize) = time_it(|| {
+        QuantizedVectors::create(
+            &storage,
+            &variant.config(),
+            QuantizedVectorsStorageType::Immutable,
+            &quant_src_dir,
+            /* max_threads */ 4,
+            &AtomicBool::new(false),
+        )
+        .unwrap_or_else(|e| panic!("QuantizedVectors::create ({}): {e}", variant.label()))
+    });
+    let quant_files: Vec<(String, Vec<u8>)> = quantized_src
+        .files()
+        .into_iter()
+        .map(|p| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            let bytes = fs::read(&p).unwrap();
+            (name, bytes)
+        })
+        .collect();
+    drop(quantized_src);
+    println!(
+        "BUILD quantize encode [{}]: {t_quantize:?} ({} artifact files)",
+        variant.label(),
+        quant_files.len(),
+    );
+
+    // Row pointers: real parquet mapping when the sidecar provides it (so the
+    // uploaded container stays rerank-able), mock shape otherwise.
+    let (rp_paths, rp_entries): (Vec<String>, Vec<(u32, u32, u32, u32)>) =
+        match (&rd.body_source_indices, rd.body_sidecar.row_group_sizes.is_empty()) {
+            (Some(src), false) => (
+                vec![LOGICAL_PARQUET_NAME.to_string()],
+                src.iter()
+                    .enumerate()
+                    .map(|(i, &s)| {
+                        let (rg, off) =
+                            source_row_to_row_group(&rd.body_sidecar.row_group_sizes, s);
+                        (i as u32, 0u32, rg, off)
+                    })
+                    .collect(),
+            ),
+            _ => (
+                vec!["mock://parquet/dataset/gte.parquet".to_string()],
+                (0..rd.body.len() as u32).map(|i| (i, 0, 0, i)).collect(),
+            ),
+        };
+    let rp_path_refs: Vec<&str> = rp_paths.iter().map(|s| s.as_str()).collect();
+    let row_ptr_bytes = build_row_pointer_blob(&rp_path_refs, &rp_entries);
+
+    let mut blobs: Vec<BlobSpec<'_>> = quant_files
+        .iter()
+        .map(|(name, bytes)| {
+            let blob_type = if name == "quantized.data" {
+                "ann-hnsw-quantized-vectors-v1"
+            } else if name == "quantized.meta.json" {
+                "ann-hnsw-quantized-meta-v1"
+            } else if name == QUANTIZED_CONFIG_PATH {
+                "ann-hnsw-quantized-config-v1"
+            } else {
+                "ann-hnsw-quantized-extra-v1"
+            };
+            BlobSpec {
+                blob_type,
+                bytes,
+                properties: serde_json::json!({
+                    "quantization_variant": code,
+                    "file_name": name,
+                    "dimensions": DIM.to_string(),
+                    "created-by": "qdrant-edge-builder-v1",
+                }),
+            }
+        })
+        .collect();
+    blobs.push(BlobSpec {
+        blob_type: "ann-hnsw-graph-meta-v1",
+        bytes: &graph_meta_bytes,
+        properties: serde_json::json!({
+            "m": "16",
+            "ef_construct": "100",
+            "vector_count": rd.body.len().to_string(),
+            "created-by": "qdrant-edge-builder-v1",
+        }),
+    });
+    blobs.push(BlobSpec {
+        blob_type: "ann-hnsw-graph-links-v1",
+        bytes: &graph_links_bytes,
+        properties: serde_json::json!({
+            "format": "compressed",
+            "created-by": "qdrant-edge-builder-v1",
+        }),
+    });
+    blobs.push(BlobSpec {
+        blob_type: "ann-hnsw-row-pointers-v1",
+        bytes: &row_ptr_bytes,
+        properties: serde_json::json!({
+            "entry_count": rd.body.len().to_string(),
+            "created-by": "qdrant-edge-builder-v1",
+        }),
+    });
+
+    let puffin_path = tmp.path().join("cold_start.puffin");
+    write_puffin(&puffin_path, &blobs).unwrap();
+    let container_bytes = fs::read(&puffin_path).unwrap();
+    println!(
+        "  container: {:.1} MiB total",
+        container_bytes.len() as f64 / 1024.0 / 1024.0,
+    );
+    for b in &blobs {
+        let name = b.properties["file_name"].as_str().unwrap_or("-");
+        println!("    {:<34} {:<22} {:>12} B", b.blob_type, name, b.bytes.len());
+    }
+
+    // ==================== UPLOAD (build-side, reported once) ================
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let object_key = format!("iceberg/table/data/cold_start_{code}_{n}.puffin");
+    let ((), t_upload) = time_it(|| {
+        put_bytes_multipart(&rt, store.as_ref(), &object_key, container_bytes.clone()).unwrap()
+    });
+    drop(rt);
+    println!("UPLOAD {object_key}: {t_upload:?}");
+
+    // ==================== COLD-START REPS ==================================
+    // Each rep: fresh cache dir → miss fetch → mmap+footer → graph assemble →
+    // quantized extract+load → first query. The last rep's loaded index is
+    // kept for the warm sweep.
+    let is_stopped = AtomicBool::new(false);
+    let mut fetch_us: Vec<f64> = Vec::with_capacity(NUM_REPS);
+    let mut mmap_footer_us: Vec<f64> = Vec::with_capacity(NUM_REPS);
+    let mut graph_us: Vec<f64> = Vec::with_capacity(NUM_REPS);
+    let mut quant_us: Vec<f64> = Vec::with_capacity(NUM_REPS);
+    let mut first_query_us: Vec<f64> = Vec::with_capacity(NUM_REPS);
+    let mut ttfr_us: Vec<f64> = Vec::with_capacity(NUM_REPS);
+    let mut last_gets = 0usize;
+    let mut last_heads = 0usize;
+    let mut warm_index: Option<(GraphLayers, QuantizedVectors, TempDir)> = None;
+
+    for _rep in 0..NUM_REPS {
+        let cache_root = TempDir::new().unwrap();
+        let fetcher =
+            PuffinFetcher::new(Arc::clone(&store), cache_root.path().to_path_buf()).unwrap();
+
+        // (1) fetch: S3 → validated local cache file.
+        let (cached_path, d_fetch) = time_it(|| fetcher.fetch(&object_key, SNAPSHOT_A).unwrap());
+        let stats = fetcher.stats();
+        last_gets = stats.gets;
+        last_heads = stats.heads;
+
+        // (2) mmap + footer parse/validate.
+        let ((mmap, footer), d_mmap_footer) = time_it(|| {
+            let mmap = mmap_whole_file(&cached_path);
+            let footer = read_and_validate_footer(&mmap[..]).unwrap();
+            (mmap, footer)
+        });
+
+        // (3) graph assemble (meta bincode + ranged-mmap links + populate).
+        let (graph_layers, d_graph) = time_it(|| {
+            let meta = footer.by_type("ann-hnsw-graph-meta-v1").unwrap();
+            let graph_data: GraphLayerData<'_> =
+                bincode::deserialize(&mmap[meta.offset..meta.offset + meta.length]).unwrap();
+            let links_desc = footer.by_type("ann-hnsw-graph-links-v1").unwrap();
+            let links = GraphLinks::load_from_ranged_mmap(
+                Arc::clone(&mmap),
+                links_desc.offset as u64,
+                links_desc.length as u64,
+                GraphLinksFormat::Compressed,
+            )
+            .unwrap();
+            let graph_layers = GraphLayers {
+                hnsw_m: HnswM::new(graph_data.m, graph_data.m0),
+                links,
+                entry_points: graph_data.entry_points.into_owned(),
+                visited_pool: VisitedPool::new(),
+            };
+            graph_layers.links.populate().unwrap();
+            graph_layers
+        });
+
+        // (4) quantized: extract file_name-tagged blobs → production load.
+        let ((quantized, quant_extract_dir), d_quant) = time_it(|| {
+            let dir = TempDir::new().unwrap();
+            let mut saw_config = false;
+            for blob in &footer.blobs {
+                if !blob.blob_type.starts_with("ann-hnsw-quantized-") {
+                    continue;
+                }
+                let file_name = blob.properties["file_name"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{} blob lacks file_name", blob.blob_type));
+                saw_config |= file_name == QUANTIZED_CONFIG_PATH;
+                fs::write(
+                    dir.path().join(file_name),
+                    &mmap[blob.offset..blob.offset + blob.length],
+                )
+                .unwrap();
+            }
+            assert!(saw_config, "container missing quantized config blob");
+            let quantized = QuantizedVectors::load(
+                &variant.config(),
+                &storage,
+                dir.path(),
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+            .expect("QuantizedVectors::load returned None");
+            (quantized, dir)
+        });
+
+        // (5) first quantized query (top-10, ef=64).
+        let (first_top, d_first) = time_it(|| {
+            let scorer = FilteredScorer::new(
+                rd.queries[0].clone().into(),
+                &storage,
+                Some(&quantized),
+                None,
+                &deleted,
+                HardwareCounterCell::new(),
+            )
+            .unwrap();
+            graph_layers
+                .search(10, 64, SearchAlgorithm::Hnsw, scorer, None, &is_stopped)
+                .unwrap()
+        });
+        assert_eq!(first_top.len(), 10, "first cold query must return top-10");
+
+        let us = |d: std::time::Duration| d.as_secs_f64() * 1e6;
+        fetch_us.push(us(d_fetch));
+        mmap_footer_us.push(us(d_mmap_footer));
+        graph_us.push(us(d_graph));
+        quant_us.push(us(d_quant));
+        first_query_us.push(us(d_first));
+        ttfr_us.push(us(d_fetch + d_mmap_footer + d_graph + d_quant + d_first));
+
+        warm_index = Some((graph_layers, quantized, quant_extract_dir));
+    }
+
+    // ==================== WARM SWEEP (post-cold reference) ==================
+    let (graph_layers, quantized, _quant_dir) = warm_index.unwrap();
+    let mut warm_p50_samples: Vec<f64> = Vec::with_capacity(NUM_REPS);
+    let mut warm_p95_samples: Vec<f64> = Vec::with_capacity(NUM_REPS);
+    for _ in 0..NUM_REPS {
+        let mut micros: Vec<f64> = Vec::with_capacity(rd.queries.len());
+        for q in &rd.queries {
+            let (_top, elapsed) = time_it(|| {
+                let scorer = FilteredScorer::new(
+                    q.clone().into(),
+                    &storage,
+                    Some(&quantized),
+                    None,
+                    &deleted,
+                    HardwareCounterCell::new(),
+                )
+                .unwrap();
+                graph_layers
+                    .search(10, 64, SearchAlgorithm::Hnsw, scorer, None, &is_stopped)
+                    .unwrap()
+            });
+            micros.push(elapsed.as_secs_f64() * 1e6);
+        }
+        micros.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        warm_p50_samples.push(percentile(&micros, 0.50));
+        warm_p95_samples.push(percentile(&micros, 0.95));
+    }
+
+    println!(
+        "Phase 4e cold start [{S3_ENDPOINT_LABEL}] variant={code} N={n}, {NUM_REPS} reps:",
+    );
+    println!(
+        "  container {:.1} MiB; per-miss store calls: {last_gets} GETs + {last_heads} HEAD",
+        container_bytes.len() as f64 / 1024.0 / 1024.0,
+    );
+    println!("  (1) fetch S3→local cache : {}", median_spread_ms(fetch_us));
+    println!("  (2) mmap + footer        : {}", median_spread_us(mmap_footer_us));
+    println!("  (3) graph assemble       : {}", median_spread_ms(graph_us));
+    println!("  (4) quantized load       : {}", median_spread_ms(quant_us));
+    println!("  (5) first quantized query: {}", median_spread_us(first_query_us));
+    println!("  time-to-first-result (1..5): {}", median_spread_ms(ttfr_us));
+    println!("  warm p50 after cold      : {}", median_spread_us(warm_p50_samples));
+    println!("  warm p95 after cold      : {}", median_spread_us(warm_p95_samples));
+    println!(
+        "  NOTE: full-precision storage is rebuilt from the local fixture only to satisfy \
+         FilteredScorer's signature and QuantizedVectors::load; it is never scored against \
+         and excluded from all timings above.",
+    );
+}

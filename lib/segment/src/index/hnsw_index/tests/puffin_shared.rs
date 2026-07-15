@@ -897,7 +897,7 @@ impl QuantVariant {
         }
     }
 
-    fn config(&self) -> QuantizationConfig {
+    pub(super) fn config(&self) -> QuantizationConfig {
         match self {
             Self::Bq => BinaryQuantizationConfig {
                 always_ram: Some(true),
