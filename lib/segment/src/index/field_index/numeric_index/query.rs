@@ -12,6 +12,8 @@ use std::ops::Bound;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::str::FromStr;
 
+use blobstore::Blob;
+use common::condition_checker::{CheckItem, ConditionChecker, Partitioner, Rest, Select};
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
@@ -19,17 +21,19 @@ use itertools::Either;
 use ordered_float::OrderedFloat;
 use uuid::Uuid;
 
-use super::Encodable;
 use super::numeric_index_read::NumericIndexRead;
-use crate::common::operation_error::OperationResult;
+use super::{Encodable, NumericIndexInner, ReadOnlyNumericIndexInner};
+use crate::common::operation_error::{OperationError, OperationResult};
+use crate::index::UniversalReadExt;
+use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::index::field_index::numeric_point::{Numericable, Point};
+use crate::index::field_index::on_disk_point_to_values::StoredValue;
 use crate::index::field_index::stat_tools::estimate_multi_value_selection_cardinality;
-use crate::index::field_index::stored_point_to_values::StoredValue;
 use crate::index::field_index::utils::check_boundaries;
 use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition, PrimaryCondition};
-use crate::index::query_optimization::optimized_filter::ConditionCheckerFn;
 use crate::types::{
-    FieldCondition, Match, MatchValue, PayloadKeyType, Range, RangeInterface, ValueVariants,
+    FieldCondition, FloatPayloadType, IntPayloadType, Match, MatchValue, PayloadKeyType, Range,
+    RangeInterface, UuidIntType, ValueVariants,
 };
 
 /// Histogram-driven cardinality estimation for a range condition.
@@ -298,13 +302,13 @@ where
     collect_blocks()?.into_iter().try_for_each(f)
 }
 
-/// Build a per-point checker closure for a `range` field condition, if the
-/// index can serve it.
+/// Build a per-point checker for a `range` field condition, if the index can
+/// serve it.
 pub(super) fn condition_checker<'a, T, I>(
     index: &'a I,
     condition: &FieldCondition,
     hw_acc: HwMeasurementAcc,
-) -> Option<ConditionCheckerFn<'a>>
+) -> Option<RangeConditionChecker<'a, I, T>>
 where
     T: Encodable + Numericable + StoredValue + Send + Sync + Default,
     I: NumericIndexRead<T>,
@@ -337,14 +341,104 @@ where
         }
     };
 
-    let hw_counter = hw_acc.get_counter_cell();
-    Some(Box::new(move |point_id: PointOffsetType| {
-        index.check_values_any(
+    Some(RangeConditionChecker {
+        index,
+        typed_range,
+        hw_counter: hw_acc.get_counter_cell(),
+    })
+}
+
+pub struct RangeConditionChecker<'a, I, T> {
+    index: &'a I,
+    typed_range: Range<T>,
+    hw_counter: HardwareCounterCell,
+}
+
+impl<I, T> ConditionChecker for RangeConditionChecker<'_, I, T>
+where
+    T: Encodable + Numericable + StoredValue + Send + Sync + Default,
+    I: NumericIndexRead<T>,
+{
+    type Error = OperationError;
+
+    fn check(&self, point_id: PointOffsetType) -> OperationResult<bool> {
+        Ok(self.index.check_values_any(
             point_id,
-            |value| typed_range.check_range(*value),
-            &hw_counter,
-        )
-    }))
+            |value| self.typed_range.check_range(*value),
+            &self.hw_counter,
+        ))
+    }
+
+    fn check_batched<K: CheckItem>(
+        &self,
+        ids: &mut [K],
+        select: Select,
+        _rest: Rest,
+    ) -> OperationResult<usize> {
+        let p = Partitioner::new(ids);
+        self.index.for_each_matching_value(
+            p.iter().map(|item| (item, item.point_id())),
+            &self.hw_counter,
+            |value| self.typed_range.check_range(*value),
+            |item, matched| p.write(item, matched == select.is_match()),
+        )?;
+        Ok(p.finish())
+    }
+}
+
+pub trait NumericIndexValue: Encodable + Numericable + StoredValue + Send + Sync + Default
+where
+    Vec<Self>: Blob,
+{
+    fn condition_checker_writable<'a>(
+        checker: RangeConditionChecker<'a, NumericIndexInner<Self>, Self>,
+    ) -> ConditionCheckerEnum<'a>;
+
+    fn condition_checker_read_only<'a, S: UniversalReadExt>(
+        checker: RangeConditionChecker<'a, ReadOnlyNumericIndexInner<Self, S>, Self>,
+    ) -> ConditionCheckerEnum<'a>;
+}
+
+impl NumericIndexValue for IntPayloadType {
+    fn condition_checker_writable<'a>(
+        checker: RangeConditionChecker<'a, NumericIndexInner<Self>, Self>,
+    ) -> ConditionCheckerEnum<'a> {
+        ConditionCheckerEnum::NumericIntWritable(checker)
+    }
+
+    fn condition_checker_read_only<'a, S: UniversalReadExt>(
+        checker: RangeConditionChecker<'a, ReadOnlyNumericIndexInner<Self, S>, Self>,
+    ) -> ConditionCheckerEnum<'a> {
+        S::condition_checker_numeric_int(checker)
+    }
+}
+
+impl NumericIndexValue for FloatPayloadType {
+    fn condition_checker_writable<'a>(
+        checker: RangeConditionChecker<'a, NumericIndexInner<Self>, Self>,
+    ) -> ConditionCheckerEnum<'a> {
+        ConditionCheckerEnum::NumericFloatWritable(checker)
+    }
+
+    fn condition_checker_read_only<'a, S: UniversalReadExt>(
+        checker: RangeConditionChecker<'a, ReadOnlyNumericIndexInner<Self, S>, Self>,
+    ) -> ConditionCheckerEnum<'a> {
+        S::condition_checker_numeric_float(checker)
+    }
+}
+
+impl NumericIndexValue for UuidIntType {
+    fn condition_checker_writable<'a>(
+        checker: RangeConditionChecker<'a, NumericIndexInner<Self>, Self>,
+    ) -> ConditionCheckerEnum<'a> {
+        ConditionCheckerEnum::NumericUuidWritable(checker)
+    }
+
+    fn condition_checker_read_only<'a, S: UniversalReadExt>(
+        checker: RangeConditionChecker<'a, ReadOnlyNumericIndexInner<Self, S>, Self>,
+    ) -> ConditionCheckerEnum<'a> {
+        S::condition_checker_numeric_uuid(checker)
+    }
 }
 
 /// Stream `(value, point)` pairs of the given range in ascending order.

@@ -820,7 +820,7 @@ impl RealDataScaffold {
         FilteredScorer::new(
             query.into(),
             &self.storage,
-            None,
+            None::<&crate::vector_storage::quantized::quantized_vectors::QuantizedVectors>,
             None,
             &self.deleted,
             HardwareCounterCell::new(),
@@ -832,7 +832,7 @@ impl RealDataScaffold {
         FilteredScorer::new_internal(
             point_id,
             &self.storage,
-            None,
+            None::<&crate::vector_storage::quantized::quantized_vectors::QuantizedVectors>,
             None,
             &self.deleted,
             HardwareCounterCell::new(),
@@ -855,7 +855,7 @@ impl RealDataScaffold {
 // FilteredScorer signature — it is NOT touched during scoring.
 
 use crate::types::{
-    BinaryQuantizationConfig, BinaryQuantizationEncoding, QuantizationConfig,
+    BinaryQuantizationConfig, BinaryQuantizationEncoding, Memory, QuantizationConfig,
     TurboQuantBitSize, TurboQuantQuantizationConfig, TurboQuantization,
 };
 use crate::vector_storage::quantized::quantized_vectors::{
@@ -918,17 +918,27 @@ impl QuantVariant {
         }
     }
 
+    // `always_ram` is deprecated in favor of `memory` (1.19.0) but the config
+    // structs derive no `Default`, so the field must still be named. Upstream's
+    // own tests take a file-wide `allow(deprecated)`; scope it to this fn.
+    #[expect(deprecated)]
     pub(super) fn config(&self) -> QuantizationConfig {
         match self {
+            // `memory: Pinned` is what the deprecated `always_ram: true` now
+            // resolves to (see `legacy_always_ram_placement`): quantized
+            // vectors resident in RAM and never evicted, which is what these
+            // measurements assume.
             Self::Bq => BinaryQuantizationConfig {
-                always_ram: Some(true),
+                always_ram: None,
+                memory: Some(Memory::Pinned),
                 encoding: Some(BinaryQuantizationEncoding::OneBit),
                 query_encoding: None,
             }
             .into(),
             Self::Tq(bits) => QuantizationConfig::Turbo(TurboQuantization {
                 turbo: TurboQuantQuantizationConfig {
-                    always_ram: Some(true),
+                    always_ram: None,
+                    memory: Some(Memory::Pinned),
                     bits: Some(*bits),
                 },
             }),

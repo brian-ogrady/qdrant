@@ -1,5 +1,6 @@
 #![expect(clippy::wildcard_enum_match_arm, reason = "test code")]
 
+use std::assert_matches;
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -145,6 +146,7 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         .search(
             full_search_request.into(),
             None,
+            None,
             &ShardSelectorInternal::All,
             None,
             hw_acc,
@@ -181,16 +183,14 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         .search(
             failed_search_request.into(),
             None,
+            None,
             &ShardSelectorInternal::All,
             None,
             hw_acc,
         )
         .await;
 
-    assert!(
-        matches!(result, Err(CollectionError::BadInput { .. })),
-        "{result:?}"
-    );
+    assert_matches!(result, Err(CollectionError::BadInput { .. }));
 
     let full_search_request = SearchRequestInternal {
         vector: NamedVector {
@@ -211,6 +211,7 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
     let result = collection
         .search(
             full_search_request.into(),
+            None,
             None,
             &ShardSelectorInternal::All,
             None,
@@ -237,6 +238,7 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
                 with_payload: Some(WithPayloadInterface::Bool(false)),
                 with_vector: WithVector::Selector(vec![VECTOR1_NAME.to_owned()]),
             },
+            None,
             None,
             &ShardSelectorInternal::All,
             None,
@@ -267,6 +269,7 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         &collection,
         |_name| async { unreachable!("should not be called in this test") },
         None,
+        None,
         ShardSelectorInternal::All,
         None,
         hw_acc,
@@ -294,6 +297,7 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         },
         &collection,
         |_name| async { unreachable!("should not be called in this test") },
+        None,
         None,
         ShardSelectorInternal::All,
         None,

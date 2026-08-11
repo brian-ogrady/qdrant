@@ -5,13 +5,13 @@ use common::types::{PointOffsetType, ScoreType};
 use sparse::common::sparse_vector::SparseVector;
 use sparse::common::types::{DimId, DimWeight};
 
-use crate::vector_storage::SparseVectorStorage;
+use crate::vector_storage::SparseVectorStorageRead;
 use crate::vector_storage::query::{Query, TransformInto};
 use crate::vector_storage::query_scorer::QueryScorer;
 
 pub struct SparseCustomQueryScorer<
     'a,
-    TVectorStorage: SparseVectorStorage,
+    TVectorStorage: SparseVectorStorageRead,
     TQuery: Query<SparseVector>,
 > {
     vector_storage: &'a TVectorStorage,
@@ -21,7 +21,7 @@ pub struct SparseCustomQueryScorer<
 
 impl<
     'a,
-    TVectorStorage: SparseVectorStorage,
+    TVectorStorage: SparseVectorStorageRead,
     TQuery: Query<SparseVector> + TransformInto<TQuery, SparseVector, SparseVector>,
 > SparseCustomQueryScorer<'a, TVectorStorage, TQuery>
 {
@@ -30,7 +30,7 @@ impl<
         vector_storage: &'a TVectorStorage,
         mut hardware_counter: HardwareCounterCell,
     ) -> Self {
-        let query: TQuery = TransformInto::transform(query, |mut vector| {
+        let query: TQuery = TransformInto::transform(query, &|mut vector| {
             vector.sort_by_indices();
             Ok(vector)
         })
@@ -52,11 +52,21 @@ impl<
     }
 }
 
-impl<TVectorStorage: SparseVectorStorage, TQuery: Query<SparseVector>> QueryScorer
+impl<TVectorStorage: SparseVectorStorageRead, TQuery: Query<SparseVector>>
+    SparseCustomQueryScorer<'_, TVectorStorage, TQuery>
+{
+    fn score(&self, v: &SparseVector) -> ScoreType {
+        self.query.score_by(|example| {
+            let cpu_units = v.indices.len() + example.indices.len();
+            self.hardware_counter.cpu_counter().incr_delta(cpu_units);
+            example.score(v).unwrap_or(0.0)
+        })
+    }
+}
+
+impl<TVectorStorage: SparseVectorStorageRead, TQuery: Query<SparseVector>> QueryScorer
     for SparseCustomQueryScorer<'_, TVectorStorage, TQuery>
 {
-    type TVector = SparseVector;
-
     #[inline]
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
         let stored = self
@@ -70,14 +80,6 @@ impl<TVectorStorage: SparseVectorStorage, TQuery: Query<SparseVector>> QueryScor
             .incr_delta(stored.indices.len() + stored.values.len());
 
         self.score(&stored)
-    }
-
-    fn score(&self, v: &SparseVector) -> ScoreType {
-        self.query.score_by(|example| {
-            let cpu_units = v.indices.len() + example.indices.len();
-            self.hardware_counter.cpu_counter().incr_delta(cpu_units);
-            example.score(v).unwrap_or(0.0)
-        })
     }
 
     fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {

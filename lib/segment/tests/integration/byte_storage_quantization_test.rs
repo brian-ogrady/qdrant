@@ -1,3 +1,8 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
+use std::assert_matches;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -23,8 +28,9 @@ use segment::segment_constructor::build_segment;
 use segment::types::{
     BinaryQuantizationConfig, CompressionRatio, Condition, Distance, FieldCondition, Filter,
     HnswConfig, HnswGlobalConfig, Indexes, PayloadSchemaType, ProductQuantizationConfig,
-    QuantizationSearchParams, Range, ScalarQuantizationConfig, SearchParams, SegmentConfig,
-    SeqNumberType, VectorDataConfig, VectorStorageDatatype, VectorStorageType,
+    QuantizationConfig, QuantizationSearchParams, Range, ScalarQuantizationConfig, SearchParams,
+    SegmentConfig, SeqNumberType, TurboQuantBitSize, TurboQuantQuantizationConfig,
+    TurboQuantization, VectorDataConfig, VectorStorageDatatype, VectorStorageType,
 };
 use segment::vector_storage::VectorStorageEnum;
 use segment::vector_storage::quantized::quantized_vectors::{
@@ -36,6 +42,8 @@ enum QuantizationVariant {
     Scalar,
     PQ,
     Binary,
+    Turbo,
+    TurboBits1_5,
 }
 
 fn random_vector<R>(rnd_gen: &mut R, dim: usize, data_type: VectorStorageDatatype) -> DenseVector
@@ -44,13 +52,12 @@ where
 {
     match data_type {
         VectorStorageDatatype::Float32 => unreachable!(),
-        VectorStorageDatatype::Float16 => {
+        VectorStorageDatatype::Float16 | VectorStorageDatatype::Turbo4 => {
             let mut vector = segment::fixtures::payload_fixtures::random_vector(rnd_gen, dim);
             vector.iter_mut().for_each(|x| *x -= 0.5);
             vector
         }
         VectorStorageDatatype::Uint8 => random_dense_byte_vector(rnd_gen, dim),
-        VectorStorageDatatype::Turbo4 => unreachable!(),
     }
 }
 
@@ -73,7 +80,6 @@ fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> us
         .count()
 }
 
-#[cfg_attr(target_os = "windows", ignore = "slow on Windows, not OS-specific")]
 #[rstest]
 #[case::nearest_binary_dot(
     QueryVariant::Nearest,
@@ -192,7 +198,64 @@ fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> us
     32, // ef
     70., // min_acc out of 100
 )]
-fn test_byte_storage_binary_quantization_hnsw(
+// Turbo4 source re-quantized. One case per rotation decision (Dot stands in for
+// Cosine/Euclid — the rotation is orthogonal): non-TQ target rotates vectors
+// back; TQ target keeps them rotated (Identity); TQ+Manhattan rotates back.
+#[case::nearest_scalar_turbo_dot(
+    QueryVariant::Nearest,
+    VectorStorageDatatype::Turbo4,
+    QuantizationVariant::Scalar,
+    Distance::Dot,
+    32, // dim
+    32, // ef
+    70., // min_acc out of 100
+)]
+#[case::nearest_turbo_turbo_dot(
+    QueryVariant::Nearest,
+    VectorStorageDatatype::Turbo4,
+    QuantizationVariant::Turbo,
+    Distance::Dot,
+    32, // dim
+    32, // ef
+    70., // min_acc out of 100
+)]
+#[cfg_attr(
+    target_os = "windows",
+    test_attr(ignore = "slow on Windows, not OS-specific")
+)]
+#[case::nearest_turbo_turbo_manhattan(
+    QueryVariant::Nearest,
+    VectorStorageDatatype::Turbo4,
+    QuantizationVariant::Turbo,
+    Distance::Manhattan,
+    32, // dim
+    32, // ef
+    70., // min_acc out of 100
+)]
+// Odd dim: padded_dim (34) differs from the source's Unpadded(33) rotation, so
+// Identity (no rotation) is distinguishable from a second Padded rotation.
+#[case::nearest_turbo_turbo_dot_odd_dim(
+    QueryVariant::Nearest,
+    VectorStorageDatatype::Turbo4,
+    QuantizationVariant::Turbo,
+    Distance::Dot,
+    33, // dim (odd → padded_dim = 34)
+    32, // ef
+    70., // min_acc out of 100
+)]
+// Bits1_5 target requires a Padded rotation, so the source rotation cannot be
+// kept: the vectors must be rotated back and re-rotated. Must not panic
+// (`Bits1_5 requires Padded` assert) or silently degrade to 1-bit.
+#[case::nearest_turbo_turbo_bits1_5_dot(
+    QueryVariant::Nearest,
+    VectorStorageDatatype::Turbo4,
+    QuantizationVariant::TurboBits1_5,
+    Distance::Dot,
+    32, // dim
+    32, // ef
+    50., // min_acc out of 100
+)]
+fn test_quantization_over_typed_storage_hnsw(
     #[case] query_variant: QueryVariant,
     #[case] storage_data_type: VectorStorageDatatype,
     #[case] quantization_variant: QuantizationVariant,
@@ -239,18 +302,26 @@ fn test_byte_storage_binary_quantization_hnsw(
 
     let int_key = "int";
 
-    let mut segment_byte = build_segment(dir_byte.path(), &config_byte, None, true).unwrap();
-    // check that `segment_byte` uses byte or half storage
+    let (mut segment_byte, _) = build_segment(dir_byte.path(), &config_byte, None, true).unwrap();
+    // check that `segment_byte` uses the storage backend selected by the datatype
     {
         let borrowed_storage = segment_byte.vector_data[DEFAULT_VECTOR_NAME]
             .vector_storage
             .borrow();
         let raw_storage: &VectorStorageEnum = &borrowed_storage;
-        assert!(matches!(
-            raw_storage,
-            &VectorStorageEnum::DenseAppendableMemmapByte(_)
-                | &VectorStorageEnum::DenseAppendableMemmapHalf(_),
-        ));
+        match storage_data_type {
+            VectorStorageDatatype::Turbo4 => {
+                assert_matches!(
+                    raw_storage,
+                    &VectorStorageEnum::DenseTurboAppendableMemmap(_)
+                );
+            }
+            _ => assert_matches!(
+                raw_storage,
+                &VectorStorageEnum::DenseAppendableMemmapByte(_)
+                    | &VectorStorageEnum::DenseAppendableMemmapHalf(_),
+            ),
+        }
     }
 
     let hw_counter = HardwareCounterCell::new();
@@ -287,22 +358,39 @@ fn test_byte_storage_binary_quantization_hnsw(
 
     let quantization_config = match quantization_variant {
         QuantizationVariant::Scalar => ScalarQuantizationConfig {
+            memory: None,
             r#type: Default::default(),
             quantile: None,
             always_ram: None,
         }
         .into(),
         QuantizationVariant::PQ => ProductQuantizationConfig {
+            memory: None,
             compression: CompressionRatio::X8,
             always_ram: None,
         }
         .into(),
         QuantizationVariant::Binary => BinaryQuantizationConfig {
+            memory: None,
             always_ram: None,
             encoding: None,
             query_encoding: None,
         }
         .into(),
+        QuantizationVariant::Turbo => QuantizationConfig::Turbo(TurboQuantization {
+            turbo: TurboQuantQuantizationConfig {
+                memory: None,
+                always_ram: None,
+                bits: None,
+            },
+        }),
+        QuantizationVariant::TurboBits1_5 => QuantizationConfig::Turbo(TurboQuantization {
+            turbo: TurboQuantQuantizationConfig {
+                memory: None,
+                always_ram: None,
+                bits: Some(TurboQuantBitSize::Bits1_5),
+            },
+        }),
     };
 
     segment_byte
@@ -323,6 +411,7 @@ fn test_byte_storage_binary_quantization_hnsw(
         });
 
     let hnsw_config = HnswConfig {
+        memory: None,
         m,
         ef_construct,
         full_scan_threshold,

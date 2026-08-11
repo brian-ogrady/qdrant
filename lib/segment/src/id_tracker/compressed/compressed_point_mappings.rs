@@ -14,7 +14,7 @@ use itertools::Itertools;
 use rand::RngExt;
 use rand::distr::Distribution;
 #[cfg(test)]
-use rand::rngs::StdRng;
+use rand::rngs::SmallRng;
 #[cfg(test)]
 use rand::seq::SliceRandom as _;
 #[cfg(test)]
@@ -140,26 +140,24 @@ impl CompressedPointMappings {
     pub(crate) fn iter_from(
         &self,
         external_id: Option<PointIdType>,
-    ) -> Box<dyn Iterator<Item = (PointIdType, PointOffsetType)> + '_> {
+    ) -> impl Iterator<Item = (PointIdType, PointOffsetType)> + '_ {
         match external_id {
-            None => Box::new(self.external_to_internal.iter()),
-            Some(point_id) => Box::new(self.external_to_internal.iter_from(point_id)),
+            None => itertools::Either::Left(self.external_to_internal.iter()),
+            Some(point_id) => {
+                itertools::Either::Right(self.external_to_internal.iter_from(point_id))
+            }
         }
     }
 
-    pub(crate) fn iter_external(&self) -> Box<dyn Iterator<Item = PointIdType> + '_> {
-        Box::new(
-            self.external_to_internal
-                .iter()
-                .map(|(point_id, _)| point_id),
-        )
+    pub(crate) fn iter_external(&self) -> impl Iterator<Item = PointIdType> + '_ {
+        self.external_to_internal
+            .iter()
+            .map(|(point_id, _)| point_id)
     }
 
-    pub(crate) fn iter_internal(&self) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
-        Box::new(
-            (0..self.internal_to_external.len() as PointOffsetType)
-                .filter(move |i| !self.deleted[*i as usize]),
-        )
+    pub(crate) fn iter_internal(&self) -> impl Iterator<Item = PointOffsetType> + '_ {
+        (0..self.internal_to_external.len() as PointOffsetType)
+            .filter(move |i| !self.deleted[*i as usize])
     }
 
     pub(crate) fn iter_internal_raw(
@@ -185,7 +183,7 @@ impl CompressedPointMappings {
 
     /// Generate a random [`PointMappings`].
     #[cfg(test)]
-    pub fn random(rand: &mut StdRng, total_size: u32) -> Self {
+    pub fn random(rand: &mut SmallRng, total_size: u32) -> Self {
         Self::random_with_params(rand, total_size, total_size, 128)
     }
 
@@ -200,7 +198,7 @@ impl CompressedPointMappings {
     ///   (256 uuids + 256 u64s)
     #[cfg(test)]
     pub fn random_with_params(
-        rand: &mut StdRng,
+        rand: &mut SmallRng,
         total_size: u32,
         preserved_size: u32,
         bits_in_id: u8,

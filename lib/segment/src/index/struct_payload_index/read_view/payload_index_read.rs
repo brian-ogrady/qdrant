@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 
 use ahash::AHashMap;
+use common::condition_checker::ConditionChecker;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
 use common::either_variant::EitherVariant;
+use common::generic_consts::AccessPattern;
 use common::iterator_ext::IteratorExt;
 use common::types::{DeferredBehavior, PointOffsetType, ScoreType};
 
@@ -17,11 +19,12 @@ use crate::index::field_index::{
     CardinalityEstimation, FacetIndex, FieldIndexRead, PayloadBlockCondition,
 };
 use crate::index::query_estimator::estimate_filter;
+use crate::index::query_optimization::optimized_filter::OptimizedFilter;
 use crate::index::query_optimization::payload_provider::PayloadProvider;
 use crate::index::query_optimization::rescore_formula::FormulaScorer;
 use crate::index::query_optimization::rescore_formula::parsed_formula::ParsedFormula;
 use crate::json_path::JsonPath;
-use crate::payload_storage::{FilterContext, PayloadStorageRead};
+use crate::payload_storage::PayloadStorageRead;
 use crate::telemetry::PayloadIndexTelemetry;
 use crate::types::{
     Condition, Filter, Payload, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef,
@@ -45,8 +48,9 @@ where
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<CardinalityEstimation> {
         let available_points = self.available_point_count();
-        let estimator =
-            |condition: &Condition| self.condition_cardinality(condition, None, hw_counter);
+        let estimator = |condition: &Condition| {
+            self.condition_cardinality(condition, None, DeferredBehavior::VisibleOnly, hw_counter)
+        };
         estimate_filter(&estimator, query, available_points)
     }
 
@@ -58,7 +62,12 @@ where
     ) -> OperationResult<CardinalityEstimation> {
         let available_points = self.available_point_count();
         let estimator = |condition: &Condition| {
-            self.condition_cardinality(condition, Some(nested_path), hw_counter)
+            self.condition_cardinality(
+                condition,
+                Some(nested_path),
+                DeferredBehavior::VisibleOnly,
+                hw_counter,
+            )
         };
         estimate_filter(&estimator, query, available_points)
     }
@@ -77,7 +86,7 @@ where
                 &query_cardinality,
                 hw_counter,
                 is_stopped,
-                DeferredBehavior::Exclude,
+                DeferredBehavior::VisibleOnly,
             )?
             .collect();
         Ok(result)
@@ -89,15 +98,11 @@ where
             .and_then(|indexes| indexes.iter().find_map(|index| index.as_numeric()))
     }
 
-    fn get_telemetry_data(&self) -> Vec<PayloadIndexTelemetry> {
+    fn get_telemetry_data(&self) -> OperationResult<Vec<PayloadIndexTelemetry>> {
         self.field_indexes
             .iter()
-            .flat_map(|(name, field)| -> Vec<PayloadIndexTelemetry> {
-                field
-                    .iter()
-                    .map(|field| field.get_telemetry_data().set_name(name.to_string()))
-                    .collect()
-            })
+            .flat_map(|(name, field)| field.iter().map(move |field| (name, field)))
+            .map(|(name, field)| Ok(field.get_telemetry_data()?.set_name(name.to_string())))
             .collect()
     }
 
@@ -120,12 +125,18 @@ where
             formula,
         } = parsed_formula;
 
-        let payload_retrievers = self.retrievers_map(payload_vars.clone(), hw_counter);
+        let payload_retrievers = self.retrievers_map(payload_vars.clone(), hw_counter)?;
 
         let payload_provider = PayloadProvider::new(self.payload.clone());
         let total = self.available_point_count();
         let condition_checkers = self
-            .convert_conditions(conditions, payload_provider, total, hw_counter)?
+            .convert_conditions(
+                conditions,
+                payload_provider,
+                total,
+                DeferredBehavior::VisibleOnly,
+                hw_counter,
+            )?
             .into_iter()
             .map(|(checker, _estimation)| checker)
             .collect();
@@ -152,11 +163,11 @@ where
         if query_cardinality.primary_clauses.is_empty() {
             let full_scan_iterator = point_mappings.iter_internal_with_behavior(deferred_behavior);
 
-            let struct_filtered_context = self.struct_filtered_context(filter, hw_counter)?;
+            let optimized_filter = self.optimized_filter(filter, deferred_behavior, hw_counter)?;
             // Worst case: query expected to return few matches, but index can't be used
             let matched_points = full_scan_iterator
                 .stop_if(is_stopped)
-                .filter(move |i| struct_filtered_context.check(*i));
+                .filter(move |i| optimized_filter.check_infallible(*i));
 
             Ok(EitherVariant::A(matched_points))
         } else {
@@ -195,11 +206,11 @@ where
                     EitherVariant::B(iter)
                 } else {
                     // Some conditions are primary clauses, some are not
-                    let struct_filtered_context =
-                        self.struct_filtered_context(filter, hw_counter)?;
+                    let optimized_filter =
+                        self.optimized_filter(filter, deferred_behavior, hw_counter)?;
                     let iter = joined_primary_iterator.filter(move |&id| {
                         !visited_list.check_and_update_visited(id)
-                            && struct_filtered_context.check(id)
+                            && optimized_filter.check_infallible(id)
                     });
                     EitherVariant::C(iter)
                 });
@@ -207,7 +218,7 @@ where
 
             // We can't use primary conditions, so we fall back to iterating over all ids
             // and applying full filter.
-            let struct_filtered_context = self.struct_filtered_context(filter, hw_counter)?;
+            let optimized_filter = self.optimized_filter(filter, deferred_behavior, hw_counter)?;
 
             let id_tracker_iterator = point_mappings.iter_internal_with_behavior(deferred_behavior);
 
@@ -217,32 +228,36 @@ where
                     i.cpu_counter()
                 })
                 .filter(move |&id| {
-                    !visited_list.check_and_update_visited(id) && struct_filtered_context.check(id)
+                    !visited_list.check_and_update_visited(id)
+                        && optimized_filter.check_infallible(id)
                 });
 
             Ok(EitherVariant::D(iter))
         }
     }
 
-    fn indexed_points(&self, field: PayloadKeyTypeRef) -> usize {
-        self.field_indexes.get(field).map_or(0, |indexes| {
-            // Assume that multiple field indexes are applied to the same data type,
-            // so the points indexed with those indexes are the same.
-            // We will return minimal number as a worst case, to highlight possible errors in the index early.
-            indexes
-                .iter()
-                .map(|index| index.count_indexed_points())
-                .min()
-                .unwrap_or(0)
-        })
+    fn indexed_points(&self, field: PayloadKeyTypeRef) -> OperationResult<usize> {
+        let Some(indexes) = self.field_indexes.get(field) else {
+            return Ok(0);
+        };
+
+        // Assume that multiple field indexes are applied to the same data type,
+        // so the points indexed with those indexes are the same.
+        // We will return minimal number as a worst case, to highlight possible errors in the index early.
+        let counts = indexes
+            .iter()
+            .map(|index| index.count_indexed_points())
+            .collect::<OperationResult<Vec<_>>>()?;
+
+        Ok(counts.into_iter().min().unwrap_or(0))
     }
 
     fn filter_context<'b>(
         &'b self,
         filter: &'b Filter,
         hw_counter: &HardwareCounterCell,
-    ) -> OperationResult<Box<dyn FilterContext + 'b>> {
-        Ok(Box::new(self.struct_filtered_context(filter, hw_counter)?))
+    ) -> OperationResult<OptimizedFilter<'b>> {
+        self.optimized_filter(filter, DeferredBehavior::VisibleOnly, hw_counter)
     }
 
     fn for_each_payload_block(
@@ -274,5 +289,16 @@ where
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Payload> {
         self.payload.borrow().get_sequential(point_id, hw_counter)
+    }
+
+    fn read_payloads<AP: AccessPattern, U: common::universal_io::UserData>(
+        &self,
+        point_ids: impl Iterator<Item = (U, PointOffsetType)>,
+        callback: impl FnMut(U, Payload) -> OperationResult<()>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        self.payload
+            .borrow()
+            .read_payloads::<AP, _>(point_ids, callback, hw_counter)
     }
 }

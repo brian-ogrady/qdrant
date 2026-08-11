@@ -1,25 +1,23 @@
 use std::path::PathBuf;
 
+use blobstore::Blob;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use common::universal_io::UniversalRead;
-use gridstore::Blob;
-use itertools::Itertools;
 
 use super::super::MapIndex;
 use super::super::key::MapIndexKey;
 use super::super::read_only::ReadOnlyMapIndex;
-use super::super::read_ops::MapIndexRead;
+use super::super::read_ops::{MapConditionChecker, MapIndexRead};
 use crate::common::Flusher;
 use crate::common::operation_error::OperationResult;
+use crate::index::UniversalReadExt;
+use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::index::field_index::{
     CardinalityEstimation, PayloadBlockCondition, PayloadFieldIndex, PayloadFieldIndexRead,
     PrimaryCondition,
 };
 use crate::index::query_estimator::combine_should_estimations;
-use crate::index::query_optimization::optimized_filter::ConditionCheckerFn;
-use crate::payload_storage::condition_checker::INDEXSET_ITER_THRESHOLD;
 use crate::types::{
     AnyVariants, FieldCondition, IntPayloadType, Match, MatchAny, MatchExcept, MatchValue,
     PayloadKeyType, ValueVariants,
@@ -44,8 +42,8 @@ impl PayloadFieldIndex for MapIndex<IntPayloadType> {
 }
 
 impl PayloadFieldIndexRead for MapIndex<IntPayloadType> {
-    fn count_indexed_points(&self) -> usize {
-        MapIndexRead::get_indexed_points(self)
+    fn count_indexed_points(&self) -> OperationResult<usize> {
+        Ok(MapIndexRead::get_indexed_points(self))
     }
 
     fn filter<'a>(
@@ -77,17 +75,18 @@ impl PayloadFieldIndexRead for MapIndex<IntPayloadType> {
         &'a self,
         condition: &FieldCondition,
         hw_acc: HwMeasurementAcc,
-    ) -> Option<ConditionCheckerFn<'a>> {
-        condition_checker_impl(self, condition, hw_acc)
+    ) -> OperationResult<Option<ConditionCheckerEnum<'a>>> {
+        Ok(condition_checker_impl(self, condition, hw_acc)
+            .map(ConditionCheckerEnum::MapIntWritable))
     }
 }
 
-impl<S: UniversalRead> PayloadFieldIndexRead for ReadOnlyMapIndex<IntPayloadType, S>
+impl<S: UniversalReadExt> PayloadFieldIndexRead for ReadOnlyMapIndex<IntPayloadType, S>
 where
     Vec<<IntPayloadType as MapIndexKey>::Owned>: Blob + Send + Sync,
 {
-    fn count_indexed_points(&self) -> usize {
-        MapIndexRead::get_indexed_points(self)
+    fn count_indexed_points(&self) -> OperationResult<usize> {
+        Ok(MapIndexRead::get_indexed_points(self))
     }
 
     fn filter<'a>(
@@ -119,15 +118,15 @@ where
         &'a self,
         condition: &FieldCondition,
         hw_acc: HwMeasurementAcc,
-    ) -> Option<ConditionCheckerFn<'a>> {
-        condition_checker_impl(self, condition, hw_acc)
+    ) -> OperationResult<Option<ConditionCheckerEnum<'a>>> {
+        Ok(condition_checker_impl(self, condition, hw_acc).map(S::condition_checker_map_int))
     }
 }
 
 // Shared bodies for `MapIndex<IntPayloadType>` and
 // `ReadOnlyMapIndex<IntPayloadType, S>`.
 
-fn filter_impl<'a, T: MapIndexRead<IntPayloadType>>(
+fn filter_impl<'a, T: MapIndexRead<'a, IntPayloadType>>(
     index: &'a T,
     condition: &'a FieldCondition,
     hw_counter: &'a HardwareCounterCell,
@@ -148,12 +147,9 @@ fn filter_impl<'a, T: MapIndexRead<IntPayloadType>>(
                     None
                 }
             }
-            AnyVariants::Integers(integers) => Some(Box::new(
-                integers
-                    .iter()
-                    .flat_map(move |integer| index.get_iterator(integer, hw_counter))
-                    .unique(),
-            )),
+            AnyVariants::Integers(integers) => {
+                Some(index.iter_for_values(integers.iter(), hw_counter)?)
+            }
         },
         Some(Match::Except(MatchExcept { except })) => match except {
             AnyVariants::Strings(_) => None,
@@ -165,8 +161,8 @@ fn filter_impl<'a, T: MapIndexRead<IntPayloadType>>(
     Ok(result)
 }
 
-fn estimate_cardinality_impl<T: MapIndexRead<IntPayloadType>>(
-    index: &T,
+fn estimate_cardinality_impl<'a, T: MapIndexRead<'a, IntPayloadType>>(
+    index: &'a T,
     condition: &FieldCondition,
     hw_counter: &HardwareCounterCell,
 ) -> Option<CardinalityEstimation> {
@@ -219,8 +215,8 @@ fn estimate_cardinality_impl<T: MapIndexRead<IntPayloadType>>(
     }
 }
 
-fn for_each_payload_block_impl<T: MapIndexRead<IntPayloadType>>(
-    index: &T,
+fn for_each_payload_block_impl<'a, T: MapIndexRead<'a, IntPayloadType>>(
+    index: &'a T,
     threshold: usize,
     key: PayloadKeyType,
     f: &mut dyn FnMut(PayloadBlockCondition) -> OperationResult<()>,
@@ -240,11 +236,11 @@ fn for_each_payload_block_impl<T: MapIndexRead<IntPayloadType>>(
     })
 }
 
-fn condition_checker_impl<'a, T: MapIndexRead<IntPayloadType> + 'a>(
+fn condition_checker_impl<'a, T: MapIndexRead<'a, IntPayloadType> + 'a>(
     index: &'a T,
     condition: &FieldCondition,
     hw_acc: HwMeasurementAcc,
-) -> Option<ConditionCheckerFn<'a>> {
+) -> Option<MapConditionChecker<'a, IntPayloadType, T>> {
     // Destructure explicitly (no `..`) so a new field added to
     // `FieldCondition` forces this method to be revisited.
     let FieldCondition {
@@ -264,44 +260,13 @@ fn condition_checker_impl<'a, T: MapIndexRead<IntPayloadType> + 'a>(
     match cond_match {
         Match::Value(MatchValue {
             value: ValueVariants::Integer(value),
-        }) => {
-            let value = *value;
-            Some(Box::new(move |point_id: PointOffsetType| {
-                index.check_values_any(point_id, &hw_counter, |i| *i == value)
-            }))
-        }
+        }) => Some(index.match_value_checker(hw_counter, *value)),
         Match::Any(MatchAny {
             any: AnyVariants::Integers(list),
-        }) => {
-            let list = list.clone();
-            if list.len() < INDEXSET_ITER_THRESHOLD {
-                Some(Box::new(move |point_id: PointOffsetType| {
-                    index.check_values_any(point_id, &hw_counter, |value| {
-                        list.iter().any(|i| i == value)
-                    })
-                }))
-            } else {
-                Some(Box::new(move |point_id: PointOffsetType| {
-                    index.check_values_any(point_id, &hw_counter, |value| list.contains(value))
-                }))
-            }
-        }
+        }) => Some(index.match_any_checker(hw_counter, list.clone(), false)),
         Match::Except(MatchExcept {
             except: AnyVariants::Integers(list),
-        }) => {
-            let list = list.clone();
-            if list.len() < INDEXSET_ITER_THRESHOLD {
-                Some(Box::new(move |point_id: PointOffsetType| {
-                    index.check_values_any(point_id, &hw_counter, |value| {
-                        !list.iter().any(|i| i == value)
-                    })
-                }))
-            } else {
-                Some(Box::new(move |point_id: PointOffsetType| {
-                    index.check_values_any(point_id, &hw_counter, |value| !list.contains(value))
-                }))
-            }
-        }
+        }) => Some(index.match_any_checker(hw_counter, list.clone(), true)),
         // Conditions this index can't serve.
         Match::Value(MatchValue {
             value: ValueVariants::String(_) | ValueVariants::Bool(_),
@@ -314,6 +279,7 @@ fn condition_checker_impl<'a, T: MapIndexRead<IntPayloadType> + 'a>(
         })
         | Match::Text(_)
         | Match::TextAny(_)
-        | Match::Phrase(_) => None,
+        | Match::Phrase(_)
+        | Match::Prefix(_) => None,
     }
 }

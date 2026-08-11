@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
+use blobstore::BlobstoreReader;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::universal_io::{OkNotFound, UniversalRead};
-use gridstore::GridstoreReader;
+use common::universal_io::{CachedReadFs, OkNotFound, Populate, UniversalRead, UniversalReadFs};
 
 use super::super::inner::MutableFullTextIndexInner;
 use super::ReadOnlyAppendableFullTextIndex;
@@ -13,15 +13,28 @@ use crate::index::field_index::full_text_index::inverted_index::mutable_inverted
 use crate::index::field_index::full_text_index::tokenizers::Tokenizer;
 
 impl<S: UniversalRead> ReadOnlyAppendableFullTextIndex<S> {
+    /// Schedule background prefetch of the Gridstore files [`open`](Self::open)
+    /// will read.
+    ///
+    /// Returns whether the on-disk directory exists.
+    pub fn preopen(fs: &impl CachedReadFs<File = S>, dir: PathBuf) -> OperationResult<bool> {
+        // Blobstore reader
+        Ok(
+            BlobstoreReader::<Vec<u8>, S>::preopen(fs, dir, Populate::PreferBackground)
+                .ok_not_found()?
+                .is_some(),
+        )
+    }
+
     /// Open the appendable (Gridstore) full-text index read-only, threading
     /// every file open through the filesystem handle `fs`.
     ///
-    /// Opens a [`GridstoreReader`] over the generic filesystem object, then
+    /// Opens a [`BlobstoreReader`] over the generic filesystem object, then
     /// rebuilds the in-memory inverted index by replaying every stored,
     /// CBOR-serialized document through [`MutableInvertedIndexBuilder`] — the
     /// exact reconstruction the writable
     /// [`MutableFullTextIndex::open_gridstore`][1] performs over a writable
-    /// [`gridstore::Gridstore`]. No write path; the reader is retained for
+    /// [`blobstore::Blobstore`]. No write path; the reader is retained for
     /// later `files` / `clear_cache` use.
     ///
     /// Returns [`Ok(None)`] when the on-disk directory doesn't exist, matching
@@ -30,11 +43,13 @@ impl<S: UniversalRead> ReadOnlyAppendableFullTextIndex<S> {
     ///
     /// [1]: super::super::MutableFullTextIndex::open_gridstore
     pub fn open(
-        fs: &S::Fs,
+        fs: &impl UniversalReadFs<File = S>,
         path: PathBuf,
         config: TextIndexParams,
     ) -> OperationResult<Option<Self>> {
-        let Some(storage) = GridstoreReader::<Vec<u8>, S>::open(fs, path).ok_not_found()? else {
+        let Some(storage) =
+            BlobstoreReader::<Vec<u8>, S>::open(fs, path, Populate::Blocking).ok_not_found()?
+        else {
             // Files don't exist, cannot load
             return Ok(None);
         };
@@ -47,7 +62,7 @@ impl<S: UniversalRead> ReadOnlyAppendableFullTextIndex<S> {
 
         storage
             .iter::<_, OperationError>(
-                storage.max_point_offset(),
+                storage.max_point_offset()?,
                 |idx, value: Vec<u8>| {
                     let str_tokens = FullTextIndex::deserialize_document(&value)?;
                     builder.add(idx, str_tokens);

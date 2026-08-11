@@ -1,16 +1,16 @@
 use std::borrow::{Borrow, Cow};
 
+use blobstore::Blob;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use common::universal_io::UniversalRead;
-use gridstore::Blob;
 
 use super::MapIndex;
 use super::key::MapIndexKey;
 use super::read_only::ReadOnlyMapIndex;
 use super::read_ops::MapIndexRead;
 use crate::common::operation_error::OperationResult;
-use crate::data_types::facets::{FacetHit, FacetValueRef};
+use crate::data_types::facets::{FacetHit, FacetValue, FacetValueRef};
 use crate::index::field_index::facet_index::FacetIndex;
 
 impl<N: MapIndexKey + ?Sized> FacetIndex for MapIndex<N>
@@ -19,6 +19,10 @@ where
     for<'a> Cow<'a, N>: Into<FacetValueRef<'a>>,
     for<'a> &'a N: Into<FacetValueRef<'a>>,
 {
+    fn unique_values_count(&self) -> usize {
+        MapIndexRead::get_unique_values_count(self)
+    }
+
     fn for_points_values(
         &self,
         points: impl Iterator<Item = PointOffsetType>,
@@ -32,9 +36,11 @@ where
             MapIndex::Immutable(index) => index.for_points_values(points, |idx, slice| {
                 f(idx, &mut slice.iter().map(|v| v.borrow().into()));
             }),
-            MapIndex::Mmap(index) => index.for_points_values(points, hw_counter, |idx, vals| {
-                f(idx, &mut vals.map(|v| v.into()));
-            })?,
+            MapIndex::OnDisk(index) => {
+                index.for_points_values(points, hw_counter, |idx, vals| {
+                    f(idx, &mut vals.map(|v| v.into()));
+                })?
+            }
         }
         Ok(())
     }
@@ -58,6 +64,18 @@ where
         ) -> OperationResult<()>,
     ) -> OperationResult<()> {
         MapIndexRead::for_each_value_map(self, hw_counter, |value, iter| f(value.into(), iter))
+    }
+
+    fn for_values_map(
+        &self,
+        values: impl Iterator<Item = FacetValue>,
+        hw_counter: &HardwareCounterCell,
+        mut f: impl FnMut(FacetValue, &mut dyn Iterator<Item = PointOffsetType>) -> OperationResult<()>,
+    ) -> OperationResult<()> {
+        let keys = values.filter_map(N::from_facet_value);
+        MapIndexRead::for_values_map(self, keys, hw_counter, |key, ids| {
+            f(Into::<FacetValueRef>::into(key).to_owned(), ids)
+        })
     }
 
     fn for_each_count_per_value(
@@ -85,6 +103,10 @@ where
     for<'a> Cow<'a, N>: Into<FacetValueRef<'a>>,
     for<'a> &'a N: Into<FacetValueRef<'a>>,
 {
+    fn unique_values_count(&self) -> usize {
+        MapIndexRead::get_unique_values_count(self)
+    }
+
     fn for_points_values(
         &self,
         points: impl Iterator<Item = PointOffsetType>,
@@ -99,6 +121,12 @@ where
                 Ok(())
             }
             ReadOnlyMapIndex::Immutable(index) => {
+                index.for_points_values(points, |idx, slice| {
+                    f(idx, &mut slice.iter().map(|v| v.borrow().into()));
+                });
+                Ok(())
+            }
+            ReadOnlyMapIndex::OnDisk(index) => {
                 index.for_points_values(points, hw_counter, |idx, vals| {
                     f(idx, &mut vals.map(|v| v.into()));
                 })
@@ -122,6 +150,18 @@ where
         ) -> OperationResult<()>,
     ) -> OperationResult<()> {
         MapIndexRead::for_each_value_map(self, hw_counter, |value, iter| f(value.into(), iter))
+    }
+
+    fn for_values_map(
+        &self,
+        values: impl Iterator<Item = FacetValue>,
+        hw_counter: &HardwareCounterCell,
+        mut f: impl FnMut(FacetValue, &mut dyn Iterator<Item = PointOffsetType>) -> OperationResult<()>,
+    ) -> OperationResult<()> {
+        let keys = values.filter_map(N::from_facet_value);
+        MapIndexRead::for_values_map(self, keys, hw_counter, |key, ids| {
+            f(Into::<FacetValueRef>::into(key).to_owned(), ids)
+        })
     }
 
     fn for_each_count_per_value(

@@ -1,8 +1,8 @@
+use blobstore::{Blob, BlobstoreReader};
 use common::universal_io::UniversalRead;
-use gridstore::{Blob, GridstoreReader};
 
 use super::super::MapIndexKey;
-use super::inner::MutableMapIndexInner;
+use super::in_memory::InMemoryMapIndex;
 
 mod lifecycle;
 mod live_reload;
@@ -11,8 +11,8 @@ mod read_ops;
 /// Read-only counterpart to [`super::MutableMapIndex`].
 ///
 /// Owns the same in-memory state ([`MutableMapIndexInner`]) but is backed by
-/// [`GridstoreReader`] over generic [`UniversalRead`] instead of a writable
-/// [`gridstore::Gridstore`]. Implements
+/// [`BlobstoreReader`] over generic [`UniversalRead`] instead of a writable
+/// [`blobstore::Blobstore`]. Implements
 /// [`super::super::read_ops::MapIndexRead`] by forwarding to the inner;
 /// provides no mutation surface.
 ///
@@ -23,11 +23,10 @@ pub struct ReadOnlyAppendableMapIndex<N: MapIndexKey + ?Sized, S: UniversalRead>
 where
     Vec<<N as MapIndexKey>::Owned>: Blob + Send + Sync,
 {
-    pub(super) inner: MutableMapIndexInner<N>,
-    /// Backing Gridstore reader, populated by [`Self::open`]. Held to keep the
+    pub(super) in_memory_index: InMemoryMapIndex<N>,
+    /// Backing Blobstore reader, populated by [`Self::open`]. Held to keep the
     /// storage mapped; the `files` / `populate` / `clear_cache` wiring that
     /// reads it lands with the parent dispatcher (it isn't part of the
     /// [`MapIndexRead`](super::super::read_ops::MapIndexRead) surface).
-    #[allow(dead_code)]
-    pub(super) storage: GridstoreReader<Vec<<N as MapIndexKey>::Owned>, S>,
+    pub(super) storage: BlobstoreReader<Vec<<N as MapIndexKey>::Owned>, S>,
 }

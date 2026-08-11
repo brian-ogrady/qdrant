@@ -1,17 +1,30 @@
+use std::assert_matches;
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs_err as fs;
 
+use super::pipeline::DiskCachePipeline;
 use super::{
     BLOCK_SIZE, DiskCache, DiskCacheConfig, DiskCacheFs, DiskCacheFsContext, DiskCacheRemote,
 };
-use crate::generic_consts::Sequential;
+use crate::generic_consts::{Random, Sequential};
 use crate::mmap::AdviceSetting;
+use crate::universal_io::cached_fs::FileInfo;
 use crate::universal_io::{
-    OpenOptions, Populate, ReadRange, UniversalRead, UniversalReadFileOps, UniversalReadFs,
+    CachedFs, CachedReadFs, MmapFile, OpenOptions, Populate, ReadPipeline, ReadRange,
+    UniversalAppend, UniversalFlush, UniversalIoError, UniversalRead, UniversalReadFileOps,
+    UniversalReadFs, UniversalWrite,
 };
+
+// The disk cache is strictly read-only: mutating it must stay a
+// compile-time error, on top of writeable opens being rejected at runtime
+// (covered per backend variant below).
+static_assertions::assert_not_impl_any!(
+    DiskCache<MmapFile>: UniversalAppend, UniversalFlush, UniversalWrite
+);
 
 fn make_test_data(n_bytes: usize) -> Vec<u8> {
     (0..n_bytes).map(|i| (i % 251) as u8).collect()
@@ -47,8 +60,21 @@ impl Scenario {
         }
     }
 
-    fn expected_local_path(&self) -> PathBuf {
+    /// Base mirror path for the remote; every open appends a unique suffix.
+    fn local_path_base(&self) -> PathBuf {
         self.config.local_path_for(&self.remote_path).unwrap()
+    }
+
+    fn fs<R>(&self) -> DiskCacheFs<R>
+    where
+        R: DiskCacheRemote,
+        <R::Fs as UniversalReadFileOps>::ContextConfig: Default,
+    {
+        DiskCacheFs::<R>::from_context(DiskCacheFsContext {
+            config: self.config.clone(),
+            remote: Default::default(),
+        })
+        .unwrap()
     }
 
     fn open<R>(&self, prefill: bool) -> DiskCache<R>
@@ -62,6 +88,27 @@ impl Scenario {
             Populate::No
         };
 
+        self.fs()
+            .open(
+                &self.remote_path,
+                OpenOptions {
+                    writeable: false,
+                    populate,
+                    need_sequential: false,
+                    advice: AdviceSetting::Global,
+                },
+                Default::default(),
+            )
+            .unwrap()
+    }
+
+    /// Open with [`Populate::Partial`] over `range`, prefetching just that
+    /// (block-aligned) byte range at open.
+    fn open_partial<R>(&self, range: std::ops::Range<u64>) -> DiskCache<R>
+    where
+        R: DiskCacheRemote,
+        <R::Fs as UniversalReadFileOps>::ContextConfig: Default,
+    {
         let fs = DiskCacheFs::<R>::from_context(DiskCacheFsContext {
             config: self.config.clone(),
             remote: Default::default(),
@@ -71,13 +118,31 @@ impl Scenario {
             &self.remote_path,
             OpenOptions {
                 writeable: false,
-                populate,
+                populate: Populate::Partial(ReadRange::new(range.start, range.end - range.start)),
                 need_sequential: false,
                 advice: AdviceSetting::Global,
             },
             Default::default(),
         )
         .unwrap()
+    }
+
+    /// Slice of the remote data corresponding to `range`.
+    fn slice(&self, range: &std::ops::Range<u64>) -> &[u8] {
+        &self.data[range.start as usize..range.end as usize]
+    }
+
+    /// A `get_file_info` for `schedule_reopen`, backed by a `CachedFs`
+    /// listing snapshot taken now — the schedule-phase view of the remote.
+    /// Take a fresh one after growing the remote, as a refresh pass would.
+    fn snapshot_file_info<R>(&self) -> impl Fn(&Path) -> Option<FileInfo>
+    where
+        R: DiskCacheRemote,
+        <R::Fs as UniversalReadFileOps>::ContextConfig: Default,
+    {
+        let mut cached_fs = CachedFs::new(self.fs::<R>(), &self.remote_path).unwrap();
+        cached_fs.cache_file_info().unwrap();
+        move |path| cached_fs.file_info(path).cloned()
     }
 
     /// Append `additional_bytes` bytes to the remote file in-place.
@@ -95,16 +160,18 @@ impl Scenario {
         self.data = new_data.clone();
         new_data
     }
+}
 
-    /// Shrink the remote file in-place to `new_len` bytes.
-    fn truncate_remote(&mut self, new_len: usize) {
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .open(&self.remote_path)
-            .unwrap();
-        file.set_len(new_len as u64).unwrap();
-        self.data.truncate(new_len);
+/// Drain `pipeline` until `wait` returns `None`, collecting results by user data.
+fn drain_pipeline<R: DiskCacheRemote>(
+    pipeline: &mut DiskCachePipeline<'_, R, u32>,
+) -> HashMap<u32, Vec<u8>> {
+    let mut results = HashMap::new();
+    while let Some((user_data, bytes)) = pipeline.wait().unwrap() {
+        let previous = results.insert(user_data, bytes.to_vec());
+        assert!(previous.is_none(), "duplicate result for {user_data}");
     }
+    results
 }
 
 #[duplicate::duplicate_item(
@@ -116,12 +183,12 @@ impl Scenario {
 #[cfg_predicate]
 #[cfg(test)]
 mod tests_mod {
-    use std::io::ErrorKind;
     use std::sync::atomic::Ordering;
 
     use super::*;
     #[cfg_predicate]
     use crate::universal_io::R;
+    use crate::universal_io::UioResult;
 
     const PREFILL: bool = _PREFILL;
 
@@ -132,22 +199,31 @@ mod tests_mod {
 
         // Read inside the first block.
         let bytes = file
-            .read::<Sequential, u8>(ReadRange {
-                byte_offset: 10,
-                length: 20,
-            })
+            .read::<_, u8>(ReadRange::new(10, 20), Sequential)
             .unwrap();
         assert_eq!(&*bytes, &scn.data[10..30]);
 
         // Last block includes the 100-byte tail.
         let last = scn.data.len() as u64;
         let bytes = file
-            .read::<Sequential, u8>(ReadRange {
-                byte_offset: last - 50,
-                length: 50,
-            })
+            .read::<_, u8>(ReadRange::new(last - 50, 50), Sequential)
             .unwrap();
         assert_eq!(&*bytes, &scn.data[scn.data.len() - 50..]);
+    }
+
+    /// `read_whole` on a zero-length remote must return an empty slice, not
+    /// panic. The whole-object prefill schedules nothing for an empty file, so
+    /// `init_from_open_prefill` resolves to `None` and falls back to a
+    /// zero-length mirror (on io_uring `schedule_whole` returns without
+    /// scheduling; on mmap it yields an empty read).
+    #[test]
+    fn read_whole_empty_remote_returns_empty() {
+        let scn = Scenario::new(0);
+        let file = scn.open::<R>(PREFILL);
+
+        let bytes = file.read_whole::<u8>().unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(file.len::<u8>().unwrap(), 0);
     }
 
     #[test]
@@ -158,23 +234,27 @@ mod tests_mod {
         let start = (BLOCK_SIZE - 50) as u64;
         let len = (BLOCK_SIZE + 100) as u64;
         let bytes = file
-            .read::<Sequential, u8>(ReadRange {
-                byte_offset: start,
-                length: len,
-            })
+            .read::<_, u8>(ReadRange::new(start, len), Sequential)
             .unwrap();
         let start = start as usize;
         let end = start + len as usize;
-        assert!(matches!(bytes, Cow::Borrowed(_)));
+        assert_matches!(bytes, Cow::Borrowed(_));
         assert_eq!(bytes.as_ref(), &scn.data[start..end]);
     }
 
     #[test]
     fn local_file_is_created_on_first_read() {
         let scn = Scenario::new(BLOCK_SIZE * 2);
-        let expected_local = scn.expected_local_path();
 
         let file = scn.open::<R>(PREFILL);
+        let expected_local = file.local_path.clone();
+        assert!(
+            expected_local
+                .to_str()
+                .unwrap()
+                .starts_with(scn.local_path_base().to_str().unwrap()),
+            "unique mirror name must derive from the configured mapping",
+        );
 
         // Before the first read, the local file doesn't exist yet.
         assert!(
@@ -184,12 +264,7 @@ mod tests_mod {
         );
 
         // Trigger one read. This must bring up the local file.
-        let _ = file
-            .read::<Sequential, u8>(ReadRange {
-                byte_offset: 0,
-                length: 1,
-            })
-            .unwrap();
+        let _ = file.read::<_, u8>(ReadRange::one(0), Sequential).unwrap();
 
         assert!(
             expected_local.exists(),
@@ -210,10 +285,7 @@ mod tests_mod {
         file.populate().unwrap();
 
         let bytes = file
-            .read::<Sequential, u8>(ReadRange {
-                byte_offset: 0,
-                length: scn.data.len() as u64,
-            })
+            .read::<_, u8>(ReadRange::new(0, scn.data.len() as u64), Sequential)
             .unwrap();
         assert_eq!(&*bytes, &scn.data[..]);
     }
@@ -224,38 +296,53 @@ mod tests_mod {
         let file = scn.open::<R>(PREFILL);
 
         let err = file
-            .read::<Sequential, u8>(ReadRange {
-                byte_offset: 1000,
-                length: 100,
-            })
+            .read::<_, u8>(ReadRange::new(1000, 100), Sequential)
             .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::universal_io::UniversalIoError::OutOfBounds { .. }
-            ),
-            "expected OutOfBounds, got {err:?}",
+        assert_matches!(
+            err,
+            crate::universal_io::UniversalIoError::OutOfBounds { .. },
         );
     }
 
-    /// Reopen with no prior reads leaves the local mirror untouched.
+    /// Two live instances for the same remote path must not share a mirror:
+    /// each open gets a unique local name, so the second open cannot truncate
+    /// the first instance's mirror out from under it. This is what makes
+    /// refresh-by-fresh-open (live-reload) safe while the old handle is alive.
     #[test]
-    fn reopen_without_prior_reads_keeps_local_uninitialized() {
+    fn concurrent_instances_have_independent_mirrors() {
         let scn = Scenario::new(BLOCK_SIZE * 2);
-        let mut cache = scn.open::<R>(PREFILL);
-        let expected_local = scn.expected_local_path();
-        assert!(!expected_local.exists());
 
-        cache.reopen().unwrap();
+        let first = scn.open::<R>(PREFILL);
+        let read_all = |cache: &DiskCache<R>| {
+            cache
+                .read::<_, u8>(ReadRange::new(0, scn.data.len() as u64), Sequential)
+                .unwrap()
+                .to_vec()
+        };
+        assert_eq!(read_all(&first), scn.data);
 
-        // unless it was scheduled for prefill
-        if PREFILL {
-            assert!(expected_local.exists());
-            assert!(cache.local.get().is_some());
-        } else {
-            assert!(!expected_local.exists());
-            assert!(cache.local.get().is_none());
-        }
+        let second = scn.open::<R>(PREFILL);
+        assert_ne!(first.local_path, second.local_path);
+        assert_eq!(read_all(&second), scn.data);
+
+        // The first instance's mirror survived the second open.
+        assert_eq!(read_all(&first), scn.data);
+    }
+
+    /// Dropping an instance removes its mirror file: names are unique per
+    /// open, so a leftover would never be reused.
+    #[test]
+    fn drop_removes_local_mirror() {
+        let scn = Scenario::new(BLOCK_SIZE);
+        let cache = scn.open::<R>(PREFILL);
+
+        let _ = cache.read::<_, u8>(ReadRange::one(0), Sequential).unwrap();
+
+        let local_path = cache.local_path.clone();
+        assert!(local_path.exists());
+
+        drop(cache);
+        assert!(!local_path.exists());
     }
 
     /// Reopen on an unchanged remote must not resize, repopulate, or mutate
@@ -265,15 +352,10 @@ mod tests_mod {
         let scn = Scenario::new(BLOCK_SIZE * 3);
         let mut cache = scn.open::<R>(PREFILL);
 
-        let _ = cache
-            .read::<Sequential, u8>(ReadRange {
-                byte_offset: 0,
-                length: 1,
-            })
-            .unwrap();
+        let _ = cache.read::<_, u8>(ReadRange::one(0), Sequential).unwrap();
 
         let (len_before, populated_before, fetched_before) = {
-            let local = cache.local.get().expect("local initialized after read");
+            let local = cache.state().expect("local initialized after read").local;
             (
                 local.mmap().len::<u8>().unwrap(),
                 local.fully_populated.load(Ordering::Acquire),
@@ -283,43 +365,23 @@ mod tests_mod {
 
         cache.reopen().unwrap();
 
-        let local = cache.local.get().expect("local must still be initialized");
+        let local = if PREFILL {
+            // in case of Populate::PreferBackground, we need to await for
+            // completion to get the local_state back.
+            cache.state().unwrap().local
+        } else {
+            // in case of Populate::No, local_state should still be there
+            // without forcing (re)initialization.
+            assert!(cache.is_ready(), "local must still be initialized");
+            cache.state().unwrap().local
+        };
+
         assert_eq!(local.mmap().len::<u8>().unwrap(), len_before);
         assert_eq!(
             local.fully_populated.load(Ordering::Acquire),
             populated_before,
         );
         assert_eq!(local.fetched.lock().clone(), fetched_before);
-    }
-
-    /// Reopening over a shrunk remote must fail with `UnexpectedEof`.
-    #[test]
-    fn reopen_with_smaller_remote_fails() {
-        let mut scn = Scenario::new(BLOCK_SIZE * 4);
-        let mut cache = scn.open::<R>(PREFILL);
-
-        let _ = cache
-            .read::<Sequential, u8>(ReadRange {
-                byte_offset: 0,
-                length: 1,
-            })
-            .unwrap();
-
-        // The read above may have mapped the remote. Windows cannot shrink a
-        // file with an active mapping, so drop the cache's remote handle before
-        // shrinking the remote on disk. `reopen` re-opens it lazily afterward.
-        cache.release_remote();
-        scn.truncate_remote(BLOCK_SIZE * 2);
-
-        let err = cache.reopen().unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                crate::universal_io::UniversalIoError::Io(io_err)
-                    if io_err.kind() == ErrorKind::UnexpectedEof,
-            ),
-            "expected Io(UnexpectedEof), got: {err:?}",
-        );
     }
 
     /// Reads into the new section must fail before reopen (local mirror is at
@@ -331,36 +393,22 @@ mod tests_mod {
 
         let original_len = scn.data.len() as u64;
 
-        let _ = cache
-            .read::<Sequential, u8>(ReadRange {
-                byte_offset: 0,
-                length: 1,
-            })
-            .unwrap();
+        let _ = cache.read::<_, u8>(ReadRange::one(0), Sequential).unwrap();
 
         let new_data = scn.grow_remote(BLOCK_SIZE);
 
         let err = cache
-            .read::<Sequential, u8>(ReadRange {
-                byte_offset: original_len,
-                length: BLOCK_SIZE as u64,
-            })
+            .read::<_, u8>(ReadRange::new(original_len, BLOCK_SIZE as u64), Sequential)
             .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::universal_io::UniversalIoError::OutOfBounds { .. },
-            ),
-            "expected OutOfBounds before reopen, got: {err:?}",
+        assert_matches!(
+            err,
+            crate::universal_io::UniversalIoError::OutOfBounds { .. },
         );
 
         cache.reopen().unwrap();
 
         let bytes = cache
-            .read::<Sequential, u8>(ReadRange {
-                byte_offset: original_len,
-                length: BLOCK_SIZE as u64,
-            })
+            .read::<_, u8>(ReadRange::new(original_len, BLOCK_SIZE as u64), Sequential)
             .unwrap();
         assert_eq!(&*bytes, &new_data[original_len as usize..]);
     }
@@ -377,10 +425,7 @@ mod tests_mod {
         // Touch the partial tail so block 1 ends up in the `fetched` bitmap
         // (its fetch is clamped to the old EOF).
         let _ = cache
-            .read::<Sequential, u8>(ReadRange {
-                byte_offset: BLOCK_SIZE as u64,
-                length: 1,
-            })
+            .read::<_, u8>(ReadRange::one(BLOCK_SIZE as u64), Sequential)
             .unwrap();
 
         // Grow remote past the old tail block boundary.
@@ -392,11 +437,445 @@ mod tests_mod {
         // and the newly-grown tail [old_len..BLOCK_SIZE*2). Without the
         // invalidation, the second half would be zeros from `set_len`.
         let bytes = cache
-            .read::<Sequential, u8>(ReadRange {
-                byte_offset: BLOCK_SIZE as u64,
-                length: BLOCK_SIZE as u64,
-            })
+            .read::<_, u8>(
+                ReadRange::new(BLOCK_SIZE as u64, BLOCK_SIZE as u64),
+                Sequential,
+            )
             .unwrap();
         assert_eq!(&*bytes, &new_data[BLOCK_SIZE..BLOCK_SIZE * 2]);
+    }
+
+    /// Staging must be invisible to readers: the mirror keeps its old length
+    /// (so components keep `len()` as their growth signal) until `reopen`
+    /// applies the staged work.
+    #[test]
+    fn reopen_schedule_is_invisible_until_reopen() {
+        let mut scn = Scenario::new(BLOCK_SIZE * 2);
+        let mut cache = scn.open::<R>(PREFILL);
+
+        let original_len = scn.data.len() as u64;
+        let _ = cache.read::<_, u8>(ReadRange::one(0), Sequential).unwrap();
+
+        let new_data = scn.grow_remote(BLOCK_SIZE);
+        cache
+            .schedule_reopen(scn.snapshot_file_info::<R>())
+            .unwrap();
+
+        // Nothing changed yet: same length, and the appended region is still
+        // out of bounds.
+        assert_eq!(cache.len::<u8>().unwrap(), original_len);
+        let err = cache
+            .read::<_, u8>(ReadRange::new(original_len, BLOCK_SIZE as u64), Sequential)
+            .unwrap_err();
+        assert_matches!(err, UniversalIoError::OutOfBounds { .. });
+
+        cache.reopen().unwrap();
+
+        assert_eq!(cache.len::<u8>().unwrap(), new_data.len() as u64);
+        // A populated cache staged the tail fetch, so the appended block is
+        // already local; a lazy one only learned the new length.
+        let new_block = (original_len / BLOCK_SIZE as u64) as u32;
+        assert_eq!(
+            cache
+                .state()
+                .unwrap()
+                .local
+                .contains(new_block..new_block + 1),
+            PREFILL,
+        );
+
+        let bytes = cache
+            .read::<_, u8>(ReadRange::new(original_len, BLOCK_SIZE as u64), Sequential)
+            .unwrap();
+        assert_eq!(&*bytes, &new_data[original_len as usize..]);
+    }
+
+    /// Staging against a cold cache materializes the mirror at the known
+    /// length, and applying it changes nothing.
+    #[test]
+    fn reopen_schedule_materializes_cold_mirror() {
+        let scn = Scenario::new(BLOCK_SIZE * 2 + 100);
+        let mut cache = scn.open::<R>(PREFILL);
+        assert!(!cache.is_ready());
+
+        cache
+            .schedule_reopen(scn.snapshot_file_info::<R>())
+            .unwrap();
+
+        assert!(cache.is_ready());
+        assert_eq!(cache.len::<u8>().unwrap(), scn.data.len() as u64);
+
+        // A later reopen (nothing staged — the length didn't grow) must
+        // leave the mirror alone.
+        cache.reopen().unwrap();
+        assert_eq!(cache.len::<u8>().unwrap(), scn.data.len() as u64);
+
+        let bytes = cache.read_whole::<u8>().unwrap();
+        assert_eq!(&*bytes, &scn.data[..]);
+    }
+
+    /// Scheduling an unchanged length stages nothing; the schedule/apply pair
+    /// must neither resize nor invalidate.
+    #[test]
+    fn reopen_schedule_no_growth_does_not_repopulate() {
+        let scn = Scenario::new(BLOCK_SIZE * 3);
+        let mut cache = scn.open::<R>(PREFILL);
+
+        let _ = cache.read::<_, u8>(ReadRange::one(0), Sequential).unwrap();
+        let (len_before, fetched_before) = {
+            let local = cache.state().unwrap().local;
+            (
+                local.mmap().len::<u8>().unwrap(),
+                local.fetched.lock().clone(),
+            )
+        };
+
+        cache
+            .schedule_reopen(scn.snapshot_file_info::<R>())
+            .unwrap();
+        cache.reopen().unwrap();
+
+        let local = cache.state().unwrap().local;
+        assert_eq!(local.mmap().len::<u8>().unwrap(), len_before);
+        assert_eq!(*local.fetched.lock(), fetched_before);
+    }
+
+    /// Two schedules without an apply in between: the second supersedes the
+    /// first, so one `reopen` lands all the growth.
+    #[test]
+    fn reopen_schedule_twice_without_apply() {
+        let mut scn = Scenario::new(BLOCK_SIZE * 2);
+        let mut cache = scn.open::<R>(PREFILL);
+
+        let _ = cache.read::<_, u8>(ReadRange::one(0), Sequential).unwrap();
+
+        scn.grow_remote(BLOCK_SIZE);
+        cache
+            .schedule_reopen(scn.snapshot_file_info::<R>())
+            .unwrap();
+        let new_data = scn.grow_remote(BLOCK_SIZE);
+        cache
+            .schedule_reopen(scn.snapshot_file_info::<R>())
+            .unwrap();
+
+        cache.reopen().unwrap();
+
+        assert_eq!(cache.len::<u8>().unwrap(), new_data.len() as u64);
+        let bytes = cache.read_whole::<u8>().unwrap();
+        assert_eq!(&*bytes, &new_data[..]);
+    }
+
+    /// Re-scheduling the same length keeps the first staging as is — the
+    /// staged tail's in-flight read must survive to be applied.
+    #[test]
+    fn reopen_schedule_twice_with_same_length() {
+        let mut scn = Scenario::new(BLOCK_SIZE * 2);
+        let mut cache = scn.open::<R>(PREFILL);
+
+        let _ = cache.read::<_, u8>(ReadRange::one(0), Sequential).unwrap();
+
+        let new_data = scn.grow_remote(BLOCK_SIZE);
+        let get_file_info = scn.snapshot_file_info::<R>();
+        cache.schedule_reopen(&get_file_info).unwrap();
+        cache.schedule_reopen(&get_file_info).unwrap();
+
+        cache.reopen().unwrap();
+
+        assert_eq!(cache.len::<u8>().unwrap(), new_data.len() as u64);
+        let bytes = cache.read_whole::<u8>().unwrap();
+        assert_eq!(&*bytes, &new_data[..]);
+    }
+
+    /// Scheduling against a snapshot that does not cover the file fails with
+    /// `NotFound` — the file resolves its own remote path, so there is no
+    /// path argument to mispair.
+    #[test]
+    fn reopen_schedule_missing_from_snapshot_errors() {
+        let scn = Scenario::new(BLOCK_SIZE);
+        let mut cache = scn.open::<R>(PREFILL);
+
+        let err = cache.schedule_reopen(|_| None).unwrap_err();
+        assert_matches!(err, UniversalIoError::NotFound { .. });
+    }
+
+    /// `Populate::Partial` prefetches only the requested (block-aligned) range;
+    /// blocks outside it stay unfetched until read, then fault in lazily.
+    #[test]
+    fn partial_populate_fetches_only_requested_range() {
+        // 4 blocks: 0, 1, 2, and a partial tail block 3.
+        let scn = Scenario::new(BLOCK_SIZE * 3 + 100);
+        // Request blocks 0 and 1 (range spills 50 bytes into block 1).
+        let file = scn.open_partial::<R>(0..(BLOCK_SIZE as u64 + 50));
+
+        // The mirror is materialized lazily; nothing exists before the first read.
+        let expected_local = file.local_path.clone();
+        assert!(!expected_local.exists());
+        assert!(!file.is_ready());
+
+        // A read within the prefetched range is served from the local mirror.
+        let bytes = file
+            .read::<_, u8>(ReadRange::new(10, 20), Sequential)
+            .unwrap();
+        assert_eq!(&*bytes, &scn.data[10..30]);
+
+        // The mirror now exists, and exactly the requested blocks {0, 1} are
+        // cached — not the whole file, proving the populate was partial.
+        assert!(expected_local.exists());
+        {
+            let local = file.state().unwrap().local;
+            assert!(!local.fully_populated.load(Ordering::Acquire));
+            assert!(local.fetched.lock().contains_range(0..2));
+            assert!(!local.fetched.lock().contains(2));
+            assert!(!local.fetched.lock().contains(3));
+        }
+
+        // A read outside the prefetched range faults its block in on demand.
+        let start = (BLOCK_SIZE * 2) as u64;
+        let bytes = file
+            .read::<_, u8>(ReadRange::new(start, 30), Sequential)
+            .unwrap();
+        assert_eq!(&*bytes, &scn.data[start as usize..start as usize + 30]);
+        assert!(file.state().unwrap().local.fetched.lock().contains(2));
+    }
+
+    /// An empty `Populate::Partial` range prefetches nothing but still opens a
+    /// correctly-sized mirror that serves reads by faulting blocks in lazily.
+    #[test]
+    fn partial_populate_empty_range_is_lazy() {
+        let scn = Scenario::new(BLOCK_SIZE * 2 + 100);
+        let file = scn.open_partial::<R>(10..10);
+
+        // Nothing prefetched, so the first read must fault its block in.
+        let bytes = file
+            .read::<_, u8>(ReadRange::new(0, 16), Sequential)
+            .unwrap();
+        assert_eq!(&*bytes, &scn.data[0..16]);
+        assert_eq!(file.len::<u8>().unwrap(), scn.data.len() as u64);
+    }
+
+    /// A `Populate::Partial` range starting past EOF has nothing valid to
+    /// prefetch; the mirror is still sized correctly and serves reads lazily.
+    #[test]
+    fn partial_populate_range_past_eof_is_lazy() {
+        let scn = Scenario::new(100);
+        let file = scn.open_partial::<R>(BLOCK_SIZE as u64 * 4..BLOCK_SIZE as u64 * 5);
+
+        let bytes = file
+            .read::<_, u8>(ReadRange::new(0, 100), Sequential)
+            .unwrap();
+        assert_eq!(&*bytes, &scn.data[..]);
+        assert_eq!(file.len::<u8>().unwrap(), 100);
+    }
+
+    #[test]
+    fn same_block_reads_share_one_fetch() {
+        let scn = Scenario::new(BLOCK_SIZE * 3 + 100);
+        let file = scn.open::<R>(false);
+
+        let mut pipeline = DiskCachePipeline::<R, u32>::new().unwrap();
+        pipeline.schedule::<Random>(0, &file, 10..30, 1).unwrap();
+        // Same block as above: piggybacks even if the remote queue is full.
+        pipeline.schedule::<Random>(1, &file, 100..200, 1).unwrap();
+        assert_eq!(pipeline.in_flight_fetches(), 1);
+
+        let results = drain_pipeline(&mut pipeline);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[&0], &scn.data[10..30]);
+        assert_eq!(results[&1], &scn.data[100..200]);
+    }
+
+    #[test]
+    fn spanning_fetch_covers_contained_reads() {
+        let scn = Scenario::new(BLOCK_SIZE * 3 + 100);
+        let file = scn.open::<R>(false);
+
+        let mut pipeline = DiskCachePipeline::<R, u32>::new().unwrap();
+        // Spans blocks 0..2.
+        let spanning = (BLOCK_SIZE - 50) as u64..(BLOCK_SIZE + 50) as u64;
+        // Contained in block 1.
+        let contained = (BLOCK_SIZE + 100) as u64..(BLOCK_SIZE + 200) as u64;
+        pipeline
+            .schedule::<Random>(0, &file, spanning.clone(), 1)
+            .unwrap();
+        pipeline
+            .schedule::<Random>(1, &file, contained.clone(), 1)
+            .unwrap();
+        assert_eq!(pipeline.in_flight_fetches(), 1);
+
+        let results = drain_pipeline(&mut pipeline);
+        assert_eq!(results[&0], scn.slice(&spanning));
+        assert_eq!(results[&1], scn.slice(&contained));
+    }
+
+    /// Piggybacked reads may themselves span multiple blocks, as long as the
+    /// in-flight fetch fully covers them — including reads reaching into the
+    /// EOF-clamped partial tail block.
+    #[test]
+    fn multi_block_reads_share_one_fetch() {
+        // Three full blocks plus a 100-byte partial tail block.
+        let scn = Scenario::new(BLOCK_SIZE * 3 + 100);
+        let file = scn.open::<R>(false);
+        let eof = scn.data.len() as u64;
+
+        let mut pipeline = DiskCachePipeline::<R, u32>::new().unwrap();
+        // Spans all four blocks; the fetch's byte range is clamped to EOF.
+        let spanning = 100u64..eof - 10;
+        // Crosses the block 1/2 boundary.
+        let middle = (BLOCK_SIZE + 200) as u64..(BLOCK_SIZE * 2 + 200) as u64;
+        // Reaches the partial tail block, ending exactly at EOF.
+        let tail = (BLOCK_SIZE * 3 - 50) as u64..eof;
+        pipeline
+            .schedule::<Random>(0, &file, spanning.clone(), 1)
+            .unwrap();
+        pipeline
+            .schedule::<Random>(1, &file, middle.clone(), 1)
+            .unwrap();
+        pipeline
+            .schedule::<Random>(2, &file, tail.clone(), 1)
+            .unwrap();
+        assert_eq!(pipeline.in_flight_fetches(), 1);
+
+        let results = drain_pipeline(&mut pipeline);
+        assert_eq!(results[&0], scn.slice(&spanning));
+        assert_eq!(results[&1], scn.slice(&middle));
+        assert_eq!(results[&2], scn.slice(&tail));
+    }
+
+    /// A read only partially covered by an in-flight fetch must not piggyback
+    /// on it: it goes to the remote queue like any other fetch — never
+    /// resolving against blocks the in-flight fetch doesn't cover.
+    #[test]
+    fn partially_covered_read_does_not_piggyback() {
+        let scn = Scenario::new(BLOCK_SIZE * 3 + 100);
+        let file = scn.open::<R>(false);
+
+        let mut pipeline = DiskCachePipeline::<R, u32>::new().unwrap();
+        // Fetch covers blocks 0..2.
+        let first = (BLOCK_SIZE - 50) as u64..(BLOCK_SIZE + 50) as u64;
+        // Needs blocks 1..3: block 2 is not covered by the fetch above.
+        let second = (BLOCK_SIZE + 100) as u64..(BLOCK_SIZE * 2 + 100) as u64;
+        pipeline
+            .schedule::<Random>(0, &file, first.clone(), 1)
+            .unwrap();
+
+        let mut results = HashMap::new();
+        match pipeline.schedule::<Random>(1, &file, second.clone(), 1) {
+            // Queued backends: a separate fetch was scheduled.
+            Ok(()) => assert_eq!(pipeline.in_flight_fetches(), 2),
+            // Single-slot backends (mmap remote): the read went for the remote
+            // queue and found it full — either way, it did not piggyback.
+            Err(UniversalIoError::QueueIsFull) => {
+                assert_eq!(pipeline.in_flight_fetches(), 1);
+                // Free the queue and retry; the retried read must still fetch,
+                // as block 2 is not local even after the first fetch commits.
+                results.extend(drain_pipeline(&mut pipeline));
+                pipeline
+                    .schedule::<Random>(1, &file, second.clone(), 1)
+                    .unwrap();
+                assert_eq!(pipeline.in_flight_fetches(), 1);
+            }
+            Err(err) => panic!("unexpected error: {err}"),
+        }
+
+        results.extend(drain_pipeline(&mut pipeline));
+        assert_eq!(results[&0], scn.slice(&first));
+        assert_eq!(results[&1], scn.slice(&second));
+    }
+
+    /// Reads on different files never share a fetch, even for identical ranges.
+    #[test]
+    fn different_files_do_not_share_fetches() {
+        let scn = Scenario::new(BLOCK_SIZE * 2);
+        let file_a = scn.open::<R>(false);
+        let file_b = scn.open::<R>(false);
+
+        let mut pipeline = DiskCachePipeline::<R, u32>::new().unwrap();
+        pipeline.schedule::<Random>(0, &file_a, 10..30, 1).unwrap();
+        match pipeline.schedule::<Random>(1, &file_b, 10..30, 1) {
+            Ok(()) => assert_eq!(pipeline.in_flight_fetches(), 2),
+            // Single-slot backends: the identical range on another file went
+            // to the remote queue instead of piggybacking on `file_a`'s fetch.
+            Err(UniversalIoError::QueueIsFull) => {
+                assert_eq!(pipeline.in_flight_fetches(), 1);
+            }
+            Err(err) => panic!("unexpected error: {err}"),
+        }
+
+        let results = drain_pipeline(&mut pipeline);
+        assert_eq!(results[&0], &scn.data[10..30]);
+    }
+
+    /// Once a fetch commits its blocks to the mirror, later reads of those
+    /// blocks are served locally without scheduling another fetch.
+    #[test]
+    fn committed_blocks_serve_later_reads_locally() {
+        let scn = Scenario::new(BLOCK_SIZE * 2);
+        let file = scn.open::<R>(false);
+
+        let mut pipeline = DiskCachePipeline::<R, u32>::new().unwrap();
+        pipeline.schedule::<Random>(0, &file, 10..30, 1).unwrap();
+        let results = drain_pipeline(&mut pipeline);
+        assert_eq!(results[&0], &scn.data[10..30]);
+
+        pipeline.schedule::<Random>(1, &file, 40..60, 1).unwrap();
+        // Served locally: no remote fetch in flight.
+        assert_eq!(pipeline.in_flight_fetches(), 0);
+        let results = drain_pipeline(&mut pipeline);
+        assert_eq!(results[&1], &scn.data[40..60]);
+    }
+
+    /// End-to-end `read_batch` with many reads clustered in shared blocks:
+    /// every read resolves with its own user data and correct bytes.
+    #[test]
+    fn read_batch_with_shared_blocks_resolves_every_read() {
+        let scn = Scenario::new(BLOCK_SIZE * 3 + 100);
+        let file = scn.open::<R>(false);
+
+        let ranges: Vec<(usize, ReadRange)> = (0..64)
+            .map(|i| {
+                let range = ReadRange {
+                    byte_offset: (i * 700) as u64,
+                    length: 100,
+                };
+                (i, range)
+            })
+            .collect();
+
+        let mut seen = vec![false; ranges.len()];
+        file.read_batch(ranges.clone(), Random, |i, bytes: &[u8]| {
+            let start = ranges[i].1.byte_offset as usize;
+            assert_eq!(bytes, &scn.data[start..start + 100]);
+            assert!(!seen[i]);
+            seen[i] = true;
+            UioResult::Ok(())
+        })
+        .unwrap();
+        assert!(seen.iter().all(|&s| s));
+    }
+
+    /// The cache is strictly read-only: writeable opens (the append
+    /// vehicle on other backends) are rejected outright — appends must go
+    /// directly to the backing storage.
+    #[test]
+    fn writeable_open_is_rejected() {
+        let scn = Scenario::new(10);
+
+        let err = scn
+            .fs::<R>()
+            .open(
+                &scn.remote_path,
+                OpenOptions {
+                    writeable: true,
+                    populate: Populate::No,
+                    need_sequential: false,
+                    advice: AdviceSetting::Global,
+                },
+                Default::default(),
+            )
+            .unwrap_err();
+        assert_matches!(
+            err,
+            crate::universal_io::UniversalIoError::Uninitialized { .. },
+        );
     }
 }

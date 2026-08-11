@@ -15,9 +15,10 @@ use crate::config::vectors::{EdgeSparseVectorParams, EdgeVectorParams};
 
 /// Fluent builder for [`EdgeConfig`].
 ///
-/// All fields are optional and fall back to [`EdgeConfig::default`] values
-/// at [`Self::build`] time; at minimum supply at least one dense or sparse
-/// vector via [`Self::vector`] / [`Self::sparse_vector`].
+/// All fields are optional; at minimum supply at least one dense or sparse
+/// vector via [`Self::vector`] / [`Self::sparse_vector`]. Fields left unset
+/// stay unspecified (`None`) in the built config: loading an existing shard
+/// keeps their persisted values, otherwise defaults apply.
 #[derive(Debug, Default)]
 pub struct EdgeConfigBuilder {
     on_disk_payload: Option<bool>,
@@ -27,6 +28,8 @@ pub struct EdgeConfigBuilder {
     quantization_config: Option<QuantizationConfig>,
     optimizers: Option<EdgeOptimizersConfig>,
     wal_options: Option<WalOptions>,
+    max_search_threads: Option<usize>,
+    search_pool_core: Option<usize>,
 }
 
 impl EdgeConfigBuilder {
@@ -92,6 +95,20 @@ impl EdgeConfigBuilder {
         self
     }
 
+    /// Number of threads in the shard's search thread pool. `0` derives the count from the number
+    /// of CPUs (matching the core search runtime). See [`EdgeConfig::max_search_threads`].
+    pub fn max_search_threads(mut self, max_search_threads: usize) -> Self {
+        self.max_search_threads = Some(max_search_threads);
+        self
+    }
+
+    /// Pin every thread of the shard's search pool to the given CPU core (best-effort). See
+    /// [`EdgeConfig::search_pool_core`].
+    pub fn search_pool_core(mut self, core: usize) -> Self {
+        self.search_pool_core = Some(core);
+        self
+    }
+
     pub fn build(self) -> EdgeConfig {
         // Exhaustively destructure Self and construct EdgeConfig: adding a
         // field to either type forces a compile error here.
@@ -103,16 +120,19 @@ impl EdgeConfigBuilder {
             quantization_config,
             optimizers,
             wal_options,
+            max_search_threads,
+            search_pool_core,
         } = self;
-        let defaults = EdgeConfig::default();
         EdgeConfig {
-            on_disk_payload: on_disk_payload.unwrap_or(defaults.on_disk_payload),
+            on_disk_payload,
             vectors,
             sparse_vectors,
-            hnsw_config: hnsw_config.unwrap_or(defaults.hnsw_config),
-            quantization_config: quantization_config.or(defaults.quantization_config),
-            optimizers: optimizers.unwrap_or(defaults.optimizers),
-            wal_options: wal_options.or(defaults.wal_options),
+            hnsw_config,
+            quantization_config,
+            optimizers,
+            wal_options,
+            max_search_threads,
+            search_pool_core,
         }
     }
 }

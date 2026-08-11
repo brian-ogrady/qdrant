@@ -1,4 +1,6 @@
 pub mod aligned_buf;
+#[cfg(feature = "testing")]
+pub mod bench_cache;
 pub mod binary_search;
 pub mod bitpacking;
 pub mod bitpacking_links;
@@ -6,6 +8,7 @@ pub mod bitpacking_ordered;
 pub mod bitvec;
 pub mod budget;
 pub mod bytes;
+pub mod condition_checker;
 pub mod counter;
 pub mod cow;
 pub mod cpu;
@@ -39,8 +42,10 @@ pub mod save_on_disk;
 pub mod scope_tracker;
 pub mod small_uint;
 pub mod sort_utils;
+pub mod sorted_slice;
 pub mod stable_hash;
 pub mod storage_version;
+pub mod stored_bitmask;
 pub mod stored_bitslice;
 pub mod tar_ext;
 pub mod tar_unpack;

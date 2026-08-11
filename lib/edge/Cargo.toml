@@ -20,12 +20,14 @@ sparse = { path = "../sparse" }
 wal = { path = "../wal" }
 
 ahash = { workspace = true }
+core_affinity = { workspace = true }
 fs-err = { workspace = true }
 itertools = { workspace = true }
 log = { workspace = true }
 ordered-float = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
+rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

@@ -3,6 +3,8 @@ use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::mem;
 
+#[cfg(feature = "api")]
+use api::grpc::RawPayload;
 use common::validation::validate_multi_vector;
 use itertools::Itertools as _;
 use ordered_float::OrderedFloat;
@@ -10,13 +12,14 @@ use schemars::JsonSchema;
 use segment::common::operation_error::OperationError;
 use segment::common::utils::unordered_hash_unique;
 use segment::data_types::named_vectors::NamedVectors;
-use segment::data_types::segment_record::SegmentRecord;
+use segment::data_types::segment_record::{SegmentRecord, SegmentRecordRaw};
 use segment::data_types::vectors::{
     BatchVectorStructInternal, DEFAULT_VECTOR_NAME, DenseVector, MultiDenseVector,
-    MultiDenseVectorInternal, VectorInternal, VectorStructInternal,
+    MultiDenseVectorInternal, VectorInternal, VectorRef, VectorStructInternal,
 };
 use segment::types::{Filter, Payload, PointIdType, VectorNameBuf};
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use sparse::common::types::{DimId, DimWeight};
 use strum::{EnumDiscriminants, EnumIter};
 use validator::{Validate, ValidationErrors};
@@ -116,6 +119,10 @@ pub enum PointOperations {
     DeletePointsByFilter(Filter),
     /// Points Sync
     SyncPoints(PointSyncOperation),
+    /// Insert or update points with storage-native (raw bytes) vectors
+    UpsertPointsRaw(Vec<PointStructRawPersisted>),
+    /// Points sync with storage-native (raw bytes) vectors
+    SyncPointsRaw(PointSyncRawOperation),
 }
 
 impl PointOperations {
@@ -126,6 +133,8 @@ impl PointOperations {
             Self::DeletePoints { ids } => Some(ids.clone()),
             Self::DeletePointsByFilter(_) => None,
             Self::SyncPoints(op) => Some(op.points.iter().map(|point| point.id).collect()),
+            Self::UpsertPointsRaw(points) => Some(points.iter().map(|point| point.id).collect()),
+            Self::SyncPointsRaw(op) => Some(op.points.iter().map(|point| point.id).collect()),
         }
     }
 
@@ -141,6 +150,33 @@ impl PointOperations {
             Self::DeletePoints { ids } => ids.retain(filter),
             Self::DeletePointsByFilter(_) => (),
             Self::SyncPoints(op) => op.points.retain(|point| filter(&point.id)),
+            Self::UpsertPointsRaw(points) => points.retain(|point| filter(&point.id)),
+            Self::SyncPointsRaw(op) => op.points.retain(|point| filter(&point.id)),
+        }
+    }
+
+    /// Drop named-vector references to names not in `valid`. See
+    /// [`CollectionUpdateOperations::retain_vector_names`].
+    pub fn retain_vector_names(&mut self, valid: &HashSet<VectorNameBuf>) {
+        match self {
+            Self::UpsertPoints(op) => op.retain_vector_names(valid),
+            Self::UpsertPointsConditional(op) => op.points_op.retain_vector_names(valid),
+            Self::SyncPoints(op) => {
+                for point in &mut op.points {
+                    point.vector.retain_vector_names(valid);
+                }
+            }
+            Self::UpsertPointsRaw(points) => {
+                for point in points {
+                    point.vectors.retain(|(name, _)| valid.contains(name));
+                }
+            }
+            Self::SyncPointsRaw(op) => {
+                for point in &mut op.points {
+                    point.vectors.retain(|(name, _)| valid.contains(name));
+                }
+            }
+            Self::DeletePoints { .. } | Self::DeletePointsByFilter(_) => (),
         }
     }
 }
@@ -193,6 +229,19 @@ impl PointInsertOperationsInternal {
         }
     }
 
+    /// Drop named-vector references to names not in `valid`. See
+    /// [`CollectionUpdateOperations::retain_vector_names`].
+    pub fn retain_vector_names(&mut self, valid: &HashSet<VectorNameBuf>) {
+        match self {
+            Self::PointsBatch(batch) => batch.vectors.retain_vector_names(valid),
+            Self::PointsList(points) => {
+                for point in points {
+                    point.vector.retain_vector_names(valid);
+                }
+            }
+        }
+    }
+
     pub fn retain_point_ids<F>(&mut self, filter: F)
     where
         F: Fn(&PointIdType) -> bool,
@@ -220,7 +269,7 @@ impl PointInsertOperationsInternal {
                     }
 
                     BatchVectorStructPersisted::Named(vectors) => {
-                        for (_, vectors) in vectors.iter_mut() {
+                        for vectors in vectors.values_mut() {
                             retain_with_index(vectors, |index, _| retain_indices.contains(&index));
                         }
                     }
@@ -265,6 +314,254 @@ pub struct PointSyncOperation {
     /// Maximal id og
     pub to_id: Option<PointIdType>,
     pub points: Vec<PointStructPersisted>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Hash)]
+pub struct PointSyncRawOperation {
+    /// Minimal id of the sync range
+    pub from_id: Option<PointIdType>,
+    /// Maximal id of the sync range
+    pub to_id: Option<PointIdType>,
+    pub points: Vec<PointStructRawPersisted>,
+}
+
+pub type RawVectorsPersisted = SmallVec<[(VectorNameBuf, Vec<u8>); 1]>;
+
+/// A point with vectors as storage-native bytes, as it is persisted in WAL.
+#[derive(Clone, PartialEq, Deserialize, Serialize, Hash)]
+#[serde(rename_all = "snake_case")]
+pub struct PointStructRawPersisted {
+    /// Point id
+    pub id: PointIdType,
+    /// All named vectors of the point, storage-native bytes per vector name
+    #[serde(with = "raw_vectors_serde")]
+    pub vectors: RawVectorsPersisted,
+    /// Payload values (optional)
+    pub payload: Option<Payload>,
+}
+
+/// Serde helper for [`PointStructRawPersisted::vectors`].
+///
+/// By default serde serializes `Vec<u8>` as a sequence of integers, which in
+/// CBOR (used for the WAL) costs ~2x for high-entropy data such as raw vector
+/// bytes. This module forces each blob through `serialize_bytes` so it is
+/// encoded as a compact byte string (~1x overhead) instead.
+mod raw_vectors_serde {
+    use std::fmt;
+
+    use segment::types::VectorNameBuf;
+    use serde::de::{self, Deserializer, SeqAccess, Visitor};
+    use serde::ser::{SerializeSeq, Serializer};
+
+    use super::RawVectorsPersisted;
+
+    /// Upper bound for the capacity we pre-allocate from an untrusted `size_hint`
+    /// when deserializing a single vector's raw bytes.
+    ///
+    /// Realistic sizes are far below this: a maximum-size dense vector is
+    /// 65536 dims x 4 bytes (f32) = 256 KiB. The 128 MiB headroom comfortably
+    /// covers large multivectors and sparse vectors while staying orders of
+    /// magnitude away from OOM territory.
+    const MAX_RAW_VECTOR_PREALLOC: usize = 128 * 1024 * 1024;
+
+    /// Reference wrapper that serializes a byte slice as a byte string.
+    struct BytesRef<'a>(&'a [u8]);
+
+    impl serde::Serialize for BytesRef<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(self.0)
+        }
+    }
+
+    pub fn serialize<S: Serializer>(
+        vectors: &[(VectorNameBuf, Vec<u8>)],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(vectors.len()))?;
+        for (name, bytes) in vectors {
+            seq.serialize_element(&(name, BytesRef(bytes)))?;
+        }
+        seq.end()
+    }
+
+    /// Owned wrapper that deserializes a byte string into a `Vec<u8>`.
+    struct ByteVec(Vec<u8>);
+
+    impl<'de> serde::Deserialize<'de> for ByteVec {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct ByteVecVisitor;
+
+            impl<'de> Visitor<'de> for ByteVecVisitor {
+                type Value = Vec<u8>;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                    formatter.write_str("a byte string")
+                }
+
+                fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+                    Ok(value.to_vec())
+                }
+
+                fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+                    Ok(value)
+                }
+
+                /// Formats that lack a native byte-string type (e.g. JSON) fall
+                /// back to a sequence of integers; accept those too.
+                fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                    let capacity = seq.size_hint().unwrap_or(0).min(MAX_RAW_VECTOR_PREALLOC);
+                    let mut bytes = Vec::with_capacity(capacity);
+                    while let Some(byte) = seq.next_element()? {
+                        bytes.push(byte);
+                    }
+                    Ok(bytes)
+                }
+            }
+
+            deserializer
+                .deserialize_byte_buf(ByteVecVisitor)
+                .map(ByteVec)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<RawVectorsPersisted, D::Error> {
+        let raw: Vec<(VectorNameBuf, ByteVec)> = serde::Deserialize::deserialize(deserializer)?;
+        Ok(raw
+            .into_iter()
+            .map(|(name, bytes)| (name, bytes.0))
+            .collect())
+    }
+}
+
+impl From<SegmentRecordRaw> for PointStructRawPersisted {
+    fn from(record: SegmentRecordRaw) -> Self {
+        let SegmentRecordRaw {
+            id,
+            vectors,
+            payload,
+        } = record;
+
+        Self {
+            id,
+            vectors: vectors.unwrap_or_default(),
+            payload,
+        }
+    }
+}
+
+impl PointStructRawPersisted {
+    pub fn is_equal_to(&self, segment_record: &SegmentRecordRaw) -> bool {
+        let SegmentRecordRaw {
+            id,
+            vectors,
+            payload,
+        } = segment_record;
+
+        if &self.id != id {
+            return false;
+        }
+
+        let segment_vectors = vectors.as_deref().unwrap_or(&[]);
+        if self.vectors.len() != segment_vectors.len() {
+            return false;
+        }
+        for (name, bytes) in segment_vectors {
+            let own_bytes = self
+                .vectors
+                .iter()
+                .find(|(own_name, _)| own_name == name)
+                .map(|(_, bytes)| bytes);
+            if own_bytes != Some(bytes) {
+                return false;
+            }
+        }
+
+        // Check if payloads are equal, empty and non-existent payloads are considered equal
+        let self_payload = self.payload.as_ref().filter(|p| !p.is_empty());
+        let segment_payload = payload.as_ref().filter(|p| !p.is_empty());
+        self_payload == segment_payload
+    }
+}
+
+#[cfg(feature = "api")]
+impl From<PointStructRawPersisted> for api::grpc::qdrant::PointStructRaw {
+    fn from(value: PointStructRawPersisted) -> Self {
+        let PointStructRawPersisted {
+            id,
+            vectors,
+            payload,
+        } = value;
+
+        Self {
+            id: Some(id.into()),
+            vectors: vectors.into_iter().collect(),
+            payload: payload
+                .map(api::conversions::json::payload_to_proto)
+                .unwrap_or_default(),
+            raw_payload: None,
+        }
+    }
+}
+
+#[cfg(feature = "api")]
+impl TryFrom<api::grpc::qdrant::PointStructRaw> for PointStructRawPersisted {
+    type Error = tonic::Status;
+
+    fn try_from(value: api::grpc::qdrant::PointStructRaw) -> Result<Self, Self::Error> {
+        let api::grpc::qdrant::PointStructRaw {
+            id,
+            vectors,
+            payload,
+            raw_payload,
+        } = value;
+
+        let id = id
+            .ok_or_else(|| tonic::Status::invalid_argument("Empty id is not allowed"))?
+            .try_into()?;
+
+        // Prefer the raw payload blob and fall back to the serialized payload otherwise.
+        // An empty payload is normalized to `None`.
+        let payload = match raw_payload {
+            Some(raw_payload) => decode_payload(raw_payload)?,
+            None => api::conversions::json::proto_to_payloads(payload)?,
+        };
+        let payload = (!payload.is_empty()).then_some(payload);
+
+        Ok(Self {
+            id,
+            vectors: vectors.into_iter().collect(),
+            payload,
+        })
+    }
+}
+
+/// Decodes the RawPayload according to its encoding.
+#[cfg(feature = "api")]
+fn decode_payload(raw_payload: RawPayload) -> Result<Payload, tonic::Status> {
+    match raw_payload.encoding() {
+        api::grpc::RawPayloadEncoding::JsonBytes => {
+            serde_json::from_slice(&raw_payload.payload_bytes).map_err(|err| {
+                tonic::Status::invalid_argument(format!("Malformed raw payload blob: {err}"))
+            })
+        }
+    }
+}
+
+impl Debug for PointStructRawPersisted {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let vectors = self
+            .vectors
+            .iter()
+            .map(|(name, bytes)| format!("{name}: {} bytes", bytes.len()))
+            .join(", ");
+        write!(
+            f,
+            "PointStructRawPersisted {{ id: {}, vectors: [{vectors}], payload: {:?} }}",
+            self.id, self.payload,
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Hash)]
@@ -317,6 +614,16 @@ pub enum BatchVectorStructPersisted {
     Single(Vec<DenseVector>),
     MultiDense(Vec<MultiDenseVector>),
     Named(HashMap<VectorNameBuf, Vec<VectorPersisted>>),
+}
+
+impl BatchVectorStructPersisted {
+    /// Drop named-vector references to names not in `valid`. See
+    /// [`CollectionUpdateOperations::retain_vector_names`].
+    pub fn retain_vector_names(&mut self, valid: &HashSet<VectorNameBuf>) {
+        if let BatchVectorStructPersisted::Named(named) = self {
+            named.retain(|name, _| valid.contains(name));
+        }
+    }
 }
 
 impl Hash for BatchVectorStructPersisted {
@@ -409,14 +716,14 @@ impl PointStructPersisted {
             return false;
         }
 
-        let self_vectors = self.get_vectors().into_owned_map();
+        let self_vectors = self.get_vectors();
 
         if let Some(segment_vectors) = vectors {
             if self_vectors.len() != segment_vectors.len() {
                 return false;
             }
             for (name, vec) in segment_vectors {
-                if self_vectors.get(name) != Some(vec) {
+                if self_vectors.get(name) != Some(VectorRef::from(vec)) {
                     return false;
                 }
             }
@@ -492,6 +799,16 @@ pub enum VectorStructPersisted {
     Single(DenseVector),
     MultiDense(MultiDenseVector),
     Named(HashMap<VectorNameBuf, VectorPersisted>),
+}
+
+impl VectorStructPersisted {
+    /// Drop named-vector references to names not in `valid`. See
+    /// [`CollectionUpdateOperations::retain_vector_names`].
+    pub fn retain_vector_names(&mut self, valid: &HashSet<VectorNameBuf>) {
+        if let VectorStructPersisted::Named(named) = self {
+            named.retain(|name, _| valid.contains(name));
+        }
+    }
 }
 
 impl std::hash::Hash for VectorStructPersisted {
@@ -801,4 +1118,94 @@ where
         index += 1;
         retain
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_persisted_vectors_use_compact_byte_string() {
+        // High-entropy payload: byte value == (index % 256), most bytes >= 24.
+        let blob: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        let point = PointStructRawPersisted {
+            id: 1.into(),
+            vectors: vec![("dense".to_string(), blob.clone())].into(),
+            payload: None,
+        };
+
+        let encoded = serde_cbor::to_vec(&point).unwrap();
+        // A byte string is ~1x; an integer array would be ~1.9x for this data.
+        // Guard well below the naive-array size (>7800 bytes for 4096 bytes).
+        assert!(
+            encoded.len() < blob.len() + 128,
+            "expected compact byte-string encoding, got {} bytes for a {}-byte blob",
+            encoded.len(),
+            blob.len(),
+        );
+
+        // Round-trips losslessly.
+        let decoded: PointStructRawPersisted = serde_cbor::from_slice(&encoded).unwrap();
+        assert!(decoded == point, "round-trip mismatch");
+    }
+
+    fn dense(v: f32) -> VectorPersisted {
+        VectorPersisted::Dense(vec![v])
+    }
+
+    #[test]
+    fn retain_vector_names_strips_list_batch_and_delete() {
+        let valid: HashSet<VectorNameBuf> = ["a".to_string()].into_iter().collect();
+
+        // PointsList: the deleted name `b` is stripped, `a` survives.
+        let mut list =
+            PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(vec![
+                PointStructPersisted {
+                    id: 1.into(),
+                    vector: VectorStructPersisted::Named(
+                        [("a".to_string(), dense(0.1)), ("b".to_string(), dense(0.2))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    payload: None,
+                },
+            ]));
+        list.retain_vector_names(&valid);
+        let PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(points)) =
+            &list
+        else {
+            unreachable!()
+        };
+        let VectorStructPersisted::Named(named) = &points[0].vector else {
+            unreachable!()
+        };
+        assert_eq!(named.keys().cloned().collect::<Vec<_>>(), vec!["a"]);
+
+        // PointsBatch: per-name entries are dropped, ids/payloads length untouched.
+        let mut batch = PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsBatch(
+            BatchPersisted {
+                ids: vec![1.into(), 2.into()],
+                vectors: BatchVectorStructPersisted::Named(
+                    [
+                        ("a".to_string(), vec![dense(0.1), dense(0.2)]),
+                        ("b".to_string(), vec![dense(0.3), dense(0.4)]),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                payloads: None,
+            },
+        ));
+        batch.retain_vector_names(&valid);
+        let PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsBatch(batch)) =
+            &batch
+        else {
+            unreachable!()
+        };
+        let BatchVectorStructPersisted::Named(named) = &batch.vectors else {
+            unreachable!()
+        };
+        assert_eq!(named.keys().cloned().collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(batch.ids.len(), 2);
+    }
 }

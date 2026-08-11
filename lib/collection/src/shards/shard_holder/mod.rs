@@ -4,6 +4,7 @@ pub(crate) mod shard_mapping;
 pub mod shared_shard_holder;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::debug_assert_matches;
 use std::ops::Deref as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -250,34 +251,63 @@ impl ShardHolder {
         shard: ShardReplicaSet,
         shard_key: Option<ShardKey>,
     ) -> CollectionResult<()> {
-        let evicted = self.shards.insert(shard_id, Arc::new(shard));
-        if let Some(evicted) = evicted {
-            debug_assert!(false, "Overwriting existing shard id {shard_id}");
-            evicted.stop_gracefully().await;
+        self.add_shards(vec![(shard_id, shard)], shard_key).await
+    }
+
+    /// Add batch of shards to shard holder and atomically update shard key mapping.
+    ///
+    /// ## Cancel safety
+    ///
+    /// This function is **not** cancel safe.
+    pub async fn add_shards(
+        &mut self,
+        shards: Vec<(ShardId, ShardReplicaSet)>,
+        shard_key: Option<ShardKey>,
+    ) -> CollectionResult<()> {
+        if shards.is_empty() {
+            return Ok(());
         }
 
-        self.rings
-            .entry(shard_key.clone())
-            .or_insert_with(HashRingRouter::single)
-            .add(shard_id);
+        // Persist mapping first: it is the only fallible step, so a failed write leaves
+        // in-memory state untouched.
+        if let Some(shard_key) = &shard_key {
+            self.key_mapping.write_optional(|mapping| {
+                let mut mapping = mapping.clone();
+                let shard_ids = mapping.entry(shard_key.clone()).or_default();
 
-        if let Some(shard_key) = shard_key {
-            self.key_mapping.write_optional(|key_mapping| {
-                let has_id = key_mapping
-                    .get(&shard_key)
-                    .map(|shard_ids| shard_ids.contains(&shard_id))
-                    .unwrap_or(false);
+                let mut changed = false;
 
-                if has_id {
-                    return None;
+                for &(shard_id, _) in &shards {
+                    changed |= shard_ids.insert(shard_id);
                 }
-                let mut copy_of_mapping = key_mapping.clone();
-                let shard_ids = copy_of_mapping.entry(shard_key.clone()).or_default();
-                shard_ids.insert(shard_id);
-                Some(copy_of_mapping)
+
+                if changed { Some(mapping) } else { None }
             })?;
-            self.shard_id_to_key_mapping.insert(shard_id, shard_key);
         }
+
+        let ring = self
+            .rings
+            .entry(shard_key.clone())
+            .or_insert_with(HashRingRouter::single);
+
+        for &(shard_id, _) in &shards {
+            ring.add(shard_id);
+        }
+
+        for (shard_id, shard) in shards {
+            let evicted = self.shards.insert(shard_id, Arc::new(shard));
+
+            if let Some(evicted) = evicted {
+                debug_assert!(false, "Overwriting existing shard id {shard_id}");
+                evicted.stop_gracefully().await;
+            }
+
+            if let Some(shard_key) = &shard_key {
+                self.shard_id_to_key_mapping
+                    .insert(shard_id, shard_key.clone());
+            }
+        }
+
         Ok(())
     }
 
@@ -318,11 +348,9 @@ impl ShardHolder {
         let ids_to_key = self.get_shard_id_to_key_mapping();
         for shard_id in self.shards.keys() {
             let shard_key = ids_to_key.get(shard_id).cloned();
-            debug_assert!(
-                matches!(
-                    (self.sharding_method, &shard_key),
-                    (ShardingMethod::Auto, None) | (ShardingMethod::Custom, Some(_)),
-                ),
+            debug_assert_matches!(
+                (self.sharding_method, &shard_key),
+                (ShardingMethod::Auto, None) | (ShardingMethod::Custom, Some(_)),
                 "auto sharding cannot have shard key, custom sharding must have shard key ({:?}, {shard_key:?})",
                 self.sharding_method,
             );
@@ -489,13 +517,19 @@ impl ShardHolder {
         (incoming, outgoing)
     }
 
-    /// Start tracking recovery progress for a shard (destination side).
+    /// Start a snapshot recovery of a shard (destination side).
     ///
-    /// Returns a [`ShardRecoveryGuard`] that must be held for the duration of the
-    /// recovery. Dropping the guard - on success, error, or cancellation - stops
-    /// tracking and removes the progress entry.
-    pub fn start_shard_recovery(&self, shard_id: ShardId) -> ShardRecoveryGuard {
-        self.active_recoveries.start(shard_id)
+    /// Requires the shard's recovery lock, which the returned [`ShardRecoveryGuard`]
+    /// takes ownership of. Prefer [`Collection::start_shard_recovery`], which acquires
+    /// the lock and calls this.
+    ///
+    /// [`Collection::start_shard_recovery`]: crate::collection::Collection::start_shard_recovery
+    pub fn start_shard_recovery(
+        &self,
+        shard_id: ShardId,
+        recovery_lock: tokio::sync::OwnedMutexGuard<()>,
+    ) -> ShardRecoveryGuard {
+        self.active_recoveries.start(shard_id, recovery_lock)
     }
 
     pub fn get_shard_transfer_info(
@@ -575,9 +609,10 @@ impl ShardHolder {
     ) -> CollectionResult<Vec<(&'a Arc<ShardReplicaSet>, Option<&'a ShardKey>)>> {
         let mut res = Vec::new();
 
-        match shard_selector {
+        let filter_resharding = match shard_selector {
             ShardSelectorInternal::Empty => {
-                debug_assert!(false, "Do not expect empty shard selector")
+                debug_assert!(false, "Do not expect empty shard selector");
+                false
             }
             ShardSelectorInternal::All => {
                 let is_custom_sharding = match self.sharding_method {
@@ -585,33 +620,7 @@ impl ShardHolder {
                     ShardingMethod::Custom => true,
                 };
 
-                let resharding_state = self.resharding_state.read().clone();
-
                 for (&shard_id, shard) in self.shards.iter() {
-                    // Ignore a new resharding shard until it completed point migration
-                    // The shard will be marked as active at the end of the migration stage
-                    let resharding_migrating_up = resharding_state.as_ref().is_some_and(|state| {
-                        state.direction == ReshardingDirection::Up
-                            && state.shard_id == shard_id
-                            && state.stage < ReshardingStage::ReadHashRingCommitted
-                    });
-                    if resharding_migrating_up {
-                        continue;
-                    }
-
-                    // Skip shard being removed by resharding down once the write
-                    // hash ring is committed. The shard is logically gone at this
-                    // point; querying it on a remote peer that already applied
-                    // `finish_resharding` would return a "shard not found" error.
-                    let resharding_removing_down = resharding_state.as_ref().is_some_and(|state| {
-                        state.direction == ReshardingDirection::Down
-                            && state.shard_id == shard_id
-                            && state.stage >= ReshardingStage::WriteHashRingCommitted
-                    });
-                    if resharding_removing_down {
-                        continue;
-                    }
-
                     // Technically, we could skip inactive shards regardless of sharding method,
                     // as we do not expect that shard id can even become inactive on all replicas.
                     // (if it happens, means there is a bug)
@@ -624,6 +633,8 @@ impl ShardHolder {
                     let shard_key = self.shard_id_to_key_mapping.get(&shard_id);
                     res.push((shard, shard_key));
                 }
+
+                true
             }
             ShardSelectorInternal::ShardKey(shard_key) => {
                 for shard_id in self.get_shard_ids_by_key(shard_key)? {
@@ -633,6 +644,8 @@ impl ShardHolder {
                         debug_assert!(false, "Shard id {shard_id} not found")
                     }
                 }
+
+                true
             }
             ShardSelectorInternal::ShardKeys(shard_keys) => {
                 for shard_key in shard_keys {
@@ -644,6 +657,8 @@ impl ShardHolder {
                         }
                     }
                 }
+
+                true
             }
             ShardSelectorInternal::ShardKeyWithFallback(key) => {
                 let (shard_ids_to_query, used_shard_key) =
@@ -658,6 +673,8 @@ impl ShardHolder {
                         debug_assert!(false, "Shard id {shard_id} not found")
                     }
                 }
+
+                true
             }
             ShardSelectorInternal::ShardId(shard_id) => {
                 if let Some(replica_set) = self.shards.get(shard_id) {
@@ -665,8 +682,39 @@ impl ShardHolder {
                 } else {
                     return Err(shard_not_found_error(*shard_id));
                 }
+
+                // Exempt from resharding filter. This selector is used by internal per-shard
+                // operations, such as the resharding driver reading back migrated points from the
+                // new shard, which must be able to reach the shard before it becomes visible to
+                // user-facing selectors
+                false
             }
+        };
+
+        // Filter out shards that must not be queried while resharding, regardless of how they
+        // were selected above
+        if filter_resharding && let Some(state) = self.resharding_state.read().as_ref() {
+            res.retain(|(shard, _)| {
+                if state.shard_id != shard.shard_id {
+                    return true;
+                }
+
+                // Ignore a new resharding shard until it completed point migration
+                // The shard will be marked as active at the end of the migration stage
+                let resharding_migrating_up = state.direction == ReshardingDirection::Up
+                    && state.stage < ReshardingStage::ReadHashRingCommitted;
+
+                // Skip shard being removed by resharding down once the write
+                // hash ring is committed. The shard is logically gone at this
+                // point; querying it on a remote peer that already applied
+                // `finish_resharding` would return a "shard not found" error.
+                let resharding_removing_down = state.direction == ReshardingDirection::Down
+                    && state.stage >= ReshardingStage::WriteHashRingCommitted;
+
+                !resharding_migrating_up && !resharding_removing_down
+            });
         }
+
         Ok(res)
     }
 

@@ -1,5 +1,6 @@
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::types::PointOffsetType;
+use common::generic_consts::AccessPattern;
+use common::types::{DeferredBehavior, PointOffsetType};
 
 use crate::common::operation_error::OperationResult;
 use crate::id_tracker::IdTrackerRead;
@@ -18,6 +19,16 @@ where
     TPS: PayloadStorageRead,
     TVD: VectorDataRead,
 {
+    pub fn read_payloads<P: AccessPattern, U: common::universal_io::UserData>(
+        &self,
+        point_offsets: impl Iterator<Item = (U, PointOffsetType)>,
+        callback: impl FnMut(U, Payload) -> OperationResult<()>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        self.payload_index
+            .read_payloads::<P, _>(point_offsets, callback, hw_counter)
+    }
+
     /// Retrieve payload by internal ID.
     #[inline]
     pub fn payload_by_offset(
@@ -34,7 +45,22 @@ where
         point_id: PointIdType,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Payload> {
-        let internal_id = self.lookup_internal_id(point_id)?;
+        // Single-point retrieval observes the visible snapshot; deferred
+        // mutations stay hidden until the optimizer rolls a fresh segment.
+        self.payload_with_behavior(point_id, DeferredBehavior::VisibleOnly, hw_counter)
+    }
+
+    /// Retrieve payload by external point ID with explicit deferred semantics.
+    /// With [`DeferredBehavior::WithDeferred`] this also resolves points whose
+    /// only head is a deferred mutation (invisible to reads) — used by the
+    /// copy-on-write move path which must relocate deferred points.
+    pub fn payload_with_behavior(
+        &self,
+        point_id: PointIdType,
+        deferred_behavior: DeferredBehavior,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload> {
+        let internal_id = self.lookup_internal_id(point_id, deferred_behavior)?;
         self.payload_by_offset(internal_id, hw_counter)
     }
 

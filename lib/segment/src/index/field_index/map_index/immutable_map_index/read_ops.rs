@@ -1,38 +1,39 @@
 use std::borrow::{Borrow as _, Cow};
 use std::iter;
 
+use blobstore::Blob;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use gridstore::Blob;
+use common::universal_io::UniversalRead;
 
 use super::super::read_ops::MapIndexRead;
 use super::super::{IdIter, MapIndexKey};
-use super::{ContainerSegment, ImmutableMapIndex, Storage};
+use super::{ContainerSegment, ImmutableMapIndex};
 use crate::common::operation_error::OperationResult;
 use crate::index::payload_config::StorageType;
 
-impl<N: MapIndexKey + ?Sized> MapIndexRead<N> for ImmutableMapIndex<N>
+impl<'a, N, S> MapIndexRead<'a, N> for ImmutableMapIndex<N, S>
 where
     Vec<<N as MapIndexKey>::Owned>: Blob + Send + Sync,
+    N: MapIndexKey + ?Sized + 'a,
+    S: UniversalRead,
 {
     fn check_values_any(
         &self,
         idx: PointOffsetType,
         _hw_counter: &HardwareCounterCell,
         check_fn: impl Fn(&N) -> bool,
-    ) -> bool {
-        self.point_to_values
-            .check_values_any(idx, |v| check_fn(v.borrow()))
+    ) -> OperationResult<bool> {
+        Ok(self
+            .point_to_values
+            .check_values_any(idx, |v| check_fn(v.borrow())))
     }
 
-    fn get_values<'a>(
+    fn get_values(
         &'a self,
         idx: PointOffsetType,
         _hw_counter: &HardwareCounterCell,
-    ) -> Option<impl Iterator<Item = Cow<'a, N>> + 'a>
-    where
-        N: 'a,
-    {
+    ) -> Option<impl Iterator<Item = Cow<'a, N>> + 'a> {
         Some(
             self.point_to_values
                 .get_values(idx)?
@@ -99,11 +100,7 @@ where
     }
 
     fn storage_type(&self) -> StorageType {
-        match &self.storage {
-            Storage::Mmap(index) => StorageType::Mmap {
-                is_on_disk: index.is_on_disk(),
-            },
-        }
+        StorageType::Mmap { is_on_disk: false }
     }
 
     /// Approximate RAM usage in bytes (cached at construction).
@@ -116,9 +113,11 @@ where
     }
 }
 
-impl<N: MapIndexKey + ?Sized> ImmutableMapIndex<N>
+impl<N, S> ImmutableMapIndex<N, S>
 where
     Vec<<N as MapIndexKey>::Owned>: Blob + Send + Sync,
+    N: MapIndexKey + ?Sized,
+    S: UniversalRead,
 {
     pub fn for_points_values(
         &self,
@@ -158,11 +157,17 @@ where
             value_to_points_container,
             deleted_value_to_points_container,
             point_to_values,
+            sorted_keys,
             indexed_points: _,
             values_count: _,
             storage: _,
             cached_ram_usage_bytes: _,
         } = self;
+
+        let sorted_keys_bytes = sorted_keys.as_ref().map_or(0, |keys| {
+            keys.capacity() * size_of::<<N as MapIndexKey>::Owned>()
+                + keys.iter().map(|k| N::owned_heap_bytes(k)).sum::<usize>()
+        });
 
         let hashmap_entry_overhead = size_of::<u64>() + size_of::<usize>();
         let vtp_base_bytes: usize = value_to_points.capacity()
@@ -179,6 +184,7 @@ where
             + vtp_heap_bytes
             + container_bytes
             + deleted_bytes
+            + sorted_keys_bytes
             + point_to_values.ram_usage_bytes()
     }
 }

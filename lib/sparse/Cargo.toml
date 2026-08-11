@@ -16,7 +16,8 @@ testing = ["common/testing"]
 
 [dependencies]
 bitpacking = { workspace = true }
-gridstore = { path = "../gridstore" }
+blink-alloc = { workspace = true }
+blobstore = { path = "../blobstore" }
 bincode = { workspace = true }
 common = { path = "../common/common" }
 fs-err = { workspace = true }
@@ -33,13 +34,12 @@ itertools = { workspace = true }
 parking_lot = { workspace = true }
 log = { workspace = true }
 zerocopy = { workspace = true }
-typed-arena = "2.0.2"
 
 [dev-dependencies]
 criterion = { workspace = true }
 dataset = { path = "../common/dataset" }
+duplicate = "2.0.1"
 fs-err = { workspace = true, features = ["debug"] }
-generic-tests = { workspace = true }
 indicatif = { workspace = true }
 sha2 = { workspace = true }
 sparse = { path = ".", features = ["testing"] }

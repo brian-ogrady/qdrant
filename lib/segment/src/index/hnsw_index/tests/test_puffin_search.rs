@@ -17,6 +17,7 @@ use std::sync::atomic::AtomicBool;
 
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
+use common::universal_io::MmapFs;
 use fs_err as fs;
 use quantization::encoded_storage::TestEncodedStorage;
 use quantization::encoded_vectors_binary::{
@@ -381,7 +382,7 @@ fn test_puffin_search_full_roundtrip_with_recall_and_quantized_containment() {
     let quantized_vec_size = get_quantized_vector_size_from_params::<u128>(DIM, Encoding::OneBit);
     assert_eq!(quantized_vec_size, fixture.quantized_vec_size);
     let storage = TestEncodedStorage::from_file(&data_path, quantized_vec_size).unwrap();
-    let encoded = EncodedVectorsBin::<u128, TestEncodedStorage>::load(storage, &meta_path)
+    let encoded = EncodedVectorsBin::<u128, TestEncodedStorage>::load(&MmapFs, storage, &meta_path)
         .expect("EncodedVectorsBin::<u128, _>::load from Puffin bytes");
 
     let hw = HardwareCounterCell::new();

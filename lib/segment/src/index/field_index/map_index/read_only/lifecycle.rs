@@ -1,20 +1,28 @@
 use std::path::{Path, PathBuf};
 
+use blobstore::Blob;
 use common::bitvec::BitSlice;
-use common::universal_io::UniversalRead;
-use gridstore::Blob;
+use common::universal_io::{CachedReadFs, Populate, UniversalRead, UniversalReadFs};
 
 use super::super::MapIndexKey;
 use super::super::mutable_map_index::read_only::ReadOnlyAppendableMapIndex;
-use super::super::universal_map_index::UniversalMapIndex;
+use super::super::on_disk_map_index::OnDiskMapIndex;
 use super::ReadOnlyMapIndex;
 use crate::common::operation_error::OperationResult;
+use crate::index::field_index::map_index::immutable_map_index::ImmutableMapIndex;
 use crate::index::payload_config::IndexMutability;
 
 impl<N: MapIndexKey + ?Sized, S: UniversalRead> ReadOnlyMapIndex<N, S>
 where
     Vec<<N as MapIndexKey>::Owned>: Blob + Send + Sync,
 {
+    pub fn preopen_appendable(
+        fs: &impl CachedReadFs<File = S>,
+        dir: PathBuf,
+    ) -> OperationResult<bool> {
+        ReadOnlyAppendableMapIndex::<N, S>::preopen(fs, dir)
+    }
+
     /// Read-only mirror of [`MapIndex::new_gridstore`][1]: open the appendable
     /// (Gridstore-backed) map index read-only, threading every file open
     /// through the filesystem handle `fs`.
@@ -26,8 +34,27 @@ where
     /// doesn't exist.
     ///
     /// [1]: super::super::MapIndex::new_gridstore
-    pub fn open_appendable(fs: &S::Fs, dir: PathBuf) -> OperationResult<Option<Self>> {
+    pub fn open_appendable(
+        fs: &impl UniversalReadFs<File = S>,
+        dir: PathBuf,
+    ) -> OperationResult<Option<Self>> {
         Ok(ReadOnlyAppendableMapIndex::open(fs, dir)?.map(Self::Appendable))
+    }
+
+    pub fn preopen_immutable(
+        fs: &impl CachedReadFs<File = S>,
+        dir: &Path,
+        is_on_disk: bool,
+    ) -> OperationResult<bool> {
+        let effective_is_on_disk =
+            is_on_disk || common::low_memory::low_memory_mode().prefer_disk();
+
+        let populate = match effective_is_on_disk {
+            true => Populate::No,
+            false => Populate::PreferBackground,
+        };
+
+        OnDiskMapIndex::<N, S>::preopen(fs, dir, populate)
     }
 
     /// Read-only mirror of [`MapIndex::new_mmap`][1]: open the immutable
@@ -43,7 +70,7 @@ where
     ///
     /// [1]: super::super::MapIndex::new_mmap
     pub fn open_immutable(
-        fs: &S::Fs,
+        fs: &impl UniversalReadFs<File = S>,
         path: &Path,
         is_on_disk: bool,
         deleted_points: &BitSlice,
@@ -51,10 +78,21 @@ where
         let effective_is_on_disk =
             is_on_disk || common::low_memory::low_memory_mode().prefer_disk();
 
-        Ok(
-            UniversalMapIndex::open(fs, path, effective_is_on_disk, deleted_points)?
-                .map(Self::Immutable),
-        )
+        let populate = match effective_is_on_disk {
+            true => Populate::No,
+            false => Populate::PreferBackground,
+        };
+        let Some(on_disk_index) = OnDiskMapIndex::open(fs, path, populate, deleted_points)? else {
+            return Ok(None);
+        };
+
+        if effective_is_on_disk {
+            Ok(Some(Self::OnDisk(on_disk_index)))
+        } else {
+            Ok(Some(Self::Immutable(ImmutableMapIndex::load_from_on_disk(
+                on_disk_index,
+            )?)))
+        }
     }
 
     /// Reports the on-disk format's mutability, mirroring
@@ -72,6 +110,7 @@ where
         match self {
             Self::Appendable(_) => IndexMutability::Mutable,
             Self::Immutable(_) => IndexMutability::Immutable,
+            Self::OnDisk(_) => IndexMutability::Immutable,
         }
     }
 }

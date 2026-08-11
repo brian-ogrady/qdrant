@@ -1,10 +1,13 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::{error, result};
 
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::generic_consts::Random;
 use common::types::PointOffsetType;
 use itertools::Itertools;
 use rand::rngs::StdRng;
@@ -18,6 +21,7 @@ use crate::fixtures::payload_context_fixture::create_id_tracker_fixture;
 use crate::fixtures::query_fixtures::QueryVariant;
 use crate::id_tracker::IdTrackerRead;
 use crate::index::hnsw_index::point_scorer::FilteredScorer;
+use crate::segment_constructor::batched_reader::merge_from_single_source;
 use crate::types::{
     BinaryQuantizationConfig, Distance, ProductQuantizationConfig, QuantizationConfig,
     ScalarQuantizationConfig,
@@ -29,7 +33,7 @@ use crate::vector_storage::dense::volatile_dense_vector_storage::new_volatile_de
 use crate::vector_storage::quantized::quantized_vectors::{
     QuantizedVectors, QuantizedVectorsStorageType,
 };
-use crate::vector_storage::vector_storage_base::{VectorStorage, VectorStorageRead};
+use crate::vector_storage::vector_storage_base::VectorStorageRead;
 
 const DIMS: usize = 128;
 const NUM_POINTS: usize = 600;
@@ -67,6 +71,7 @@ fn async_memmap_storage(dir: &std::path::Path) -> VectorStorageEnum {
 
 fn scalar_u8() -> WithQuantization {
     let config = ScalarQuantizationConfig {
+        memory: None,
         r#type: crate::types::ScalarType::Int8,
         quantile: Some(0.5),
         always_ram: Some(true),
@@ -82,6 +87,7 @@ fn scalar_u8() -> WithQuantization {
 
 fn product_x4() -> WithQuantization {
     let config = ProductQuantizationConfig {
+        memory: None,
         compression: crate::types::CompressionRatio::X4,
         always_ram: Some(true),
     }
@@ -95,6 +101,7 @@ fn product_x4() -> WithQuantization {
 
 fn binary() -> WithQuantization {
     let config = BinaryQuantizationConfig {
+        memory: None,
         always_ram: Some(true),
         encoding: None,
         query_encoding: None,
@@ -144,13 +151,11 @@ fn scoring_equivalency(
 
     let mut other_storage = other_storage(other_dir.path());
 
-    let mut iter = (0..NUM_POINTS).map(|i| {
-        let i = i as PointOffsetType;
-        let vec = raw_storage.get_vector::<Random>(i);
-        let deleted = raw_storage.is_deleted_vector(i);
-        (vec, deleted)
-    });
-    other_storage.update_from(&mut iter, &Default::default())?;
+    merge_from_single_source(
+        &mut other_storage,
+        &raw_storage,
+        NUM_POINTS as PointOffsetType,
+    )?;
 
     let quant_dir = tempfile::Builder::new().prefix("quant-storage").tempdir()?;
     let quantized_vectors = if let Some(config) = &quant_config {

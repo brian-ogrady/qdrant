@@ -1,8 +1,10 @@
 pub mod build_index_result;
 pub mod collection_defaults;
 pub mod facets;
+pub mod fully_qualified_point;
 pub mod groups;
 pub mod index;
+pub mod load_profile;
 pub mod manifest;
 pub mod modifier;
 pub mod named_vectors;

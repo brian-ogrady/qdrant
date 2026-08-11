@@ -2,8 +2,9 @@ mod build;
 mod payload_index;
 mod read_view;
 
-pub use read_view::StructPayloadIndexReadView;
+pub use read_view::{IdsConditionChecker, StructPayloadIndexReadView};
 
+pub mod read_only;
 #[cfg(test)]
 mod tests;
 
@@ -18,9 +19,7 @@ use common::defaults::log_load_timing;
 use fs_err as fs;
 
 use super::field_index::FieldIndex;
-use super::field_index::index_selector::{
-    IndexSelector, IndexSelectorGridstore, IndexSelectorMmap,
-};
+use super::field_index::index_selector::IndexSelector;
 use super::payload_config::{FullPayloadIndexType, PayloadFieldSchemaWithIndexType};
 use crate::common::operation_error::OperationResult;
 use crate::common::utils::IndexesMap;
@@ -28,13 +27,34 @@ use crate::id_tracker::{IdTrackerEnum, IdTrackerRead};
 use crate::index::payload_config::{self, PayloadConfig};
 use crate::index::visited_pool::VisitedPool;
 use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
-use crate::types::{PayloadFieldSchema, PayloadKeyType, VectorNameBuf};
+use crate::types::{Memory, PayloadFieldSchema, PayloadKeyType, VectorNameBuf};
 use crate::vector_storage::VectorStorageEnum;
 
-#[derive(Debug)]
-enum StorageType {
-    GridstoreAppendable,
-    GridstoreNonAppendable,
+/// Desired storage type for payload indices of a segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageType {
+    Appendable,
+    NonAppendable,
+}
+
+impl StorageType {
+    /// Storage type for payload indices of a segment, given whether the segment is appendable.
+    pub fn from_appendable(appendable: bool) -> Self {
+        if appendable {
+            StorageType::Appendable
+        } else {
+            StorageType::NonAppendable
+        }
+    }
+}
+
+/// Whether opening a payload index may create missing index data or must only load existing data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexLoadMode {
+    /// Create missing index data while loading.
+    CreateIfMissing,
+    /// Only load existing index data.
+    LoadExisting,
 }
 
 /// `PayloadIndex` implementation, which actually uses index structures for providing faster search
@@ -147,7 +167,7 @@ impl StructPayloadIndex {
                 .iter()
                 // Load each index
                 .map(|index| {
-                    let selector = self.selector_with_type(index);
+                    let selector = self.selector_with_type(index, &payload_schema.schema);
                     selector.new_index_with_type(
                         field,
                         &payload_schema.schema,
@@ -173,11 +193,23 @@ impl StructPayloadIndex {
         // If index is not properly loaded or when migrating, rebuild indices
         if rebuild {
             log::debug!("Rebuilding payload index for field `{field}`...");
+            // Close any partially-loaded index storages first: the rebuild wipes
+            // their directories before building fresh.
+            indexes.clear();
             indexes = self.build_field_indexes(
                 field,
                 &payload_schema.schema,
                 &HardwareCounterCell::disposable(), // Internal operation
             )?;
+
+            // The durable config keeps listing this field: persist the rebuilt data
+            // now, or a crash before the next flush cycle would leave the config
+            // pointing at empty index storages that silently load as a complete
+            // index. Safe here: the segment is still being opened, so no flush
+            // pipeline capture of these storages can exist yet.
+            for index in &indexes {
+                index.flusher()()?;
+            }
 
             // Persist exact payload index types of newly built indices
             is_dirty = true;
@@ -192,8 +224,8 @@ impl StructPayloadIndex {
         id_tracker: Arc<AtomicRefCell<IdTrackerEnum>>,
         vector_storages: HashMap<VectorNameBuf, Arc<AtomicRefCell<VectorStorageEnum>>>,
         path: &Path,
-        is_appendable: bool,
-        create: bool,
+        storage_type: StorageType,
+        load_mode: IndexLoadMode,
     ) -> OperationResult<Self> {
         fs::create_dir_all(path)?;
         let config_path = PayloadConfig::get_config_path(path);
@@ -201,12 +233,6 @@ impl StructPayloadIndex {
             PayloadConfig::load(&config_path)?
         } else {
             PayloadConfig::default()
-        };
-
-        let storage_type = if is_appendable {
-            StorageType::GridstoreAppendable
-        } else {
-            StorageType::GridstoreNonAppendable
         };
 
         let mut index = StructPayloadIndex {
@@ -225,7 +251,7 @@ impl StructPayloadIndex {
             index.save_config()?;
         }
 
-        index.load_all_fields(create)?;
+        index.load_all_fields(load_mode == IndexLoadMode::CreateIfMissing)?;
 
         Ok(index)
     }
@@ -273,29 +299,40 @@ impl StructPayloadIndex {
 
     /// Select which type of PayloadIndex to use for the field
     pub(super) fn selector(&self, payload_schema: &PayloadFieldSchema) -> IndexSelector<'_> {
-        let is_on_disk = payload_schema.is_on_disk();
+        let memory = payload_schema.memory_placement();
 
         match &self.storage_type {
-            StorageType::GridstoreAppendable => {
-                IndexSelector::Gridstore(IndexSelectorGridstore { dir: &self.path })
-            }
-            StorageType::GridstoreNonAppendable => IndexSelector::Mmap(IndexSelectorMmap {
+            StorageType::Appendable => IndexSelector::Appendable { dir: &self.path },
+            StorageType::NonAppendable => IndexSelector::NonAppendable {
                 dir: &self.path,
-                is_on_disk,
-            }),
+                memory,
+            },
         }
     }
 
-    fn selector_with_type(&self, index_type: &FullPayloadIndexType) -> IndexSelector<'_> {
+    fn selector_with_type(
+        &self,
+        index_type: &FullPayloadIndexType,
+        payload_schema: &PayloadFieldSchema,
+    ) -> IndexSelector<'_> {
         match index_type.storage_type {
-            payload_config::StorageType::Gridstore => {
-                IndexSelector::Gridstore(IndexSelectorGridstore { dir: &self.path })
-            }
+            payload_config::StorageType::Gridstore => IndexSelector::Appendable { dir: &self.path },
             payload_config::StorageType::Mmap { is_on_disk } => {
-                IndexSelector::Mmap(IndexSelectorMmap {
+                // The persisted flag records the structural variant (heap wrapper vs mmap) the
+                // index was built with; the schema's requested placement refines cold vs cached
+                // for the mmap variant.
+                let memory = if is_on_disk {
+                    match payload_schema.memory_placement() {
+                        Memory::Cached => Memory::Cached,
+                        Memory::Cold | Memory::Pinned => Memory::Cold,
+                    }
+                } else {
+                    Memory::Pinned
+                };
+                IndexSelector::NonAppendable {
                     dir: &self.path,
-                    is_on_disk,
-                })
+                    memory,
+                }
             }
         }
     }

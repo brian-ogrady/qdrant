@@ -5,20 +5,20 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use serde_json::Value;
 
-use super::GeoMapIndex;
-use super::read_ops::{self, GeoMapIndexRead};
+use super::GeoIndex;
+use super::read_ops::{self, GeoConditionChecker, GeoIndexRead};
 use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::utils::MultiValue;
+use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::index::field_index::{
     CardinalityEstimation, PayloadBlockCondition, PayloadFieldIndex, PayloadFieldIndexRead,
     ValueIndexer,
 };
-use crate::index::query_optimization::optimized_filter::ConditionCheckerFn;
 use crate::index::query_optimization::rescore_formula::value_retriever::VariableRetrieverFn;
 use crate::types::{FieldCondition, GeoPoint, PayloadKeyType};
 
-impl ValueIndexer for GeoMapIndex {
+impl ValueIndexer for GeoIndex {
     type ValueType = GeoPoint;
 
     fn add_many(
@@ -28,11 +28,11 @@ impl ValueIndexer for GeoMapIndex {
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         match self {
-            GeoMapIndex::Mutable(index) => index.add_many_geo_points(id, &values, hw_counter),
-            GeoMapIndex::Immutable(_) => Err(OperationError::service_error(
+            GeoIndex::Mutable(index) => index.add_many_geo_points(id, values, hw_counter),
+            GeoIndex::Immutable(_) => Err(OperationError::service_error(
                 "Can't add values to immutable geo index",
             )),
-            GeoMapIndex::Storage(_) => Err(OperationError::service_error(
+            GeoIndex::OnDisk(_) => Err(OperationError::service_error(
                 "Can't add values to mmap geo index",
             )),
         }
@@ -59,9 +59,9 @@ impl ValueIndexer for GeoMapIndex {
 
     fn remove_point(&mut self, id: PointOffsetType) -> OperationResult<()> {
         match self {
-            GeoMapIndex::Mutable(index) => index.remove_point(id),
-            GeoMapIndex::Immutable(index) => index.remove_point(id),
-            GeoMapIndex::Storage(index) => {
+            GeoIndex::Mutable(index) => index.remove_point(id),
+            GeoIndex::Immutable(index) => index.remove_point(id),
+            GeoIndex::OnDisk(index) => {
                 index.remove_point(id);
                 Ok(())
             }
@@ -69,13 +69,13 @@ impl ValueIndexer for GeoMapIndex {
     }
 }
 
-impl GeoMapIndex {
+impl GeoIndex {
     pub fn value_retriever<'a>(
         &'a self,
         _hw_counter: &'a HardwareCounterCell,
     ) -> VariableRetrieverFn<'a> {
         Box::new(move |point_id: PointOffsetType| -> MultiValue<Value> {
-            GeoMapIndexRead::get_values(self, point_id)
+            GeoIndexRead::get_values(self, point_id)
                 .into_iter()
                 .flatten()
                 .filter_map(|v| serde_json::to_value(v).ok())
@@ -84,35 +84,35 @@ impl GeoMapIndex {
     }
 }
 
-impl PayloadFieldIndex for GeoMapIndex {
+impl PayloadFieldIndex for GeoIndex {
     fn wipe(self) -> OperationResult<()> {
         match self {
-            GeoMapIndex::Mutable(index) => index.wipe(),
-            GeoMapIndex::Immutable(index) => index.wipe(),
-            GeoMapIndex::Storage(index) => index.wipe(),
+            GeoIndex::Mutable(index) => index.wipe(),
+            GeoIndex::Immutable(index) => index.wipe(),
+            GeoIndex::OnDisk(index) => index.wipe(),
         }
     }
 
     fn flusher(&self) -> Flusher {
         match self {
-            GeoMapIndex::Mutable(index) => index.flusher(),
-            GeoMapIndex::Immutable(index) => index.flusher(),
-            GeoMapIndex::Storage(index) => index.flusher(),
+            GeoIndex::Mutable(index) => index.flusher(),
+            GeoIndex::Immutable(index) => index.flusher(),
+            GeoIndex::OnDisk(index) => index.flusher(),
         }
     }
 
     fn files(&self) -> Vec<PathBuf> {
-        GeoMapIndexRead::files(self)
+        GeoIndexRead::files(self)
     }
 
     fn immutable_files(&self) -> Vec<PathBuf> {
-        GeoMapIndexRead::immutable_files(self)
+        GeoIndexRead::immutable_files(self)
     }
 }
 
-impl PayloadFieldIndexRead for GeoMapIndex {
-    fn count_indexed_points(&self) -> usize {
-        self.points_count()
+impl PayloadFieldIndexRead for GeoIndex {
+    fn count_indexed_points(&self) -> OperationResult<usize> {
+        Ok(self.points_count())
     }
 
     fn filter<'a>(
@@ -144,7 +144,31 @@ impl PayloadFieldIndexRead for GeoMapIndex {
         &'a self,
         condition: &FieldCondition,
         hw_acc: HwMeasurementAcc,
-    ) -> Option<ConditionCheckerFn<'a>> {
-        read_ops::condition_checker(self, condition, hw_acc)
+    ) -> OperationResult<Option<ConditionCheckerEnum<'a>>> {
+        let FieldCondition {
+            key: _,
+            r#match: _,
+            range: _,
+            geo_radius,
+            geo_bounding_box,
+            geo_polygon,
+            values_count: _,
+            is_empty: _,
+            is_null: _,
+        } = condition;
+        let hw_counter = hw_acc.get_counter_cell();
+        if let Some(filter) = *geo_radius {
+            let checker = GeoConditionChecker::new(self, hw_counter, filter);
+            return Ok(Some(ConditionCheckerEnum::GeoRadiusWritable(checker)));
+        }
+        if let Some(filter) = *geo_bounding_box {
+            let checker = GeoConditionChecker::new(self, hw_counter, filter);
+            return Ok(Some(ConditionCheckerEnum::GeoBoundingBoxWritable(checker)));
+        }
+        if let Some(polygon) = geo_polygon.as_ref() {
+            let checker = GeoConditionChecker::new(self, hw_counter, polygon.convert());
+            return Ok(Some(ConditionCheckerEnum::GeoPolygonWritable(checker)));
+        }
+        Ok(None)
     }
 }

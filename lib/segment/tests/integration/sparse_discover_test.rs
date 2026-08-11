@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use ahash::AHashSet;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::TelemetryDetail;
+use common::universal_io::MmapFs;
 use itertools::Itertools;
 use rand::prelude::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
@@ -125,6 +126,7 @@ fn sparse_index_discover_test() {
             SPARSE_VECTOR_NAME.to_owned(),
             SparseVectorDataConfig {
                 index: SparseIndexConfig {
+                    memory: None,
                     full_scan_threshold: Some(DEFAULT_SPARSE_FULL_SCAN_THRESHOLD),
                     index_type: SparseIndexType::MutableRam,
                     datatype: Some(VectorStorageDatatype::Float32),
@@ -152,8 +154,8 @@ fn sparse_index_discover_test() {
         sparse_vector_data: Default::default(),
     };
 
-    let mut sparse_segment = build_segment(dir.path(), &sparse_config, None, true).unwrap();
-    let mut dense_segment = build_segment(dir.path(), &dense_config, None, true).unwrap();
+    let (mut sparse_segment, _) = build_segment(dir.path(), &sparse_config, None, true).unwrap();
+    let (mut dense_segment, _) = build_segment(dir.path(), &dense_config, None, true).unwrap();
 
     let hw_counter = HardwareCounterCell::new();
 
@@ -173,7 +175,9 @@ fn sparse_index_discover_test() {
 
     let vector_storage = &sparse_segment.vector_data[SPARSE_VECTOR_NAME].vector_storage;
     let sparse_index = create_sparse_vector_index_test(SparseVectorIndexOpenArgs {
+        fs: &MmapFs,
         config: SparseIndexConfig {
+            memory: None,
             full_scan_threshold: Some(DEFAULT_SPARSE_FULL_SCAN_THRESHOLD),
             index_type: SparseIndexType::ImmutableRam,
             datatype: Some(VectorStorageDatatype::Float32),
@@ -218,7 +222,7 @@ fn sparse_index_discover_test() {
 
         let query_context = QueryContext::default();
         let segment_query_context = query_context.get_segment_query_context();
-        let vector_context = segment_query_context.get_vector_context(SPARSE_VECTOR_NAME);
+        let vector_context = segment_query_context.get_vector_context(SPARSE_VECTOR_NAME, None);
 
         let sparse_search_result = sparse_index
             .search(&[&sparse_query], None, top, None, &vector_context)
@@ -263,6 +267,7 @@ fn sparse_index_hardware_measurement_test() {
             SPARSE_VECTOR_NAME.to_owned(),
             SparseVectorDataConfig {
                 index: SparseIndexConfig {
+                    memory: None,
                     full_scan_threshold: Some(DEFAULT_SPARSE_FULL_SCAN_THRESHOLD),
                     index_type: SparseIndexType::MutableRam,
                     datatype: Some(VectorStorageDatatype::Float32),
@@ -274,7 +279,7 @@ fn sparse_index_hardware_measurement_test() {
         payload_storage_type: Default::default(),
     };
 
-    let mut sparse_segment = build_segment(dir.path(), &sparse_config, None, true).unwrap();
+    let (mut sparse_segment, _) = build_segment(dir.path(), &sparse_config, None, true).unwrap();
 
     let hw_counter = HardwareCounterCell::new();
 
@@ -290,7 +295,9 @@ fn sparse_index_hardware_measurement_test() {
 
     let vector_storage = &sparse_segment.vector_data[SPARSE_VECTOR_NAME].vector_storage;
     let sparse_index = create_sparse_vector_index_test(SparseVectorIndexOpenArgs {
+        fs: &MmapFs,
         config: SparseIndexConfig {
+            memory: None,
             full_scan_threshold: Some(DEFAULT_SPARSE_FULL_SCAN_THRESHOLD),
             index_type: SparseIndexType::ImmutableRam,
             datatype: Some(VectorStorageDatatype::Float32),
@@ -310,7 +317,7 @@ fn sparse_index_hardware_measurement_test() {
 
     let query_context = QueryContext::default();
     let segment_query_context = query_context.get_segment_query_context();
-    let vector_context = segment_query_context.get_vector_context(SPARSE_VECTOR_NAME);
+    let vector_context = segment_query_context.get_vector_context(SPARSE_VECTOR_NAME, None);
 
     let cpu_usage = query_context.hardware_usage_accumulator().get_cpu();
     assert_eq!(cpu_usage, 0);

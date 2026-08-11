@@ -1,20 +1,21 @@
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
+use blobstore::Blob;
 use common::bitvec::BitVec;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use common::universal_io::MmapFs;
-use gridstore::Blob;
+use common::universal_io::{MmapFs, Populate};
 use serde_json::Value;
 
 use super::mutable_numeric_index::InMemoryNumericIndex;
+use super::on_disk_numeric_index::OnDiskNumericIndex;
 use super::storage::NumericIndexInner;
-use super::universal_numeric_index::UniversalNumericIndex;
-use super::{Encodable, NumericIndex, NumericIndexIntoInnerValue};
+use super::{Encodable, NumericIndex, NumericIndexIntoInnerValue, NumericIndexValue};
 use crate::common::operation_error::{OperationError, OperationResult};
+use crate::index::field_index::numeric_index::immutable_numeric_index::ImmutableNumericIndex;
 use crate::index::field_index::numeric_point::Numericable;
-use crate::index::field_index::stored_point_to_values::StoredValue;
+use crate::index::field_index::on_disk_point_to_values::StoredValue;
 use crate::index::field_index::{FieldIndexBuilderTrait, ValueIndexer};
 
 pub struct NumericIndexBuilder<T: Encodable + Numericable + StoredValue + Send + Sync + Default, P>(
@@ -36,7 +37,7 @@ where
         match &mut self.0.inner {
             NumericIndexInner::Mutable(index) => index.clear(),
             NumericIndexInner::Immutable(_) => unreachable!(),
-            NumericIndexInner::Mmap(_) => unreachable!(),
+            NumericIndexInner::OnDisk(_) => unreachable!(),
         }
     }
 
@@ -123,15 +124,23 @@ where
     }
 
     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
-        let inner = UniversalNumericIndex::build(
+        let populate = Populate::from(!self.is_on_disk);
+        let on_disk_index = OnDiskNumericIndex::build(
             &MmapFs,
             self.in_memory_index,
             &self.path,
-            self.is_on_disk,
+            populate,
             &self.deleted_points,
         )?;
+
+        let inner = if self.is_on_disk {
+            NumericIndexInner::OnDisk(on_disk_index)
+        } else {
+            NumericIndexInner::Immutable(ImmutableNumericIndex::load_from_on_disk(on_disk_index))
+        };
+
         Ok(NumericIndex {
-            inner: NumericIndexInner::Mmap(inner),
+            inner,
             _phantom: PhantomData,
         })
     }
@@ -159,8 +168,7 @@ where
     }
 }
 
-impl<T: Encodable + Numericable + StoredValue + Send + Sync + Default, P> FieldIndexBuilderTrait
-    for NumericIndexGridstoreBuilder<T, P>
+impl<T: NumericIndexValue, P> FieldIndexBuilderTrait for NumericIndexGridstoreBuilder<T, P>
 where
     NumericIndex<T, P>: ValueIndexer<ValueType = P>,
     Vec<T>: Blob,
@@ -173,7 +181,7 @@ where
             "index must be initialized exactly once",
         );
         self.index.replace(
-            NumericIndex::new_gridstore(self.dir.clone(), true)?
+            NumericIndex::new_mutable(self.dir.clone(), true)?
                 // unwrap safety: cannot fail because create_if_missing is true
                 .unwrap(),
         );

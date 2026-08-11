@@ -14,8 +14,10 @@ use shard::search::CoreSearchRequestBatch;
 use tokio::time::Instant;
 
 use super::Collection;
+use crate::common::batching::empty_batch_results;
 use crate::events::SlowQueryEvent;
 use crate::operations::consistency_params::ReadConsistency;
+use crate::operations::routing::RoutingToken;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::*;
 
@@ -25,6 +27,7 @@ impl Collection {
         &self,
         request: CoreSearchRequest,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -40,6 +43,7 @@ impl Collection {
             .do_core_search_batch(
                 request_batch,
                 read_consistency,
+                routing_token,
                 shard_selection,
                 timeout,
                 hw_measurement_acc,
@@ -52,6 +56,7 @@ impl Collection {
         &self,
         request: CoreSearchRequestBatch,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -59,7 +64,7 @@ impl Collection {
         let start = Instant::now();
         // shortcuts batch if all requests with limit=0
         if request.searches.iter().all(|s| s.limit == 0) {
-            return Ok(vec![]);
+            return Ok(empty_batch_results(request.searches.len()));
         }
 
         let is_payload_required = request
@@ -107,6 +112,7 @@ impl Collection {
                 .do_core_search_batch(
                     without_payload_batch,
                     read_consistency,
+                    routing_token,
                     &shard_selection,
                     timeout,
                     hw_measurement_acc.clone(),
@@ -123,6 +129,7 @@ impl Collection {
                         req.with_payload.clone(),
                         req.with_vector.unwrap_or_default(),
                         read_consistency,
+                        routing_token,
                         &shard_selection,
                         timeout,
                         hw_measurement_acc.clone(),
@@ -134,6 +141,7 @@ impl Collection {
                 .do_core_search_batch(
                     request,
                     read_consistency,
+                    routing_token,
                     &shard_selection,
                     timeout,
                     hw_measurement_acc,
@@ -147,6 +155,7 @@ impl Collection {
         &self,
         request: CoreSearchRequestBatch,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -178,6 +187,7 @@ impl Collection {
                     .core_search(
                         request,
                         read_consistency,
+                        routing_token,
                         shard_selection.is_shard_id(),
                         timeout,
                         hw_measurement_acc,
@@ -217,6 +227,7 @@ impl Collection {
         with_payload: Option<WithPayloadInterface>,
         with_vector: WithVector,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -244,6 +255,7 @@ impl Collection {
             .retrieve(
                 retrieve_request,
                 read_consistency,
+                routing_token,
                 shard_selection,
                 timeout,
                 hw_measurement_acc,

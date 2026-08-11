@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr as _;
 use std::time::Instant;
@@ -32,15 +36,17 @@ use super::qdrant::{
     BinaryQuantization, BoolIndexParams, CompressionRatio, DatetimeIndexParams, DatetimeRange,
     Direction, FacetHit, FacetHitInternal, FacetValue, FacetValueInternal, FieldType,
     FloatIndexParams, GeoIndexParams, GeoLineString, GroupId, HardwareUsage, HasVectorCondition,
-    KeywordIndexParams, LookupLocation, MaxOptimizationThreads, MultiVectorComparator,
-    MultiVectorConfig, OrderBy, OrderValue, Range, RawVector, RecommendStrategy, RetrievedPoint,
-    SearchMatrixPair, SearchPointGroups, SearchPoints, ShardKeySelector, StartFrom,
-    StrictModeMultivector, StrictModeMultivectorConfig, StrictModeSparse, StrictModeSparseConfig,
-    TurboQuantBitSize, TurboQuantization, UuidIndexParams, VectorsOutput, WithLookup, raw_query,
-    start_from,
+    KeywordIndexParams, KeywordPrefixParams, LookupLocation, MaxOptimizationThreads, Memory,
+    MultiVectorComparator, MultiVectorConfig, OrderBy, OrderValue, Range, RawVector,
+    RecommendStrategy, RetrievedPoint, SearchMatrixPair, SearchPointGroups, SearchPoints,
+    ShardKeySelector, SliceCondition, StartFrom, StrictModeMultivector,
+    StrictModeMultivectorConfig, StrictModeSparse, StrictModeSparseConfig, TurboQuantBitSize,
+    TurboQuantization, UuidIndexParams, VectorsOutput, WithLookup, raw_query, start_from,
 };
 use super::stemming_algorithm::StemmingParams;
-use super::{Expression, Formula, RecoQuery, SnowballParams, StemmingAlgorithm, Usage};
+use super::{
+    DisabledStemmer, Expression, Formula, RecoQuery, SnowballParams, StemmingAlgorithm, Usage,
+};
 use crate::conversions::json::{self, json_to_proto};
 use crate::grpc::qdrant::condition::ConditionOneOf;
 use crate::grpc::qdrant::r#match::MatchValue;
@@ -50,16 +56,16 @@ use crate::grpc::qdrant::with_payload_selector::SelectorOptions;
 use crate::grpc::qdrant::{
     AcornSearchParams, CollectionDescription, CollectionOperationResponse, Condition, Distance,
     FieldCondition, Filter, GeoBoundingBox, GeoPoint, GeoPolygon, GeoRadius, HasIdCondition,
-    HealthCheckReply, HnswConfigDiff, IntegerIndexParams, IsEmptyCondition, IsNullCondition,
-    ListCollectionsResponse, ListShardKeysResponse, Match, MinShould, NamedVectors,
-    NestedCondition, PayloadExcludeSelector, PayloadIncludeSelector, PayloadIndexParams,
-    PayloadSchemaInfo, PayloadSchemaType, PointId, PointStruct, PointsOperationResponse,
-    PointsOperationResponseInternal, ProductQuantization, QuantizationConfig,
-    QuantizationSearchParams, QuantizationType, RepeatedIntegers, RepeatedStrings,
-    ScalarQuantization, ScoredPoint, SearchParams, ShardKey, ShardKeyDescription, StopwordsSet,
-    StrictModeConfig, TextIndexParams, TokenizerType, UpdateResult, UpdateResultInternal,
-    ValuesCount, VectorsSelector, WithPayloadSelector, WithVectorsSelector, shard_key,
-    with_vectors_selector,
+    HealthCheckReply, HnswConfigDiff, IdfParams, IntegerIndexParams, IsEmptyCondition,
+    IsNullCondition, ListCollectionsResponse, ListShardKeysResponse, Match, MinShould,
+    NamedVectors, NestedCondition, PayloadExcludeSelector, PayloadIncludeSelector,
+    PayloadIndexParams, PayloadSchemaInfo, PayloadSchemaType, PointId, PointStruct,
+    PointsOperationResponse, PointsOperationResponseInternal, ProductQuantization,
+    QuantizationConfig, QuantizationSearchParams, QuantizationType, RepeatedIntegers,
+    RepeatedStrings, ScalarQuantization, ScoredPoint, SearchParams, ShardKey, ShardKeyDescription,
+    StopwordsSet, StrictModeConfig, TextIndexParams, TokenizerType, UpdateResult,
+    UpdateResultInternal, ValuesCount, VectorsSelector, WithPayloadSelector, WithVectorsSelector,
+    shard_key, with_vectors_selector,
 };
 use crate::grpc::{
     self, BinaryQuantizationEncoding, BinaryQuantizationQueryEncoding, DecayParamsExpression,
@@ -191,19 +197,63 @@ impl From<segment::data_types::index::TokenizerType> for TokenizerType {
     }
 }
 
+impl From<segment::types::Memory> for Memory {
+    fn from(memory: segment::types::Memory) -> Self {
+        match memory {
+            segment::types::Memory::Cold => Memory::Cold,
+            segment::types::Memory::Cached => Memory::Cached,
+            segment::types::Memory::Pinned => Memory::Pinned,
+        }
+    }
+}
+
+/// Convert an optional proto `Memory` enum value into the segment memory placement.
+/// The `MemoryUnknown` sentinel maps to `None`.
+pub fn convert_memory_from_proto(
+    memory: Option<i32>,
+) -> Result<Option<segment::types::Memory>, Status> {
+    let Some(memory_int) = memory else {
+        return Ok(None);
+    };
+    let grpc_memory = Memory::try_from(memory_int).map_err(|_| {
+        Status::invalid_argument(format!("Cannot convert memory placement: {memory_int}"))
+    })?;
+    Ok(match grpc_memory {
+        Memory::Unknown => None,
+        Memory::Cold => Some(segment::types::Memory::Cold),
+        Memory::Cached => Some(segment::types::Memory::Cached),
+        Memory::Pinned => Some(segment::types::Memory::Pinned),
+    })
+}
+
+/// Convert an optional segment memory placement into the proto enum value.
+pub fn convert_memory_to_proto(memory: Option<segment::types::Memory>) -> Option<i32> {
+    memory.map(|memory| Memory::from(memory) as i32)
+}
+
+/// Infallible variant of [`convert_memory_from_proto`] for `From` conversions that cannot
+/// fail: invalid values are silently converted to `None`.
+pub fn convert_memory_from_proto_lossy(memory: Option<i32>) -> Option<segment::types::Memory> {
+    convert_memory_from_proto(memory).ok().flatten()
+}
+
 impl From<segment::data_types::index::KeywordIndexParams> for PayloadIndexParams {
     fn from(params: segment::data_types::index::KeywordIndexParams) -> Self {
         let segment::data_types::index::KeywordIndexParams {
             r#type: _,
             is_tenant,
             on_disk,
+            memory,
             enable_hnsw,
+            prefix,
         } = params;
         PayloadIndexParams {
             index_params: Some(IndexParams::KeywordIndexParams(KeywordIndexParams {
                 is_tenant,
                 on_disk,
                 enable_hnsw,
+                prefix: prefix.unwrap_or_default().then_some(KeywordPrefixParams {}),
+                memory: convert_memory_to_proto(memory),
             })),
         }
     }
@@ -216,6 +266,7 @@ impl From<segment::data_types::index::IntegerIndexParams> for PayloadIndexParams
             lookup,
             range,
             on_disk,
+            memory,
             is_principal,
             enable_hnsw,
         } = params;
@@ -226,6 +277,7 @@ impl From<segment::data_types::index::IntegerIndexParams> for PayloadIndexParams
                 is_principal,
                 on_disk,
                 enable_hnsw,
+                memory: convert_memory_to_proto(memory),
             })),
         }
     }
@@ -236,6 +288,7 @@ impl From<segment::data_types::index::FloatIndexParams> for PayloadIndexParams {
         let segment::data_types::index::FloatIndexParams {
             r#type: _,
             on_disk,
+            memory,
             is_principal,
             enable_hnsw,
         } = params;
@@ -244,6 +297,7 @@ impl From<segment::data_types::index::FloatIndexParams> for PayloadIndexParams {
                 on_disk,
                 is_principal,
                 enable_hnsw,
+                memory: convert_memory_to_proto(memory),
             })),
         }
     }
@@ -254,12 +308,14 @@ impl From<segment::data_types::index::GeoIndexParams> for PayloadIndexParams {
         let segment::data_types::index::GeoIndexParams {
             r#type: _,
             on_disk,
+            memory,
             enable_hnsw,
         } = params;
         PayloadIndexParams {
             index_params: Some(IndexParams::GeoIndexParams(GeoIndexParams {
                 on_disk,
                 enable_hnsw,
+                memory: convert_memory_to_proto(memory),
             })),
         }
     }
@@ -276,6 +332,7 @@ impl From<segment::data_types::index::TextIndexParams> for PayloadIndexParams {
             ascii_folding,
             phrase_matching,
             on_disk,
+            memory,
             stopwords,
             stemmer,
             enable_hnsw,
@@ -299,6 +356,7 @@ impl From<segment::data_types::index::TextIndexParams> for PayloadIndexParams {
                 stopwords: stopwords_set,
                 stemmer: stemming_algo,
                 enable_hnsw,
+                memory: convert_memory_to_proto(memory),
             })),
         }
     }
@@ -309,12 +367,14 @@ impl From<segment::data_types::index::BoolIndexParams> for PayloadIndexParams {
         let segment::data_types::index::BoolIndexParams {
             r#type: _,
             on_disk,
+            memory,
             enable_hnsw,
         } = params;
         PayloadIndexParams {
             index_params: Some(IndexParams::BoolIndexParams(BoolIndexParams {
                 on_disk,
                 enable_hnsw,
+                memory: convert_memory_to_proto(memory),
             })),
         }
     }
@@ -326,6 +386,7 @@ impl From<segment::data_types::index::UuidIndexParams> for PayloadIndexParams {
             r#type: _,
             is_tenant,
             on_disk,
+            memory,
             enable_hnsw,
         } = params;
         PayloadIndexParams {
@@ -333,6 +394,7 @@ impl From<segment::data_types::index::UuidIndexParams> for PayloadIndexParams {
                 is_tenant,
                 on_disk,
                 enable_hnsw,
+                memory: convert_memory_to_proto(memory),
             })),
         }
     }
@@ -343,6 +405,7 @@ impl From<segment::data_types::index::DatetimeIndexParams> for PayloadIndexParam
         let segment::data_types::index::DatetimeIndexParams {
             r#type: _,
             on_disk,
+            memory,
             is_principal,
             enable_hnsw,
         } = params;
@@ -351,6 +414,7 @@ impl From<segment::data_types::index::DatetimeIndexParams> for PayloadIndexParam
                 on_disk,
                 is_principal,
                 enable_hnsw,
+                memory: convert_memory_to_proto(memory),
             })),
         }
     }
@@ -442,6 +506,9 @@ impl From<segment::data_types::index::StemmingAlgorithm> for StemmingAlgorithm {
                 let language = language.to_string();
                 StemmingParams::Snowball(SnowballParams { language })
             }
+            segment::data_types::index::StemmingAlgorithm::Disabled(_) => {
+                StemmingParams::Disabled(DisabledStemmer {})
+            }
         };
 
         StemmingAlgorithm {
@@ -487,12 +554,18 @@ impl TryFrom<KeywordIndexParams> for segment::data_types::index::KeywordIndexPar
             is_tenant,
             on_disk,
             enable_hnsw,
+            prefix,
+            memory,
         } = params;
         Ok(segment::data_types::index::KeywordIndexParams {
             r#type: KeywordIndexType::Keyword,
             is_tenant,
             on_disk,
+            memory: convert_memory_from_proto(memory)?,
             enable_hnsw,
+            // Presence of the (currently empty) message enables prefix
+            // matching.
+            prefix: prefix.map(|KeywordPrefixParams {}| true),
         })
     }
 }
@@ -506,6 +579,7 @@ impl TryFrom<IntegerIndexParams> for segment::data_types::index::IntegerIndexPar
             is_principal,
             on_disk,
             enable_hnsw,
+            memory,
         } = params;
         Ok(segment::data_types::index::IntegerIndexParams {
             r#type: IntegerIndexType::Integer,
@@ -513,6 +587,7 @@ impl TryFrom<IntegerIndexParams> for segment::data_types::index::IntegerIndexPar
             range,
             is_principal,
             on_disk,
+            memory: convert_memory_from_proto(memory)?,
             enable_hnsw,
         })
     }
@@ -525,10 +600,12 @@ impl TryFrom<FloatIndexParams> for segment::data_types::index::FloatIndexParams 
             on_disk,
             is_principal,
             enable_hnsw,
+            memory,
         } = params;
         Ok(segment::data_types::index::FloatIndexParams {
             r#type: FloatIndexType::Float,
             on_disk,
+            memory: convert_memory_from_proto(memory)?,
             is_principal,
             enable_hnsw,
         })
@@ -541,10 +618,12 @@ impl TryFrom<GeoIndexParams> for segment::data_types::index::GeoIndexParams {
         let GeoIndexParams {
             on_disk,
             enable_hnsw,
+            memory,
         } = params;
         Ok(segment::data_types::index::GeoIndexParams {
             r#type: GeoIndexType::Geo,
             on_disk,
+            memory: convert_memory_from_proto(memory)?,
             enable_hnsw,
         })
     }
@@ -591,6 +670,7 @@ impl TryFrom<TextIndexParams> for segment::data_types::index::TextIndexParams {
             stopwords,
             stemmer,
             enable_hnsw,
+            memory,
         } = params;
 
         // Convert stopwords if present
@@ -618,6 +698,7 @@ impl TryFrom<TextIndexParams> for segment::data_types::index::TextIndexParams {
             max_token_len: max_token_len.map(|x| x as usize),
             phrase_matching,
             on_disk,
+            memory: convert_memory_from_proto(memory)?,
             stopwords: stopwords_converted,
             stemmer,
             enable_hnsw,
@@ -641,6 +722,13 @@ impl TryFrom<StemmingParams> for segment::data_types::index::StemmingAlgorithm {
                     },
                 ))
             }
+            StemmingParams::Disabled(_) => {
+                Ok(segment::data_types::index::StemmingAlgorithm::Disabled(
+                    segment::data_types::index::DisabledStemmerParams {
+                        r#type: segment::data_types::index::NoStemmer::None,
+                    },
+                ))
+            }
         }
     }
 }
@@ -651,10 +739,12 @@ impl TryFrom<BoolIndexParams> for segment::data_types::index::BoolIndexParams {
         let BoolIndexParams {
             on_disk,
             enable_hnsw,
+            memory,
         } = params;
         Ok(segment::data_types::index::BoolIndexParams {
             r#type: BoolIndexType::Bool,
             on_disk,
+            memory: convert_memory_from_proto(memory)?,
             enable_hnsw,
         })
     }
@@ -667,10 +757,12 @@ impl TryFrom<DatetimeIndexParams> for segment::data_types::index::DatetimeIndexP
             on_disk,
             is_principal,
             enable_hnsw,
+            memory,
         } = params;
         Ok(segment::data_types::index::DatetimeIndexParams {
             r#type: DatetimeIndexType::Datetime,
             on_disk,
+            memory: convert_memory_from_proto(memory)?,
             is_principal,
             enable_hnsw,
         })
@@ -684,11 +776,13 @@ impl TryFrom<UuidIndexParams> for segment::data_types::index::UuidIndexParams {
             is_tenant,
             on_disk,
             enable_hnsw,
+            memory,
         } = params;
         Ok(segment::data_types::index::UuidIndexParams {
             r#type: UuidIndexType::Uuid,
             is_tenant,
             on_disk,
+            memory: convert_memory_from_proto(memory)?,
             enable_hnsw,
         })
     }
@@ -906,22 +1000,26 @@ impl From<segment::types::AcornSearchParams> for AcornSearchParams {
     }
 }
 
-impl From<SearchParams> for segment::types::SearchParams {
-    fn from(params: SearchParams) -> Self {
+impl TryFrom<SearchParams> for segment::types::SearchParams {
+    type Error = Status;
+
+    fn try_from(params: SearchParams) -> Result<Self, Self::Error> {
         let SearchParams {
             hnsw_ef,
             exact,
             quantization,
             indexed_only,
             acorn,
+            idf,
         } = params;
-        Self {
+        Ok(Self {
             hnsw_ef: hnsw_ef.map(|x| x as usize),
             exact: exact.unwrap_or(false),
             quantization: quantization.map(QuantizationSearchParams::into),
             indexed_only: indexed_only.unwrap_or(false),
             acorn: acorn.map(segment::types::AcornSearchParams::from),
-        }
+            idf: idf.map(segment::types::IdfParams::try_from).transpose()?,
+        })
     }
 }
 
@@ -933,6 +1031,7 @@ impl From<segment::types::SearchParams> for SearchParams {
             quantization,
             indexed_only,
             acorn,
+            idf,
         } = params;
         Self {
             hnsw_ef: hnsw_ef.map(|x| x as u64),
@@ -940,7 +1039,34 @@ impl From<segment::types::SearchParams> for SearchParams {
             quantization: quantization.map(Into::into),
             indexed_only: Some(indexed_only),
             acorn: acorn.map(AcornSearchParams::from),
+            idf: idf.map(IdfParams::from),
         }
+    }
+}
+
+impl TryFrom<IdfParams> for segment::types::IdfParams {
+    type Error = Status;
+
+    fn try_from(params: IdfParams) -> Result<Self, Self::Error> {
+        let IdfParams { corpus } = params;
+        Ok(match corpus {
+            None => segment::types::IdfParams::Scope(segment::types::IdfScope::Global),
+            Some(corpus) => segment::types::IdfParams::Corpus(segment::types::IdfCorpusParams {
+                corpus: corpus.try_into()?,
+            }),
+        })
+    }
+}
+
+impl From<segment::types::IdfParams> for IdfParams {
+    fn from(params: segment::types::IdfParams) -> Self {
+        let corpus = match params {
+            segment::types::IdfParams::Scope(segment::types::IdfScope::Global) => None,
+            segment::types::IdfParams::Corpus(segment::types::IdfCorpusParams { corpus }) => {
+                Some(Filter::from(corpus))
+            }
+        };
+        Self { corpus }
     }
 }
 
@@ -1186,6 +1312,7 @@ impl From<segment::types::ScalarQuantization> for ScalarQuantization {
             },
             quantile: config.quantile,
             always_ram: config.always_ram,
+            memory: convert_memory_to_proto(config.memory),
         }
     }
 }
@@ -1198,6 +1325,7 @@ impl TryFrom<ScalarQuantization> for segment::types::ScalarQuantization {
             r#type,
             quantile,
             always_ram,
+            memory,
         } = value;
         Ok(segment::types::ScalarQuantization {
             scalar: segment::types::ScalarQuantizationConfig {
@@ -1209,6 +1337,7 @@ impl TryFrom<ScalarQuantization> for segment::types::ScalarQuantization {
                 },
                 quantile,
                 always_ram,
+                memory: convert_memory_from_proto(memory)?,
             },
         })
     }
@@ -1220,6 +1349,7 @@ impl From<segment::types::ProductQuantization> for ProductQuantization {
         let segment::types::ProductQuantizationConfig {
             compression,
             always_ram,
+            memory,
         } = product;
         ProductQuantization {
             compression: match compression {
@@ -1230,6 +1360,7 @@ impl From<segment::types::ProductQuantization> for ProductQuantization {
                 segment::types::CompressionRatio::X64 => CompressionRatio::X64 as i32,
             },
             always_ram,
+            memory: convert_memory_to_proto(memory),
         }
     }
 }
@@ -1241,6 +1372,7 @@ impl TryFrom<ProductQuantization> for segment::types::ProductQuantization {
         let ProductQuantization {
             compression,
             always_ram,
+            memory,
         } = value;
         Ok(segment::types::ProductQuantization {
             product: segment::types::ProductQuantizationConfig {
@@ -1257,6 +1389,7 @@ impl TryFrom<ProductQuantization> for segment::types::ProductQuantization {
                     Ok(CompressionRatio::X64) => segment::types::CompressionRatio::X64,
                 },
                 always_ram,
+                memory: convert_memory_from_proto(memory)?,
             },
         })
     }
@@ -1299,6 +1432,7 @@ impl From<segment::types::BinaryQuantization> for BinaryQuantization {
         let segment::types::BinaryQuantization { binary } = value;
         let segment::types::BinaryQuantizationConfig {
             always_ram,
+            memory,
             encoding,
             query_encoding,
         } = binary;
@@ -1307,6 +1441,7 @@ impl From<segment::types::BinaryQuantization> for BinaryQuantization {
             encoding: encoding
                 .map(|encoding| i32::from(BinaryQuantizationEncoding::from(encoding))),
             query_encoding: query_encoding.map(BinaryQuantizationQueryEncoding::from),
+            memory: convert_memory_to_proto(memory),
         }
     }
 }
@@ -1319,6 +1454,7 @@ impl TryFrom<BinaryQuantization> for segment::types::BinaryQuantization {
             always_ram,
             encoding,
             query_encoding,
+            memory,
         } = value;
         let encoding = encoding
             .map(BinaryQuantizationEncoding::try_from)
@@ -1327,6 +1463,7 @@ impl TryFrom<BinaryQuantization> for segment::types::BinaryQuantization {
         Ok(segment::types::BinaryQuantization {
             binary: segment::types::BinaryQuantizationConfig {
                 always_ram,
+                memory: convert_memory_from_proto(memory)?,
                 encoding: encoding.map(segment::types::BinaryQuantizationEncoding::from),
                 query_encoding: query_encoding
                     .map(segment::types::BinaryQuantizationQueryEncoding::try_from)
@@ -1364,11 +1501,16 @@ fn turbo_quant_bit_size_from_i32(value: i32) -> Result<segment::types::TurboQuan
 impl From<segment::types::TurboQuantization> for TurboQuantization {
     fn from(value: segment::types::TurboQuantization) -> Self {
         let segment::types::TurboQuantization { turbo } = value;
-        let segment::types::TurboQuantQuantizationConfig { always_ram, bits } = turbo;
+        let segment::types::TurboQuantQuantizationConfig {
+            always_ram,
+            memory,
+            bits,
+        } = turbo;
 
         TurboQuantization {
             always_ram,
             bits: bits.map(|b| i32::from(TurboQuantBitSize::from(b))),
+            memory: convert_memory_to_proto(memory),
         }
     }
 }
@@ -1377,11 +1519,19 @@ impl TryFrom<TurboQuantization> for segment::types::TurboQuantization {
     type Error = Status;
 
     fn try_from(value: TurboQuantization) -> Result<Self, Self::Error> {
-        let TurboQuantization { always_ram, bits } = value;
+        let TurboQuantization {
+            always_ram,
+            bits,
+            memory,
+        } = value;
         let bits = bits.map(turbo_quant_bit_size_from_i32).transpose()?;
 
         Ok(segment::types::TurboQuantization {
-            turbo: segment::types::TurboQuantQuantizationConfig { always_ram, bits },
+            turbo: segment::types::TurboQuantQuantizationConfig {
+                always_ram,
+                memory: convert_memory_from_proto(memory)?,
+                bits,
+            },
         })
     }
 }
@@ -1661,6 +1811,7 @@ pub fn grpc_condition_into_condition(
                 has_vector: has_vector.has_vector,
             },
         )),
+        ConditionOneOf::Slice(slice) => Some(segment::types::Condition::Slice(slice.try_into()?)),
     };
 
     Ok(condition)
@@ -1695,9 +1846,42 @@ impl From<segment::types::Condition> for Condition {
                     has_vector: has_vector.has_vector,
                 }))
             }
+            segment::types::Condition::Slice(slice) => {
+                Some(ConditionOneOf::Slice(SliceCondition::from(slice)))
+            }
         };
 
         Self { condition_one_of }
+    }
+}
+
+impl TryFrom<SliceCondition> for segment::types::SliceCondition {
+    type Error = Status;
+
+    fn try_from(value: SliceCondition) -> Result<Self, Self::Error> {
+        let SliceCondition { total, index } = value;
+        let total = std::num::NonZeroU32::new(total)
+            .ok_or_else(|| Status::invalid_argument("Slice total must be greater than 0"))?;
+        if index >= total.get() {
+            return Err(Status::invalid_argument(
+                "Slice index must be less than the total number of slices",
+            ));
+        }
+        Ok(Self {
+            slice: segment::types::Slice { total, index },
+        })
+    }
+}
+
+impl From<segment::types::SliceCondition> for SliceCondition {
+    fn from(value: segment::types::SliceCondition) -> Self {
+        let segment::types::SliceCondition {
+            slice: segment::types::Slice { total, index },
+        } = value;
+        Self {
+            total: total.get(),
+            index,
+        }
     }
 }
 
@@ -2095,6 +2279,7 @@ impl TryFrom<Match> for segment::types::Match {
                 MatchValue::TextAny(text_any) => {
                     segment::types::Match::TextAny(segment::types::MatchTextAny { text_any })
                 }
+                MatchValue::Prefix(prefix) => segment::types::Match::Prefix(prefix.into()),
             }),
             _ => Err(Status::invalid_argument("Malformed Match condition")),
         }
@@ -2137,6 +2322,9 @@ impl From<segment::types::Match> for Match {
             },
             segment::types::Match::TextAny(segment::types::MatchTextAny { text_any }) => {
                 MatchValue::TextAny(text_any)
+            }
+            segment::types::Match::Prefix(segment::types::MatchPrefix { prefix }) => {
+                MatchValue::Prefix(prefix)
             }
         };
         Self {
@@ -2321,6 +2509,7 @@ impl From<HnswConfigDiff> for segment::types::HnswConfig {
             full_scan_threshold,
             max_indexing_threads,
             on_disk,
+            memory,
             payload_m,
             inline_storage,
         } = hnsw_config;
@@ -2330,6 +2519,7 @@ impl From<HnswConfigDiff> for segment::types::HnswConfig {
             full_scan_threshold: full_scan_threshold.unwrap_or_default() as usize,
             max_indexing_threads: max_indexing_threads.unwrap_or_default() as usize,
             on_disk,
+            memory: convert_memory_from_proto_lossy(memory),
             payload_m: payload_m.map(|x| x as usize),
             inline_storage,
         }
@@ -2360,7 +2550,6 @@ impl From<StrictModeConfig> for segment::types::StrictModeConfig {
             sparse_config,
             max_payload_index_count,
             max_resident_memory_percent,
-            max_disk_usage_percent,
         } = value;
         Self {
             enabled,
@@ -2386,7 +2575,6 @@ impl From<StrictModeConfig> for segment::types::StrictModeConfig {
             sparse_config: sparse_config.map(segment::types::StrictModeSparseConfig::from),
             max_payload_index_count: max_payload_index_count.map(|i| i as usize),
             max_resident_memory_percent: max_resident_memory_percent.map(|i| i as u8),
-            max_disk_usage_percent: max_disk_usage_percent.map(|i| i as u8),
         }
     }
 }
@@ -2491,7 +2679,6 @@ impl From<segment::types::StrictModeConfigOutput> for StrictModeConfig {
             sparse_config,
             max_payload_index_count,
             max_resident_memory_percent,
-            max_disk_usage_percent,
         } = value;
         Self {
             enabled,
@@ -2515,7 +2702,6 @@ impl From<segment::types::StrictModeConfigOutput> for StrictModeConfig {
             max_points_count: max_points_count.map(|i| i as u64),
             max_payload_index_count: max_payload_index_count.map(|i| i as u64),
             max_resident_memory_percent: max_resident_memory_percent.map(u32::from),
-            max_disk_usage_percent: max_disk_usage_percent.map(u32::from),
         }
     }
 }
@@ -2544,7 +2730,6 @@ impl From<StrictModeConfig> for segment::types::StrictModeConfigOutput {
             sparse_config,
             max_payload_index_count,
             max_resident_memory_percent,
-            max_disk_usage_percent,
         } = value;
         Self {
             enabled,
@@ -2570,7 +2755,6 @@ impl From<StrictModeConfig> for segment::types::StrictModeConfigOutput {
             sparse_config: sparse_config.map(segment::types::StrictModeSparseConfigOutput::from),
             max_payload_index_count: max_payload_index_count.map(|i| i as usize),
             max_resident_memory_percent: max_resident_memory_percent.map(|i| i as u8),
-            max_disk_usage_percent: max_disk_usage_percent.map(|i| i as u8),
         }
     }
 }
@@ -2654,6 +2838,10 @@ pub fn naive_date_time_to_proto(date_time: NaiveDateTime) -> prost_wkt_types::Ti
 
 pub fn date_time_to_proto(date_time: DateTimePayloadType) -> prost_wkt_types::Timestamp {
     naive_date_time_to_proto(date_time.0.naive_utc())
+}
+
+pub fn system_time_to_proto(time: std::time::SystemTime) -> prost_wkt_types::Timestamp {
+    naive_date_time_to_proto(chrono::DateTime::<chrono::Utc>::from(time).naive_utc())
 }
 
 pub fn try_date_time_from_proto(
@@ -3059,7 +3247,7 @@ impl TryFrom<SearchPoints> for rest::SearchRequestInternal {
         Ok(Self {
             vector,
             filter: filter.map(|f| f.try_into()).transpose()?,
-            params: params.map(SearchParams::into),
+            params: params.map(SearchParams::try_into).transpose()?,
             limit: limit as usize,
             offset: offset.map(|x| x as usize),
             with_payload: with_payload.map(|wp| wp.try_into()).transpose()?,

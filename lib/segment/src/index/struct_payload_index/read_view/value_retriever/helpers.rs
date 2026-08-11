@@ -1,9 +1,9 @@
-use std::collections::HashMap;
-
+use ahash::AHashMap;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use serde_json::Value;
 
+use crate::common::operation_error::OperationResult;
 use crate::common::utils::MultiValue;
 use crate::index::field_index::FieldIndexRead;
 use crate::index::query_optimization::payload_provider::PayloadProvider;
@@ -13,29 +13,36 @@ use crate::payload_storage::PayloadStorageRead;
 use crate::types::PayloadContainer;
 
 pub(super) fn variable_retriever<'a, 'q, P, F>(
-    indices: &'a HashMap<JsonPath, Vec<F>>,
+    indices: &'a AHashMap<JsonPath, Vec<F>>,
     json_path: &JsonPath,
     payload_provider: PayloadProvider<P>,
     hw_counter: &'q HardwareCounterCell,
-) -> VariableRetrieverFn<'q>
+) -> OperationResult<VariableRetrieverFn<'q>>
 where
     P: PayloadStorageRead + 'q,
     F: FieldIndexRead,
     'a: 'q,
 {
-    indices
-        .get(json_path)
-        .and_then(|indices| {
-            indices
-                .iter()
-                .find_map(|index| index.value_retriever(hw_counter))
-        })
-        // TODO(scoreboost): optimize by reusing the same payload for all variables?
-        .unwrap_or_else(|| {
-            // if the variable is not found in the index, try to find it in the payload
-            let key = json_path.clone();
-            payload_variable_retriever(payload_provider, key, hw_counter)
-        })
+    let indexed = match indices.get(json_path) {
+        Some(indices) => {
+            let mut found = None;
+            for index in indices {
+                if let Some(retriever) = index.value_retriever(hw_counter)? {
+                    found = Some(retriever);
+                    break;
+                }
+            }
+            found
+        }
+        None => None,
+    };
+
+    // TODO(scoreboost): optimize by reusing the same payload for all variables?
+    Ok(indexed.unwrap_or_else(|| {
+        // if the variable is not found in the index, try to find it in the payload
+        let key = json_path.clone();
+        payload_variable_retriever(payload_provider, key, hw_counter)
+    }))
 }
 
 fn payload_variable_retriever<'a, P: PayloadStorageRead + 'a>(
@@ -76,9 +83,9 @@ fn payload_variable_retriever<'a, P: PayloadStorageRead + 'a>(
 #[cfg(test)]
 #[cfg(feature = "testing")]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
+    use ahash::AHashMap;
     use atomic_refcell::AtomicRefCell;
     use common::bitvec::BitVec;
     use common::counter::hardware_counter::HardwareCounterCell;
@@ -86,7 +93,7 @@ mod tests {
 
     use super::variable_retriever;
     use crate::common::utils::MultiValue;
-    use crate::index::field_index::geo_index::GeoMapIndex;
+    use crate::index::field_index::geo_index::GeoIndex;
     use crate::index::field_index::numeric_index::NumericIndex;
     use crate::index::field_index::{FieldIndex, FieldIndexBuilderTrait};
     use crate::index::query_optimization::payload_provider::PayloadProvider;
@@ -140,7 +147,7 @@ mod tests {
         in_memory_storage.payload.insert(3, payload3);
 
         // Wrap the in-memory storage in a PayloadStorageEnum.
-        let storage_enum = PayloadStorageEnum::InMemoryPayloadStorage(in_memory_storage);
+        let storage_enum = PayloadStorageEnum::InMemory(in_memory_storage);
 
         let arc_storage = Arc::new(AtomicRefCell::new(storage_enum));
         PayloadProvider::new(arc_storage)
@@ -151,7 +158,7 @@ mod tests {
         let payload_provider = fixture_payload_provider();
 
         // No indices — pick FieldIndex as the concrete F for type inference.
-        let no_indices: HashMap<_, Vec<FieldIndex>> = Default::default();
+        let no_indices: AHashMap<_, Vec<FieldIndex>> = Default::default();
 
         let hw_counter = Default::default();
 
@@ -161,7 +168,8 @@ mod tests {
             &"value".try_into().unwrap(),
             payload_provider.clone(),
             &hw_counter,
-        );
+        )
+        .unwrap();
         for id in 0..=3 {
             let value = retriever(id);
             match id {
@@ -179,7 +187,8 @@ mod tests {
             &"location".try_into().unwrap(),
             payload_provider.clone(),
             &hw_counter,
-        );
+        )
+        .unwrap();
         for id in 0..=3 {
             let value = retriever(id);
             match id {
@@ -196,7 +205,7 @@ mod tests {
     fn test_variable_retriever_from_index() {
         // Empty payload provider.
         let payload_provider = PayloadProvider::new(Arc::new(AtomicRefCell::new(
-            PayloadStorageEnum::InMemoryPayloadStorage(InMemoryPayloadStorage::default()),
+            PayloadStorageEnum::InMemory(InMemoryPayloadStorage::default()),
         )));
         let hw_counter = HardwareCounterCell::new();
         // No deletions in this test — sized to comfortably exceed the
@@ -216,7 +225,7 @@ mod tests {
 
         // Create a field index for a geo point.
         let dir = tempfile::tempdir().unwrap();
-        let mut builder = GeoMapIndex::builder_mmap(dir.path(), false, &deleted_points);
+        let mut builder = GeoIndex::builder_mmap(dir.path(), false, &deleted_points);
 
         builder.add_point(0, &[], &hw_counter).unwrap();
         builder
@@ -246,7 +255,7 @@ mod tests {
         let datetime_index = builder.finalize().unwrap();
         let datetime_index = FieldIndex::DatetimeIndex(datetime_index);
 
-        let mut indices = HashMap::new();
+        let mut indices = AHashMap::new();
         indices.insert("value".try_into().unwrap(), vec![numeric_index]);
         indices.insert("location".try_into().unwrap(), vec![geo_index]);
         indices.insert("creation".try_into().unwrap(), vec![datetime_index]);
@@ -259,7 +268,8 @@ mod tests {
             &"value".try_into().unwrap(),
             payload_provider.clone(),
             &hw_counter,
-        );
+        )
+        .unwrap();
         for id in 0..=2 {
             let value = retriever(id);
             match id {
@@ -276,7 +286,8 @@ mod tests {
             &"location".try_into().unwrap(),
             payload_provider.clone(),
             &hw_counter,
-        );
+        )
+        .unwrap();
         for id in 0..=2 {
             let value = retriever(id);
             match id {
@@ -293,7 +304,8 @@ mod tests {
             &"creation".try_into().unwrap(),
             payload_provider.clone(),
             &hw_counter,
-        );
+        )
+        .unwrap();
         for id in 0..=2 {
             let value = retriever(id);
             match id {

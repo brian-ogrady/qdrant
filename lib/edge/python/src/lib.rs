@@ -65,23 +65,25 @@ mod qdrant_edge {
     use super::scroll::PyScrollRequest;
     #[pymodule_export]
     use super::search::{
-        PyAcornSearchParams, PyQuantizationSearchParams, PySearchParams, PySearchRequest,
+        PyAcornSearchParams, PyIdfParams, PyQuantizationSearchParams, PySearchParams,
+        PySearchRequest,
     };
     #[pymodule_export]
     use super::types::filter::{
         PyFieldCondition, PyFilter, PyGeoBoundingBox, PyGeoPoint, PyGeoPolygon, PyGeoRadius,
         PyHasIdCondition, PyHasVectorCondition, PyIsEmptyCondition, PyIsNullCondition, PyMatchAny,
-        PyMatchExcept, PyMatchPhrase, PyMatchText, PyMatchTextAny, PyMatchValue, PyMinShould,
-        PyNestedCondition, PyRangeDateTime, PyRangeFloat, PyValuesCount,
+        PyMatchExcept, PyMatchPhrase, PyMatchPrefix, PyMatchText, PyMatchTextAny, PyMatchValue,
+        PyMinShould, PyNestedCondition, PyRangeDateTime, PyRangeFloat, PySliceCondition,
+        PyValuesCount,
     };
     #[pymodule_export]
     use super::types::formula::{PyDecayKind, PyExpressionInterface, PyFormula};
     #[pymodule_export]
     use super::types::payload_schema::{
-        PyBoolIndexParams, PyDatetimeIndexParams, PyFloatIndexParams, PyGeoIndexParams,
-        PyIntegerIndexParams, PyKeywordIndexParams, PyLanguage, PyPayloadSchemaType,
-        PySnowballLanguage, PySnowballParams, PyStopwordsSet, PyTextIndexParams, PyTokenizerType,
-        PyUuidIndexParams,
+        PyBoolIndexParams, PyDatetimeIndexParams, PyDisabledStemmer, PyFloatIndexParams,
+        PyGeoIndexParams, PyIntegerIndexParams, PyKeywordIndexParams, PyLanguage,
+        PyPayloadSchemaType, PySnowballLanguage, PySnowballParams, PyStopwordsSet,
+        PyTextIndexParams, PyTokenizerType, PyUuidIndexParams,
     };
     #[pymodule_export]
     use super::types::query::{
@@ -119,7 +121,7 @@ impl PyEdgeShard {
     }
 
     pub fn flush(&self) -> Result<()> {
-        self.get_shard()?.flush();
+        self.get_shard()?.flush()?;
         Ok(())
     }
 
@@ -171,18 +173,18 @@ impl PyEdgeShard {
         with_payload: Option<PyWithPayload>,
         with_vector: Option<PyWithVector>,
     ) -> Result<Vec<PyRecord>> {
-        let point_ids = PyPointId::peel_vec(point_ids);
-        let points = self.get_shard()?.retrieve(
-            &point_ids,
-            with_payload.map(WithPayloadInterface::from),
-            with_vector.map(WithVector::from),
-        )?;
+        let request = edge::RetrieveRequest {
+            point_ids: PyPointId::peel_vec(point_ids),
+            with_payload: with_payload.map(WithPayloadInterface::from),
+            with_vector: with_vector.map(WithVector::from),
+        };
+        let points = self.get_shard()?.retrieve(request)?;
         let points = PyRecord::wrap_vec(points);
         Ok(points)
     }
 
     pub fn info(&self) -> Result<PyShardInfo> {
-        let info = self.get_shard()?.info();
+        let info = self.get_shard()?.info()?;
         let info = PyShardInfo(info);
         Ok(info)
     }

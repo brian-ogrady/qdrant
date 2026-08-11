@@ -43,6 +43,7 @@ mod tests {
     use shard::operations::optimization::OptimizerThresholds;
     use shard::optimizers::config::{DenseVectorOptimizerConfig, SegmentOptimizerConfig};
     use shard::optimizers::segment_optimizer::SegmentOptimizer;
+    use shard::segment_holder::FlushMode;
     use shard::segment_holder::locked::LockedSegmentHolder;
     use tempfile::Builder;
 
@@ -58,6 +59,7 @@ mod tests {
             dense_vector.insert(
                 vector_name.clone(),
                 DenseVectorOptimizerConfig {
+                    memory: None,
                     on_disk: None,
                     hnsw_config: HnswConfig::default(),
                     quantization_config: None,
@@ -70,6 +72,7 @@ mod tests {
             plain_sparse_vector_config: segment.segment_config.sparse_vector_data.clone(),
             dense_vector,
             sparse_vector: Default::default(),
+            live_vector_names: None,
         }
     }
 
@@ -194,6 +197,14 @@ mod tests {
                 assert_eq!(new_segment.get().read().available_point_count(), 3 * 3 + 10);
             }
         }
+
+        // The optimization defers destroying the merged source segments to a post-flush action;
+        // their files are removed once a flush confirms the merged data is durable (see
+        // `SegmentHolder::register_post_flush_action`). Flush to run the action before asserting.
+        locked_holder
+            .read()
+            .flush_all(FlushMode::Sync, true)
+            .expect("failed to flush segment holder");
 
         // Check if optimized segments removed from disk
         old_path.into_iter().for_each(|x| assert!(!x.exists()));

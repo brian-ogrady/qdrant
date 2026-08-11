@@ -15,6 +15,7 @@ use std::sync::atomic::AtomicBool;
 
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
+use common::universal_io::MmapFs;
 use fs_err as fs;
 use object_store::memory::InMemory;
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -1046,7 +1047,7 @@ fn test_puffin_rerank_over_parquet_opt_in() {
     .unwrap();
     let quantized_vec_size = get_quantized_vector_size_from_params::<u128>(DIM, Encoding::OneBit);
     let storage = TestEncodedStorage::from_file(&data_path, quantized_vec_size).unwrap();
-    let encoded = EncodedVectorsBin::<u128, TestEncodedStorage>::load(storage, &meta_path).unwrap();
+    let encoded = EncodedVectorsBin::<u128, TestEncodedStorage>::load(&MmapFs, storage, &meta_path).unwrap();
 
     // 6. Set up our custom AsyncFileReader (object_store 0.13 direct, byte
     // counting folded in). Fetch metadata ONCE off the timing loop.
@@ -1596,7 +1597,7 @@ fn test_phase4c_full_scale_run() {
     .unwrap();
     let storage = TestEncodedStorage::from_file(&data_path, quantized_vec_size).unwrap();
     let encoded =
-        EncodedVectorsBin::<u128, TestEncodedStorage>::load(storage, &meta_path).unwrap();
+        EncodedVectorsBin::<u128, TestEncodedStorage>::load(&MmapFs, storage, &meta_path).unwrap();
 
     let is_stopped = AtomicBool::new(false);
     let mut per_query_recall: Vec<f64> = Vec::with_capacity(rd.queries.len());
@@ -2863,7 +2864,7 @@ fn test_phase5a_build_opt_in() {
             let scorer = FilteredScorer::new_internal(
                 idx,
                 &storage,
-                None,
+                None::<&crate::vector_storage::quantized::quantized_vectors::QuantizedVectors>,
                 None,
                 &deleted,
                 HardwareCounterCell::new(),

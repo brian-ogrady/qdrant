@@ -5,7 +5,6 @@ mod versions_storage;
 #[cfg(test)]
 pub(super) mod tests;
 
-#[allow(dead_code)]
 pub mod read_only;
 
 use std::fmt::Debug;
@@ -24,18 +23,22 @@ use common::universal_io::{
 use fs_err::File;
 
 pub use self::deleted_storage::DELETED_FILE_NAME;
-use self::deleted_storage::deleted_path;
+pub(crate) use self::deleted_storage::deleted_path;
 pub use self::mappings_storage::{MAPPINGS_FILE_NAME, mappings_path};
 use self::mappings_storage::{load_mapping, store_mapping};
 pub use self::versions_storage::VERSION_MAPPING_FILE_NAME;
-use self::versions_storage::{mmap_size, version_mapping_path};
+use self::versions_storage::mmap_size;
+pub(crate) use self::versions_storage::version_mapping_path;
 use crate::common::Flusher;
 use crate::common::buffered_update_bitslice::BufferedUpdateBitSlice;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::id_tracker::compressed::compressed_point_mappings::CompressedPointMappings;
 use crate::id_tracker::compressed::versions_store::CompressedVersions;
 use crate::id_tracker::in_memory_id_tracker::InMemoryIdTracker;
-use crate::id_tracker::{DELETED_POINT_VERSION, IdTracker, IdTrackerRead, PointMappingsRefEnum};
+use crate::id_tracker::{
+    DELETED_POINT_VERSION, IdTracker, IdTrackerRead, PointMappingsRefEnum,
+    default_external_ids_batch, default_internal_versions_batch,
+};
 use crate::types::{PointIdType, SeqNumberType};
 
 #[derive(Debug)]
@@ -238,7 +241,20 @@ impl<S: UniversalWrite + Send + Sync + 'static> IdTrackerRead for ImmutableIdTra
         self.internal_to_version.get(internal_id)
     }
 
-    fn internal_id(&self, external_id: PointIdType) -> Option<PointOffsetType> {
+    fn internal_versions_batch(
+        &self,
+        internal_ids: impl IntoIterator<Item = PointOffsetType>,
+        callback: impl FnMut(PointOffsetType, SeqNumberType),
+    ) -> OperationResult<()> {
+        default_internal_versions_batch(self, internal_ids, callback)
+    }
+
+    fn internal_id_with_behavior(
+        &self,
+        external_id: PointIdType,
+        _deferred_behavior: common::types::DeferredBehavior,
+    ) -> Option<PointOffsetType> {
+        // Immutable mappings never carry deferred heads; behavior is moot.
         self.mappings.internal_id(&external_id)
     }
 
@@ -246,7 +262,17 @@ impl<S: UniversalWrite + Send + Sync + 'static> IdTrackerRead for ImmutableIdTra
         self.mappings.external_id(internal_id)
     }
 
-    fn point_mappings(&self) -> PointMappingsRefEnum<'_> {
+    fn external_ids_batch(
+        &self,
+        internal_ids: impl IntoIterator<Item = PointOffsetType>,
+        callback: impl FnMut(PointOffsetType, PointIdType),
+    ) -> OperationResult<()> {
+        default_external_ids_batch(self, internal_ids, callback)
+    }
+
+    type Backend = S;
+
+    fn point_mappings(&self) -> PointMappingsRefEnum<'_, Self::Backend> {
         PointMappingsRefEnum::Compressed(&self.mappings)
     }
 
@@ -276,8 +302,8 @@ impl<S: UniversalWrite + Send + Sync + 'static> IdTrackerRead for ImmutableIdTra
 
     fn iter_internal_versions(
         &self,
-    ) -> Box<dyn Iterator<Item = (PointOffsetType, SeqNumberType)> + '_> {
-        Box::new(self.internal_to_version.iter())
+    ) -> OperationResult<Box<dyn Iterator<Item = (PointOffsetType, SeqNumberType)> + '_>> {
+        Ok(Box::new(self.internal_to_version.iter()))
     }
 }
 

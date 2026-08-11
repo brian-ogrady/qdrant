@@ -1,10 +1,10 @@
 use std::path::Path;
 
+use blobstore::Blob;
 use common::bitvec::{BitSlice, BitVec};
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use gridstore::Blob;
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use rand::prelude::StdRng;
@@ -13,16 +13,13 @@ use rstest::rstest;
 use serde_json::Value;
 use tempfile::{Builder, TempDir};
 
-use super::immutable_numeric_index::ImmutableNumericIndex;
 use super::*;
 use crate::common::operation_error::OperationResult;
-use crate::index::field_index::numeric_point::Numericable;
-use crate::index::field_index::stored_point_to_values::StoredValue;
 use crate::index::field_index::{
     CardinalityEstimation, FieldIndexBuilderTrait, PayloadFieldIndexRead, ValueIndexer,
 };
 use crate::json_path::JsonPath;
-use crate::types::{FieldCondition, FloatPayloadType, Range, RangeInterface};
+use crate::types::{FieldCondition, FloatPayloadType, Memory, Range, RangeInterface};
 
 /// Generous default size for the deleted-points bitslice used in tests.
 ///
@@ -52,6 +49,7 @@ enum IndexType {
     RamMmap,
 }
 
+#[expect(clippy::large_enum_variant)]
 enum IndexBuilder {
     MutableGridstore(NumericIndexGridstoreBuilder<FloatPayloadType, FloatPayloadType>),
     Mmap(NumericIndexMmapBuilder<FloatPayloadType, FloatPayloadType>),
@@ -112,13 +110,13 @@ fn open_index_from_disk(
     deleted: &BitSlice,
 ) -> NumericIndex<FloatPayloadType, FloatPayloadType> {
     match index_type {
-        IndexType::MutableGridstore => NumericIndex::new_gridstore(temp_dir.to_path_buf(), true)
+        IndexType::MutableGridstore => NumericIndex::new_mutable(temp_dir.to_path_buf(), true)
             .unwrap()
             .unwrap(),
-        IndexType::Mmap => NumericIndex::new_mmap(temp_dir, true, deleted)
+        IndexType::Mmap => NumericIndex::new_immutable(temp_dir, Memory::Cold, deleted)
             .unwrap()
             .unwrap(),
-        IndexType::RamMmap => NumericIndex::new_mmap(temp_dir, false, deleted)
+        IndexType::RamMmap => NumericIndex::new_immutable(temp_dir, Memory::Pinned, deleted)
             .unwrap()
             .unwrap(),
     }
@@ -143,17 +141,7 @@ fn random_index(
             .add_point(i as PointOffsetType, &values, &hw_counter)
             .unwrap();
     }
-    let mut index = index_builder.finalize().unwrap();
-
-    if matches!(index_type, IndexType::RamMmap) {
-        let NumericIndexInner::Mmap(mmap_index) = index.inner else {
-            panic!("Expected mmap index");
-        };
-        index = NumericIndex {
-            inner: NumericIndexInner::Immutable(ImmutableNumericIndex::open_mmap(mmap_index)),
-            _phantom: Default::default(),
-        };
-    }
+    let index = index_builder.finalize().unwrap();
 
     (temp_dir, index)
 }
@@ -412,15 +400,17 @@ fn test_numeric_index_load_from_disk(#[case] index_type: IndexType) {
         .unwrap()
         .unwrap(),
         IndexType::Mmap => {
-            NumericIndexInner::<FloatPayloadType>::new_mmap(temp_dir.path(), true, &deleted)
+            NumericIndexInner::<FloatPayloadType>::new_mmap(temp_dir.path(), Memory::Cold, &deleted)
                 .unwrap()
                 .unwrap()
         }
-        IndexType::RamMmap => {
-            NumericIndexInner::<FloatPayloadType>::new_mmap(temp_dir.path(), false, &deleted)
-                .unwrap()
-                .unwrap()
-        }
+        IndexType::RamMmap => NumericIndexInner::<FloatPayloadType>::new_mmap(
+            temp_dir.path(),
+            Memory::Pinned,
+            &deleted,
+        )
+        .unwrap()
+        .unwrap(),
     };
 
     test_cond(
@@ -800,9 +790,83 @@ fn test_numeric_index_reload_short_deleted_bitslice(#[case] index_type: IndexTyp
     assert_eq!(index.inner().get_points_count(), 7);
 }
 
-fn test_cond<
-    T: Encodable + Numericable + PartialOrd + Clone + StoredValue + Send + Sync + Default + 'static,
->(
+/// An index whose "no values" mask is stored in the compact `StoredBitmask`
+/// format (written when the `compact_bitmask` feature flag is on) must open
+/// and filter identically to one with the legacy dense bitslice.
+///
+/// Tests run with default feature flags, so the build above writes the legacy
+/// file; convert it to the compact format by hand and reopen.
+#[rstest]
+#[case(IndexType::Mmap)]
+#[case(IndexType::RamMmap)]
+fn test_numeric_index_open_compact_deleted_mask(#[case] index_type: IndexType) {
+    use common::stored_bitmask::save_bitmask;
+    use common::universal_io::MmapFs;
+    use roaring::RoaringBitmap;
+
+    use crate::index::field_index::deleted_mask::{DELETED_MASK_FILE, deleted_mask_path};
+
+    let (temp_dir, mut index_builder) = get_index_builder(index_type);
+
+    // Same setup as `test_numeric_index_reload_short_deleted_bitslice`:
+    // point 4 has an empty payload, so the build marks it in the mask.
+    let values: Vec<Vec<f64>> = vec![
+        vec![1.0],
+        vec![1.0],
+        vec![1.0],
+        vec![], // empty payload at id 4
+        vec![1.0],
+        vec![2.0],
+        vec![2.5],
+        vec![2.6],
+        vec![3.0],
+    ];
+
+    let hw_counter = HardwareCounterCell::new();
+    values.into_iter().enumerate().for_each(|(idx, values)| {
+        let values = values.iter().map(|v| Value::from(*v)).collect_vec();
+        let values = values.iter().collect_vec();
+        let new_idx = idx as PointOffsetType + 1;
+        index_builder
+            .add_point(new_idx, &values, &hw_counter)
+            .unwrap();
+    });
+    let index = index_builder.finalize().unwrap();
+    drop(index);
+
+    // Convert the legacy dense mask into the compact format: same bits
+    // (offset 0 = no point at internal id 0, offset 4 = the empty-payload
+    // point), 10 logical flags.
+    // The legacy file only exists when the build ran with `compact_bitmask`
+    // off (the default in tests); tolerate either so a future flag-default
+    // change doesn't break the test.
+    let legacy_path = temp_dir.path().join("deleted.bin");
+    if legacy_path.exists() {
+        fs_err::remove_file(&legacy_path).unwrap();
+    }
+    let ones = RoaringBitmap::from_sorted_iter([0u32, 4]).unwrap();
+    save_bitmask(&MmapFs, &deleted_mask_path(temp_dir.path()), 10, ones).unwrap();
+    assert!(temp_dir.path().join(DELETED_MASK_FILE).exists());
+
+    let mut short_deleted = BitVec::repeat(false, 3);
+    short_deleted.set(1, true);
+    let index = open_index_from_disk(temp_dir.path(), index_type, &short_deleted);
+
+    // Same expectations as the legacy-format test.
+    test_cond(
+        index.inner(),
+        Range {
+            gt: None,
+            gte: Some(1.0),
+            lt: None,
+            lte: None,
+        },
+        vec![2, 3, 5, 6, 7, 8, 9],
+    );
+    assert_eq!(index.inner().get_points_count(), 7);
+}
+
+fn test_cond<T: NumericIndexValue + PartialOrd + Clone + 'static>(
     index: &NumericIndexInner<T>,
     rng: Range<FloatPayloadType>,
     result: Vec<u32>,
@@ -888,7 +952,7 @@ fn test_remove_reopen() {
     let index = open_index_from_disk(temp_dir.path(), IndexType::RamMmap, &deleted);
 
     // Deletions reflected in the indexed-point count.
-    assert_eq!(index.inner().count_indexed_points(), 2);
+    assert_eq!(index.inner().count_indexed_points().unwrap(), 2);
 
     // Range query covering all four original values returns only the live
     // ones; deleted points must be filtered out by the immutable index.
@@ -991,4 +1055,163 @@ fn test_integer_index_fractional_range_bounds() {
         vec![0],
         "lte: 1.5 must include integer 1 and exclude 2",
     );
+}
+
+/// The optional block-index sidecar over the sorted pairs must be a pure
+/// accelerator: cardinality estimates and filter results must be identical
+/// with the sidecar present and after deleting it (which falls back to plain
+/// binary search over the storage).
+#[test]
+fn test_block_index_fallback_equivalence() {
+    fn collect_results(
+        index: &NumericIndex<FloatPayloadType, FloatPayloadType>,
+        queries: &[Range<OrderedFloat<FloatPayloadType>>],
+    ) -> Vec<(usize, usize, usize, Vec<PointOffsetType>)> {
+        let hw_counter = HardwareCounterCell::new();
+        queries
+            .iter()
+            .map(|query| {
+                let estimation =
+                    query::range_cardinality(index.inner(), &RangeInterface::Float(*query))
+                        .unwrap();
+                let points = index
+                    .inner()
+                    .filter(
+                        &FieldCondition::new_range(JsonPath::new("unused"), *query),
+                        &hw_counter,
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .collect_vec();
+                (estimation.min, estimation.exp, estimation.max, points)
+            })
+            .collect()
+    }
+
+    // 3000 points x 2 values = 6000 pairs, several 16KiB blocks.
+    let (temp_dir, index) = random_index(3000, 2, IndexType::Mmap);
+    drop(index);
+
+    let block_index_path = temp_dir
+        .path()
+        .join(on_disk_numeric_index::PAIRS_BLOCK_INDEX_PATH);
+    assert!(block_index_path.exists());
+
+    // Random ranges (values live in 0..100), exact-value probes, and bounds
+    // outside the value domain.
+    let mut rng = StdRng::seed_from_u64(7);
+    let mut queries = Vec::new();
+    for _ in 0..100 {
+        let a: FloatPayloadType = rng.random_range(-10.0..110.0);
+        let b: FloatPayloadType = rng.random_range(-10.0..110.0);
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let (lo, hi) = (OrderedFloat(lo), OrderedFloat(hi));
+        queries.push(Range {
+            lt: None,
+            gt: None,
+            gte: Some(lo),
+            lte: Some(hi),
+        });
+        queries.push(Range {
+            lt: Some(hi),
+            gt: Some(lo),
+            gte: None,
+            lte: None,
+        });
+        queries.push(Range {
+            lt: None,
+            gt: None,
+            gte: Some(lo),
+            lte: Some(lo),
+        });
+    }
+
+    let deleted = empty_deleted();
+
+    let with_block_index = open_index_from_disk(temp_dir.path(), IndexType::Mmap, &deleted);
+    let with_results = collect_results(&with_block_index, &queries);
+    drop(with_block_index);
+
+    fs_err::remove_file(&block_index_path).unwrap();
+    let without_block_index = open_index_from_disk(temp_dir.path(), IndexType::Mmap, &deleted);
+    let without_results = collect_results(&without_block_index, &queries);
+
+    assert_eq!(with_results, without_results);
+    // Sanity: the query mix actually matches points.
+    assert!(
+        with_results
+            .iter()
+            .any(|(_, _, _, points)| !points.is_empty())
+    );
+}
+
+/// The block-index sidecar must be covered by `preopen`: after
+/// `schedule_prefetch`, `open` must be served from the prefetch pool without
+/// touching the filesystem again. Conversely, an absent sidecar (old segment)
+/// must not fail `preopen` and must open in fallback mode.
+#[test]
+fn test_block_index_preopen() {
+    use common::universal_io::{CachedFs, CachedReadFs as _, MmapFile, Populate, ReadOnly};
+
+    use crate::index::field_index::numeric_index::on_disk_numeric_index::OnDiskNumericIndex;
+
+    type Storage = ReadOnly<MmapFile>;
+    type RoFs = <Storage as common::universal_io::UniversalRead>::Fs;
+
+    let (temp_dir, index) = random_index(3000, 2, IndexType::Mmap);
+    drop(index);
+    let block_index_path = temp_dir
+        .path()
+        .join(on_disk_numeric_index::PAIRS_BLOCK_INDEX_PATH);
+    let deleted = empty_deleted();
+
+    // Same order as the segment open path: snapshot, then preopen, then open.
+    use common::universal_io::UniversalReadFileOps as _;
+    let fs = RoFs::from_context(Default::default()).unwrap();
+    let mut cached_fs = CachedFs::new(fs.clone(), temp_dir.path()).unwrap();
+    cached_fs.cache_file_info().unwrap();
+    assert!(
+        OnDiskNumericIndex::<FloatPayloadType, Storage>::preopen(
+            &cached_fs,
+            temp_dir.path(),
+            Populate::PreferBackground,
+        )
+        .unwrap()
+    );
+
+    // The sidecar read of `open` must now come from the prefetch pool.
+    fs_err::remove_file(&block_index_path).unwrap();
+
+    let index = OnDiskNumericIndex::<FloatPayloadType, Storage>::open(
+        &cached_fs,
+        temp_dir.path(),
+        Populate::PreferBackground,
+        &deleted,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(index.storage.pairs_block_index.is_some());
+    drop(index);
+
+    // An absent sidecar (segment built before it was introduced): `preopen`
+    // must not fail on the missing file and `open` must fall back.
+    let mut cached_fs = CachedFs::new(fs, temp_dir.path()).unwrap();
+    cached_fs.cache_file_info().unwrap();
+    assert!(
+        OnDiskNumericIndex::<FloatPayloadType, Storage>::preopen(
+            &cached_fs,
+            temp_dir.path(),
+            Populate::PreferBackground,
+        )
+        .unwrap()
+    );
+    let index = OnDiskNumericIndex::<FloatPayloadType, Storage>::open(
+        &cached_fs,
+        temp_dir.path(),
+        Populate::PreferBackground,
+        &deleted,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(index.storage.pairs_block_index.is_none());
 }

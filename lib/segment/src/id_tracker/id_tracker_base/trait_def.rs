@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use common::bitvec::{BitSlice, BitSliceExt as _};
 use common::types::{DeferredBehavior, PointOffsetType};
+use common::universal_io::UniversalRead;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -70,7 +71,7 @@ pub trait IdTracker: IdTrackerRead + fmt::Debug {
         // We return those points to the caller to clean up the storage.
         let mut to_return = Vec::new();
 
-        for (internal_id, version) in self.iter_internal_versions() {
+        for (internal_id, version) in self.iter_internal_versions()? {
             if version != DELETED_POINT_VERSION && self.external_id(internal_id).is_none() {
                 to_return.push(internal_id);
             }
@@ -124,20 +125,60 @@ pub trait IdTracker: IdTrackerRead + fmt::Debug {
 }
 
 pub trait IdTrackerRead {
+    /// Read backend of the disk-resident mapping, if any. Trackers that keep
+    /// their mapping in RAM (all but the disk-resident ones) set this to a
+    /// placeholder [`MmapFile`](common::universal_io::MmapFile) — the
+    /// `Plain`/`Compressed` mapping variants do not use it.
+    type Backend: UniversalRead;
+
     /// Get a reference to the point mappings, which provides iteration methods.
-    fn point_mappings(&self) -> PointMappingsRefEnum<'_>;
+    fn point_mappings(&self) -> PointMappingsRefEnum<'_, Self::Backend>;
 
     fn internal_version(&self, internal_id: PointOffsetType) -> Option<SeqNumberType>;
 
-    /// Returns internal ID of the point, which is used inside this segment
+    /// Batch counterpart of [`internal_version`](Self::internal_version):
+    /// `callback` receives each `(internal_id, version)` as it resolves; ids
+    /// without a version (e.g. out of range) are skipped.
     ///
-    /// Excludes soft deleted points.
-    fn internal_id(&self, external_id: PointIdType) -> Option<PointOffsetType>;
+    /// Trackers with resident versions stream the single lookup
+    /// ([`default_internal_versions_batch`]); disk-resident trackers
+    /// pipeline the reads and propagate any storage error. Neither buffers —
+    /// the input is walked once and the pairs go straight to `callback`.
+    fn internal_versions_batch(
+        &self,
+        internal_ids: impl IntoIterator<Item = PointOffsetType>,
+        callback: impl FnMut(PointOffsetType, SeqNumberType),
+    ) -> OperationResult<()>;
+
+    /// Returns the internal ID of the point under explicit deferred
+    /// semantics — see [`PointMappings::internal_id_with_behavior`].
+    ///
+    /// Excludes soft deleted points. Trackers that never carry deferred
+    /// mutations (immutable / compressed) ignore the behavior argument.
+    fn internal_id_with_behavior(
+        &self,
+        external_id: PointIdType,
+        deferred_behavior: DeferredBehavior,
+    ) -> Option<PointOffsetType>;
 
     /// Return external ID for internal point, defined by user
     ///
     /// Excludes soft deleted points.
     fn external_id(&self, internal_id: PointOffsetType) -> Option<PointIdType>;
+
+    /// Batch counterpart of [`external_id`](Self::external_id), streaming
+    /// each `(internal_id, external_id)` pair to `callback`. Deleted and
+    /// unknown points are skipped, and delivery order is unspecified — callers
+    /// pair results by internal id, not input position.
+    ///
+    /// In-RAM trackers stream the iterator through the single lookup
+    /// ([`default_external_ids_batch`]); disk-resident trackers pipeline the
+    /// reads, propagating storage errors.
+    fn external_ids_batch(
+        &self,
+        internal_ids: impl IntoIterator<Item = PointOffsetType>,
+        callback: impl FnMut(PointOffsetType, PointIdType),
+    ) -> OperationResult<()>;
 
     /// Number of total points
     ///
@@ -193,9 +234,12 @@ pub trait IdTrackerRead {
 
     /// Iterate over all stored internal versions, even if they were deleted
     /// Required for cleanup on segment open
+    ///
+    /// Disk-resident trackers read the versions from storage here, so the
+    /// read error surfaces instead of truncating the iteration.
     fn iter_internal_versions(
         &self,
-    ) -> Box<dyn Iterator<Item = (PointOffsetType, SeqNumberType)> + '_>;
+    ) -> OperationResult<Box<dyn Iterator<Item = (PointOffsetType, SeqNumberType)> + '_>>;
 
     /// Internal-id threshold above which points are hidden from reads.
     ///
@@ -209,40 +253,71 @@ pub trait IdTrackerRead {
         0
     }
 
-    /// Translate external point ids into two parallel vectors of `(ids,
-    /// offsets)` in a single pass.
+    /// Translate external point ids into `(id, offset)` pairs, delivered
+    /// through `callback` as they resolve, in a single pass.
     ///
     /// Applies deferred filtering according to `deferred_behavior` inline
-    /// (no separate `point_is_deferred` lookup), missing points will be ignored
+    /// (no separate `point_is_deferred` lookup); missing points are skipped
+    /// (no callback invocation). Order is unspecified — the id travels with the
+    /// offset, so callers that need the input position carry it themselves.
     ///
-    /// The parallel-vector return shape lets downstream batched fetchers
-    /// consume `&offsets` directly.
+    /// The batch-in/callback-out shape lets callers stream ids from any
+    /// collection and sink the pairs into any shape (parallel vectors, a set,
+    /// ...) without intermediate allocations. The in-RAM default streams the
+    /// single lookup; disk-resident trackers stream the pipelined batch read
+    /// and propagate any storage error to the caller.
     ///
     /// Centralising this here keeps the deferred threshold from leaking out
     /// of the id tracker — callers go through this entry point instead of
     /// reading `deferred_internal_id()` themselves.
     fn resolve_external_ids(
         &self,
-        point_ids: &[PointIdType],
+        point_ids: impl IntoIterator<Item = PointIdType>,
         deferred_behavior: DeferredBehavior,
-    ) -> (Vec<PointIdType>, Vec<PointOffsetType>) {
-        // Non-appendable trackers never carry a deferred threshold (it's set
-        // only via `MutableIdTracker::open`, guarded by `appendable_flag` in
-        // the segment constructor), so we don't need an appendable check here.
-        let deferred_cutoff = deferred_behavior.apply(self.deferred_internal_id());
-
-        let mut ids = Vec::with_capacity(point_ids.len());
-        let mut offsets = Vec::with_capacity(point_ids.len());
-        for &point_id in point_ids {
-            let Some(internal_id) = self.internal_id(point_id) else {
-                continue;
-            };
-            if deferred_cutoff.is_some_and(|cutoff| internal_id >= cutoff) {
-                continue;
+        mut callback: impl FnMut(PointIdType, PointOffsetType),
+    ) -> OperationResult<()> {
+        // For VisibleOnly, the deferred-aware lookup returns the active head
+        // only — there's no need for the post-lookup cutoff filter the
+        // old impl carried. For WithDeferred, the lookup prefers the
+        // deferred head over a shadowed active so each ext yields its
+        // latest version exactly once.
+        for point_id in point_ids {
+            if let Some(internal_id) = self.internal_id_with_behavior(point_id, deferred_behavior) {
+                callback(point_id, internal_id);
             }
-            ids.push(point_id);
-            offsets.push(internal_id);
         }
-        (ids, offsets)
+        Ok(())
     }
+}
+
+/// Default [`external_ids_batch`](IdTrackerRead::external_ids_batch) for
+/// in-RAM trackers: streams the iterator through the single lookup, no IO to
+/// pipeline.
+pub fn default_external_ids_batch<T: IdTrackerRead + ?Sized>(
+    this: &T,
+    internal_ids: impl IntoIterator<Item = PointOffsetType>,
+    mut callback: impl FnMut(PointOffsetType, PointIdType),
+) -> OperationResult<()> {
+    for internal_id in internal_ids {
+        if let Some(external_id) = this.external_id(internal_id) {
+            callback(internal_id, external_id);
+        }
+    }
+    Ok(())
+}
+
+/// Default [`internal_versions_batch`](IdTrackerRead::internal_versions_batch)
+/// for trackers with resident versions: streams the single lookup, no IO to
+/// pipeline.
+pub fn default_internal_versions_batch<T: IdTrackerRead + ?Sized>(
+    this: &T,
+    internal_ids: impl IntoIterator<Item = PointOffsetType>,
+    mut callback: impl FnMut(PointOffsetType, SeqNumberType),
+) -> OperationResult<()> {
+    for internal_id in internal_ids {
+        if let Some(version) = this.internal_version(internal_id) {
+            callback(internal_id, version);
+        }
+    }
+    Ok(())
 }

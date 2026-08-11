@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use common::universal_io::MmapFs;
 use fs_err as fs;
 use quantization::encoded_storage::TestEncodedStorage;
 use quantization::encoded_vectors_binary::{
@@ -206,7 +207,7 @@ fn test_puffin_reader_full_roundtrip() {
             let storage =
                 TestEncodedStorage::from_file(&data_path, quantized_vec_size).unwrap();
             let encoded =
-                EncodedVectorsBin::<u128, TestEncodedStorage>::load(storage, &meta_path)
+                EncodedVectorsBin::<u128, TestEncodedStorage>::load(&MmapFs, storage, &meta_path)
                     .expect("EncodedVectorsBin::<u128, _>::load");
 
             let params: &VectorParameters = encoded.get_vector_parameters();

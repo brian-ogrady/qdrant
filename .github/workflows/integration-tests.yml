@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ '**' ]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   UV_VERSION: 0.9.17
@@ -18,13 +21,15 @@ jobs:
     steps:
       - name: Install minimal stable
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Protoc
         uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: integration-tests
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+          # Only save the cache on dev; feature-branch caches would just get evicted under the 10 GB budget
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
       - name: Install dependencies
@@ -46,15 +51,17 @@ jobs:
     steps:
       - name: Install minimal stable
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Protoc
         uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: integration-tests
+          # integration-tests is the broadest build in this group and owns saving the cache
+          save-if: "false"
       - name: Install dependencies
         run: sudo apt-get install clang
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
       - name: Install uv and Python dependencies
@@ -84,8 +91,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
       - name: Install uv and Python dependencies
@@ -95,16 +102,14 @@ jobs:
           uv --project tests lock --check
           uv --project tests sync
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Docker build
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           tags: qdrant_consensus
-          cache-from: |
-            type=gha,scope=${{ github.base_ref || github.ref_name }}-consensus
-            type=gha,scope=dev-consensus
-          cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope={0}-consensus', github.ref_name) || '' }}
+          cache-from: type=gha,scope=docker-integration-tests
+          cache-to: ${{ github.event_name == 'push' && github.ref_name == 'dev' && 'type=gha,mode=max,scope=docker-integration-tests' || '' }}
           load: true
           build-args: |
             PROFILE=ci
@@ -120,27 +125,17 @@ jobs:
     steps:
       - name: Install minimal stable
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: integration-tests
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Install dependencies
         run: sudo apt-get install -y clang jq
       - name: Docker build
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: tools/schema2openapi
           tags: schema2openapi
-          cache-from: |
-            type=gha,scope=${{ github.ref }}-schema2openapi
-            type=gha,scope=${{ github.base_ref }}-schema2openapi
-          cache-to: type=gha,mode=max,scope=${{ github.ref }}-schema2openapi
           load: true
-          build-args: |
-            PROFILE=ci
-            FEATURES=staging
       - name: Install Protoc
         uses: ./.github/actions/setup-protoc
       - name: gRPC file consistency check
@@ -168,10 +163,12 @@ jobs:
         run: echo $(aws --endpoint-url http://127.0.0.1:9000/ s3 mb s3://test-bucket)
       - name: Install minimal stable
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: integration-tests
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+          # integration-tests is the broadest build in this group and owns saving the cache
+          save-if: "false"
       - name: Install Protoc
         uses: ./.github/actions/setup-protoc
       - name: Install dependencies
@@ -180,6 +177,7 @@ jobs:
         run: cargo build --bin qdrant --features "staging" --locked
       - name: Run Shard Snapshot API Tests (local)
         shell: bash
+        timeout-minutes: 15
         run: |
           cargo run --features "staging" &
           trap 'kill $(jobs -p) &>/dev/null || :' EXIT
@@ -188,6 +186,7 @@ jobs:
           ./tests/shard-snapshot-api.sh test-all
       - name: Run Shard Snapshot API Tests (s3)
         shell: bash
+        timeout-minutes: 15
         run: |
           export QDRANT__STORAGE__SNAPSHOTS_CONFIG__SNAPSHOTS_STORAGE=s3
           export QDRANT__STORAGE__SNAPSHOTS_CONFIG__S3_CONFIG__BUCKET=test-bucket
@@ -223,14 +222,14 @@ jobs:
           AWS_EC2_METADATA_DISABLED: "true"
         run: echo $(aws --endpoint-url http://127.0.0.1:9000/ s3 mb s3://test-bucket)
 
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           lfs: true  # Fetch LFS files automatically
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Install uv and Python dependencies
         run: |
           curl -LsSf https://astral.sh/uv/$UV_VERSION/install.sh | sh
@@ -238,14 +237,12 @@ jobs:
           uv --project tests lock --check
           uv --project tests sync
       - name: Build Qdrant Docker image
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           tags: qdrant/qdrant:e2e-tests
-          cache-from: |
-            type=gha,scope=${{ github.base_ref || github.ref_name }}-e2e
-            type=gha,scope=dev-e2e
-          cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope={0}-e2e', github.ref_name) || '' }}
+          cache-from: type=gha,scope=docker-e2e-tests
+          cache-to: ${{ github.event_name == 'push' && github.ref_name == 'dev' && 'type=gha,mode=max,scope=docker-e2e-tests' || '' }}
           load: true
           build-args: |
             PROFILE=ci

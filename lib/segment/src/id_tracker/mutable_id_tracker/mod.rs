@@ -5,7 +5,6 @@ mod versions_storage;
 #[cfg(test)]
 pub(super) mod tests;
 
-#[allow(dead_code)]
 pub mod read_only;
 
 use std::collections::BTreeMap;
@@ -30,7 +29,10 @@ use self::versions_storage::{
 use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::id_tracker::point_mappings::PointMappings;
-use crate::id_tracker::{DELETED_POINT_VERSION, IdTracker, IdTrackerRead, PointMappingsRefEnum};
+use crate::id_tracker::{
+    DELETED_POINT_VERSION, IdTracker, IdTrackerRead, PointMappingsRefEnum,
+    default_external_ids_batch, default_internal_versions_batch,
+};
 use crate::types::{PointIdType, SeqNumberType};
 
 /// Mutable in-memory ID tracker with simple file based backing storage
@@ -175,15 +177,38 @@ impl IdTrackerRead for MutableIdTracker {
         self.internal_to_version.get(internal_id as usize).copied()
     }
 
-    fn internal_id(&self, external_id: PointIdType) -> Option<PointOffsetType> {
-        self.mappings.internal_id(&external_id)
+    fn internal_versions_batch(
+        &self,
+        internal_ids: impl IntoIterator<Item = PointOffsetType>,
+        callback: impl FnMut(PointOffsetType, SeqNumberType),
+    ) -> OperationResult<()> {
+        default_internal_versions_batch(self, internal_ids, callback)
+    }
+
+    fn internal_id_with_behavior(
+        &self,
+        external_id: PointIdType,
+        deferred_behavior: common::types::DeferredBehavior,
+    ) -> Option<PointOffsetType> {
+        self.mappings
+            .internal_id_with_behavior(&external_id, deferred_behavior)
     }
 
     fn external_id(&self, internal_id: PointOffsetType) -> Option<PointIdType> {
         self.mappings.external_id(internal_id)
     }
 
-    fn point_mappings(&self) -> PointMappingsRefEnum<'_> {
+    fn external_ids_batch(
+        &self,
+        internal_ids: impl IntoIterator<Item = PointOffsetType>,
+        callback: impl FnMut(PointOffsetType, PointIdType),
+    ) -> OperationResult<()> {
+        default_external_ids_batch(self, internal_ids, callback)
+    }
+
+    type Backend = common::universal_io::MmapFile;
+
+    fn point_mappings(&self) -> PointMappingsRefEnum<'_, Self::Backend> {
         PointMappingsRefEnum::Plain(&self.mappings)
     }
 
@@ -209,13 +234,13 @@ impl IdTrackerRead for MutableIdTracker {
 
     fn iter_internal_versions(
         &self,
-    ) -> Box<dyn Iterator<Item = (PointOffsetType, SeqNumberType)> + '_> {
-        Box::new(
+    ) -> OperationResult<Box<dyn Iterator<Item = (PointOffsetType, SeqNumberType)> + '_>> {
+        Ok(Box::new(
             self.internal_to_version
                 .iter()
                 .enumerate()
                 .map(|(i, version)| (i as PointOffsetType, *version)),
-        )
+        ))
     }
 
     fn name(&self) -> &'static str {

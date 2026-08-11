@@ -1,6 +1,6 @@
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::generic_consts::Random;
-use common::types::PointOffsetType;
+use common::types::{DeferredBehavior, PointOffsetType};
 
 use crate::common::check_vector_name;
 use crate::common::operation_error::{OperationError, OperationResult};
@@ -49,37 +49,15 @@ where
     /// parallel input array without keeping a separate `offset → ...` lookup
     /// table. Deleted points are filtered out lazily — entries with deleted
     /// vectors or deleted points are simply not delivered to the callback.
-    pub fn vectors_by_offsets<U: Copy>(
+    pub fn vectors_by_offsets<U: Copy + common::universal_io::UserData>(
         &self,
         vector_name: &VectorName,
         keys: impl IntoIterator<Item = (U, PointOffsetType)>,
         hw_counter: &HardwareCounterCell,
         mut callback: impl FnMut(U, PointOffsetType, VectorInternal),
     ) -> OperationResult<()> {
-        check_vector_name(vector_name, self.segment_config)?;
-        let vector_data = self
-            .vector_data
-            .get(vector_name)
-            .ok_or_else(|| OperationError::vector_name_not_exists(vector_name))?;
-        let vector_storage = vector_data.vector_storage();
-        let total_vectors = vector_storage.total_vector_count();
-
-        let id_tracker = self.id_tracker;
-        // The user-data tag rides alongside each offset, so the deletion
-        // filter stays lazy — no parallel `Vec<(orig_idx, offset)>` needed.
-        let live_keys = keys.into_iter().filter(|&(_, point_offset)| {
-            if total_vectors <= point_offset as usize {
-                debug_assert!(
-                    false,
-                    "Vector storage is inconsistent, total_vector_count: {total_vectors}, point_offset: {point_offset}, external_id: {:?}",
-                    id_tracker.external_id(point_offset),
-                );
-                return false;
-            }
-            let is_vector_deleted = vector_storage.is_deleted_vector(point_offset);
-            let is_point_deleted = id_tracker.is_deleted_point(point_offset);
-            !is_vector_deleted && !is_point_deleted
-        });
+        let vector_storage = self.vector_storage_for(vector_name)?;
+        let live_keys = self.filter_live_keys(&*vector_storage, keys);
 
         vector_storage.read_vectors::<Random, U>(
             live_keys,
@@ -96,6 +74,72 @@ where
         Ok(())
     }
 
+    /// Byte-blob analogue of [`Self::vectors_by_offsets`]: yields each vector as
+    /// storage-native bytes (`Vec<u8>`) instead of a decoded [`VectorInternal`],
+    /// avoiding a lossy round-trip. Deleted vectors/points and offsets without
+    /// a stored value are skipped lazily, like in the decoded twin; storage
+    /// read failures propagate as errors.
+    pub fn vector_bytes_by_offsets<U: Copy + common::universal_io::UserData>(
+        &self,
+        vector_name: &VectorName,
+        keys: impl IntoIterator<Item = (U, PointOffsetType)>,
+        hw_counter: &HardwareCounterCell,
+        mut callback: impl FnMut(U, PointOffsetType, Vec<u8>),
+    ) -> OperationResult<()> {
+        let vector_storage = self.vector_storage_for(vector_name)?;
+        let live_keys = self.filter_live_keys(&*vector_storage, keys);
+
+        vector_storage
+            .read_vector_bytes::<Random, U>(live_keys, |user_data, point_offset, bytes| {
+                if vector_storage.is_on_disk() {
+                    hw_counter.vector_io_read().incr_delta(bytes.len());
+                }
+                callback(user_data, point_offset, bytes);
+            })
+            .map_err(|err| {
+                OperationError::service_error(format!(
+                    "Failed to read raw bytes of vector {vector_name:?}: {err}"
+                ))
+            })
+    }
+
+    /// Resolve the vector storage for a named vector, validating the name.
+    fn vector_storage_for(&self, vector_name: &VectorName) -> OperationResult<TVD::StorageRef<'_>> {
+        check_vector_name(vector_name, self.segment_config)?;
+        let vector_data = self
+            .vector_data
+            .get(vector_name)
+            .ok_or_else(|| OperationError::vector_name_not_exists(vector_name))?;
+        Ok(vector_data.vector_storage())
+    }
+
+    /// Shared liveness filter of [`Self::vectors_by_offsets`] and
+    /// [`Self::vector_bytes_by_offsets`]: lazily drops out-of-bounds offsets
+    /// (with a debug assert) and offsets whose vector or point is deleted.
+    /// The user-data tag rides alongside each offset, so no parallel
+    /// `Vec<(orig_idx, offset)>` is needed.
+    fn filter_live_keys<'a, U: Copy, S: VectorStorageRead + ?Sized>(
+        &'a self,
+        vector_storage: &'a S,
+        keys: impl IntoIterator<Item = (U, PointOffsetType), IntoIter: 'a>,
+    ) -> impl Iterator<Item = (U, PointOffsetType)> + 'a {
+        let total_vectors = vector_storage.total_vector_count();
+        let id_tracker = self.id_tracker;
+        keys.into_iter().filter(move |&(_, point_offset)| {
+            if total_vectors <= point_offset as usize {
+                debug_assert!(
+                    false,
+                    "Vector storage is inconsistent, total_vector_count: {total_vectors}, point_offset: {point_offset}, external_id: {:?}",
+                    id_tracker.external_id(point_offset),
+                );
+                return false;
+            }
+            let is_vector_deleted = vector_storage.is_deleted_vector(point_offset);
+            let is_point_deleted = id_tracker.is_deleted_point(point_offset);
+            !is_vector_deleted && !is_point_deleted
+        })
+    }
+
     /// Retrieve a named vector for an external point ID.
     pub fn vector(
         &self,
@@ -103,7 +147,28 @@ where
         point_id: PointIdType,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Option<VectorInternal>> {
-        let internal_id = self.lookup_internal_id(point_id)?;
+        // Single-point retrieval observes the visible snapshot; deferred
+        // mutations stay hidden until the optimizer rolls a fresh segment.
+        self.vector_with_behavior(
+            vector_name,
+            point_id,
+            DeferredBehavior::VisibleOnly,
+            hw_counter,
+        )
+    }
+
+    /// Retrieve a named vector for an external point ID with explicit deferred
+    /// semantics. With [`DeferredBehavior::WithDeferred`] this also resolves
+    /// points whose only head is a deferred mutation (invisible to reads) —
+    /// used by the copy-on-write move path which must relocate deferred points.
+    pub fn vector_with_behavior(
+        &self,
+        vector_name: &VectorName,
+        point_id: PointIdType,
+        deferred_behavior: DeferredBehavior,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Option<VectorInternal>> {
+        let internal_id = self.lookup_internal_id(point_id, deferred_behavior)?;
         self.vector_by_offset(vector_name, internal_id, hw_counter)
     }
 

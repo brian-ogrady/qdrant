@@ -1,26 +1,27 @@
 use std::path::PathBuf;
 
+use blobstore::config::{DEFAULT_REGION_SIZE_BLOCKS, GridstoreConfig, StorageConfig};
+use blobstore::error::BlobstoreError;
+use blobstore::{Blob, Blobstore};
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use gridstore::config::StorageOptions;
-use gridstore::error::GridstoreError;
-use gridstore::{Blob, Gridstore};
+use common::universal_io::{MmapFs, Populate};
 
 use super::super::MapIndexKey;
 use super::MutableMapIndex;
-use super::inner::MutableMapIndexInner;
+use super::in_memory::InMemoryMapIndex;
 use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult};
 
 /// Default options for Gridstore storage
-const fn default_gridstore_options(block_size: usize) -> StorageOptions {
-    StorageOptions {
+const fn default_gridstore_options(block_size: usize) -> StorageConfig {
+    StorageConfig::Mutable(GridstoreConfig {
+        page_size_bytes: block_size * DEFAULT_REGION_SIZE_BLOCKS * 32, // 4 to 8 MiB = block_size * region_blocks * regions,
         // Size dependent on map value type
-        block_size_bytes: Some(block_size),
-        compression: Some(gridstore::config::Compression::None),
-        page_size_bytes: Some(block_size * 8192 * 32), // 4 to 8 MiB = block_size * region_blocks * regions,
-        region_size_blocks: None,
-    }
+        block_size_bytes: block_size,
+        region_size_blocks: DEFAULT_REGION_SIZE_BLOCKS,
+        compression: blobstore::config::Compression::None,
+    })
 }
 
 impl<N: MapIndexKey + ?Sized> MutableMapIndex<N>
@@ -32,16 +33,24 @@ where
     /// The `create_if_missing` parameter indicates whether to create a new Gridstore if it does
     /// not exist. If false and files don't exist, the load function will indicate nothing could be
     /// loaded.
-    pub fn open_gridstore(path: PathBuf, create_if_missing: bool) -> OperationResult<Option<Self>> {
+    ///
+    /// `prefix_index` enables in-memory prefix range scans; it is not
+    /// persisted, so it must be re-supplied (from the payload schema) on every
+    /// open.
+    pub fn open_gridstore(
+        path: PathBuf,
+        create_if_missing: bool,
+        prefix_index: bool,
+    ) -> OperationResult<Option<Self>> {
         let store = if create_if_missing {
             let options = default_gridstore_options(N::gridstore_block_size());
-            Gridstore::open_or_create(path, options).map_err(|err| {
+            Blobstore::open_or_create(MmapFs, path, options, Populate::Blocking).map_err(|err| {
                 OperationError::service_error(format!(
                     "failed to open mutable map index on gridstore: {err}"
                 ))
             })?
         } else if path.exists() {
-            Gridstore::open(path).map_err(|err| {
+            Blobstore::open(MmapFs, path, Populate::Blocking).map_err(|err| {
                 OperationError::service_error(format!(
                     "failed to open mutable map index on gridstore: {err}"
                 ))
@@ -52,16 +61,14 @@ where
         };
 
         // Load in-memory index from Gridstore
-        let mut inner = MutableMapIndexInner::<N>::empty();
+        let mut in_memory_index = InMemoryMapIndex::<N>::empty(prefix_index);
 
         let hw_counter = HardwareCounterCell::disposable();
         let hw_counter_ref = hw_counter.ref_payload_index_io_write_counter();
         store
-            .iter::<_, GridstoreError>(
+            .iter::<_, BlobstoreError>(
                 |idx, values: Vec<_>| {
-                    for value in values {
-                        inner.ingest(idx, value);
-                    }
+                    in_memory_index.add_many_to_map(idx, values);
                     Ok(true)
                 },
                 hw_counter_ref,
@@ -70,7 +77,7 @@ where
             .unwrap();
 
         Ok(Some(Self {
-            inner,
+            in_memory_index,
             storage: store,
         }))
     }
@@ -88,22 +95,7 @@ where
             return Ok(());
         }
 
-        self.inner.values_count += values.len();
-        if self.inner.point_to_values.len() <= idx as usize {
-            self.inner
-                .point_to_values
-                .resize_with(idx as usize + 1, Vec::new)
-        }
-
-        self.inner.point_to_values[idx as usize] = Vec::with_capacity(values.len());
-
         let hw_counter_ref = hw_counter.ref_payload_index_io_write_counter();
-
-        for value in values.clone() {
-            let entry = self.inner.map.entry(value.into());
-            self.inner.point_to_values[idx as usize].push(entry.key().clone());
-            entry.or_default().insert(idx);
-        }
 
         let values = values.into_iter().map(Into::into).collect::<Vec<_>>();
         self.storage
@@ -114,12 +106,13 @@ where
                 ))
             })?;
 
-        self.inner.indexed_points += 1;
+        self.in_memory_index.add_many_to_map(idx, values);
+
         Ok(())
     }
 
     pub fn remove_point(&mut self, idx: PointOffsetType) -> OperationResult<()> {
-        if !self.inner.remove_point(idx) {
+        if !self.in_memory_index.remove_point(idx) {
             return Ok(());
         }
 

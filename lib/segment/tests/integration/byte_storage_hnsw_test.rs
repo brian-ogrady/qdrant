@@ -1,3 +1,8 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
+use std::assert_matches;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -99,18 +104,18 @@ fn test_byte_storage_hnsw(
     let int_key = "int";
 
     let mut segment_float = build_simple_segment(dir_float.path(), dim, distance).unwrap();
-    let mut segment_byte = build_segment(dir_byte.path(), &config_byte, None, true).unwrap();
+    let (mut segment_byte, _) = build_segment(dir_byte.path(), &config_byte, None, true).unwrap();
     // check that `segment_byte` uses byte or half storage
     {
         let borrowed_storage = segment_byte.vector_data[DEFAULT_VECTOR_NAME]
             .vector_storage
             .borrow();
         let raw_storage: &VectorStorageEnum = &borrowed_storage;
-        assert!(matches!(
+        assert_matches!(
             raw_storage,
             &VectorStorageEnum::DenseAppendableMemmapByte(_)
                 | &VectorStorageEnum::DenseAppendableMemmapHalf(_),
-        ));
+        );
     }
 
     for n in 0..num_vectors {
@@ -168,6 +173,7 @@ fn test_byte_storage_hnsw(
         .unwrap();
 
     let hnsw_config = HnswConfig {
+        memory: None,
         m,
         ef_construct,
         full_scan_threshold,

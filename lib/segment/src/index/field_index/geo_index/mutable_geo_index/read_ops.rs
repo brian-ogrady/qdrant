@@ -3,14 +3,14 @@ use std::path::PathBuf;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 
-use super::super::read_ops::GeoMapIndexRead;
-use super::MutableGeoMapIndex;
+use super::super::read_ops::GeoIndexRead;
+use super::MutableGeoIndex;
 use crate::common::operation_error::OperationResult;
 use crate::index::field_index::geo_hash::GeoHash;
 use crate::index::payload_config::StorageType;
 use crate::types::GeoPoint;
 
-impl GeoMapIndexRead for MutableGeoMapIndex {
+impl GeoIndexRead for MutableGeoIndex {
     fn points_count(&self) -> usize {
         self.in_memory_index.points_count()
     }
@@ -44,7 +44,7 @@ impl GeoMapIndexRead for MutableGeoMapIndex {
         idx: PointOffsetType,
         hw_counter: &HardwareCounterCell,
         check_fn: &dyn Fn(&GeoPoint) -> bool,
-    ) -> bool {
+    ) -> OperationResult<bool> {
         self.in_memory_index
             .check_values_any(idx, hw_counter, check_fn)
     }
@@ -88,11 +88,11 @@ impl GeoMapIndexRead for MutableGeoMapIndex {
     }
 
     fn clear_cache(&self) -> OperationResult<()> {
-        MutableGeoMapIndex::clear_cache(self)
+        MutableGeoIndex::clear_cache(self)
     }
 
     fn files(&self) -> Vec<PathBuf> {
-        MutableGeoMapIndex::files(self)
+        MutableGeoIndex::files(self)
     }
 
     fn immutable_files(&self) -> Vec<PathBuf> {

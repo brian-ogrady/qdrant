@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::borrow::Cow;
 use std::io::{self, BufWriter, Write};
 use std::ops::Range;
@@ -9,24 +13,23 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::generic_consts::AccessPattern;
 use common::mmap;
 use common::types::PointOffsetType;
-use common::universal_io::{MmapFile, MmapFs, UniversalRead};
+use common::universal_io::{MmapFile, MmapFs, Populate, UniversalRead, UserData};
 use fs_err::{File, OpenOptions};
 
 use crate::common::Flusher;
+use crate::common::io_uring::{IoUringFallback, use_io_uring};
 use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::VectorRef;
-use crate::types::{Distance, VectorStorageDatatype};
-#[cfg(target_os = "linux")]
-use crate::vector_storage::common::get_async_scorer;
+use crate::types::{Distance, Memory, VectorStorageDatatype};
 use crate::vector_storage::dense::immutable_dense_vectors::ImmutableDenseVectors;
 use crate::vector_storage::{
-    DenseVectorStorage, VectorStorage, VectorStorageEnum, VectorStorageRead,
+    DenseVectorStorage, DenseVectorStorageRead, VectorStorage, VectorStorageEnum, VectorStorageRead,
 };
 
-const VECTORS_PATH: &str = "matrix.dat";
-const DELETED_PATH: &str = "deleted.dat";
+pub(crate) const VECTORS_PATH: &str = "matrix.dat";
+pub(crate) const DELETED_PATH: &str = "deleted.dat";
 
 /// Stores all dense vectors in mem-mapped file
 ///
@@ -78,21 +81,31 @@ where
     }
 }
 
+/// Whether the immutable single-file dense vector storages open on io_uring at `memory`. They
+/// have no feature flag of their own, and predate the setting, so they fall back to the async
+/// scorer.
+fn dense_with_uring(memory: Memory) -> bool {
+    use_io_uring(IoUringFallback::AsyncScorer, memory, true)
+}
+
 pub fn open_dense_vector_storage(
     path: &Path,
     dim: usize,
     distance: Distance,
-    populate: bool,
+    memory: Memory,
 ) -> OperationResult<VectorStorageEnum> {
-    #[cfg(target_os = "linux")]
-    let with_uring = get_async_scorer(); // `get_async_scorer` only available on Linux
-
-    #[cfg(not(target_os = "linux"))]
-    let with_uring = false;
-
-    open_dense_vector_storage_with_uring(path, dim, distance, populate, with_uring)
+    open_dense_vector_storage_with_uring(
+        path,
+        dim,
+        distance,
+        memory.populate_on_open(),
+        dense_with_uring(memory),
+    )
 }
 
+/// [`open_dense_vector_storage`] with an explicit backend choice instead of the node-wide
+/// io_uring setting. Falls back to mmap (with an error log) if the io_uring backend cannot be
+/// opened.
 pub fn open_dense_vector_storage_with_uring(
     path: &Path,
     dim: usize,
@@ -116,7 +129,7 @@ pub fn open_dense_vector_storage_with_uring(
                 return Ok(VectorStorageEnum::DenseUring(Box::new(uring_storage)));
             }
             Err(err) => {
-                log::error!("failed to open io_uring based vector storage: {err}");
+                log::error!("Failed to open io_uring based vector storage: {err}");
             }
         }
     }
@@ -129,10 +142,15 @@ pub fn open_dense_vector_storage_half(
     path: &Path,
     dim: usize,
     distance: Distance,
-    populate: bool,
+    memory: Memory,
 ) -> OperationResult<VectorStorageEnum> {
+    let populate = memory.populate_on_open();
+    let with_uring = dense_with_uring(memory);
+    // prevent "unused variable" warning
+    let _ = with_uring;
+
     #[cfg(target_os = "linux")]
-    if get_async_scorer() {
+    if with_uring {
         match open_dense_vector_storage_impl(
             common::universal_io::IoUringFs,
             path,
@@ -144,7 +162,7 @@ pub fn open_dense_vector_storage_half(
                 return Ok(VectorStorageEnum::DenseUringHalf(Box::new(uring_storage)));
             }
             Err(err) => {
-                log::error!("failed to open io_uring based vector storage: {err}");
+                log::error!("Failed to open io_uring based vector storage: {err}");
             }
         }
     }
@@ -157,10 +175,15 @@ pub fn open_dense_vector_storage_byte(
     path: &Path,
     dim: usize,
     distance: Distance,
-    populate: bool,
+    memory: Memory,
 ) -> OperationResult<VectorStorageEnum> {
+    let populate = memory.populate_on_open();
+    let with_uring = dense_with_uring(memory);
+    // prevent "unused variable" warning
+    let _ = with_uring;
+
     #[cfg(target_os = "linux")]
-    if get_async_scorer() {
+    if with_uring {
         match open_dense_vector_storage_impl(
             common::universal_io::IoUringFs,
             path,
@@ -172,7 +195,7 @@ pub fn open_dense_vector_storage_byte(
                 return Ok(VectorStorageEnum::DenseUringByte(Box::new(uring_storage)));
             }
             Err(err) => {
-                log::error!("failed to open io_uring based vector storage: {err}");
+                log::error!("Failed to open io_uring based vector storage: {err}");
             }
         }
     }
@@ -181,7 +204,7 @@ pub fn open_dense_vector_storage_byte(
     Ok(VectorStorageEnum::DenseMemmapByte(Box::new(mmap_storage)))
 }
 
-fn open_dense_vector_storage_impl<T, S>(
+pub(crate) fn open_dense_vector_storage_impl<T, S>(
     fs: S::Fs,
     path: &Path,
     dim: usize,
@@ -197,7 +220,13 @@ where
     let vectors_path = path.join(VECTORS_PATH);
     let deleted_path = path.join(DELETED_PATH);
 
-    let vectors = ImmutableDenseVectors::open(&fs, &vectors_path, &deleted_path, dim, populate)?;
+    let vectors = ImmutableDenseVectors::open(
+        &fs,
+        &vectors_path,
+        &deleted_path,
+        dim,
+        Populate::from(populate),
+    )?;
     let storage = DenseVectorStorageImpl {
         vectors_path,
         deleted_path,
@@ -210,13 +239,13 @@ where
     Ok(storage)
 }
 
-impl<T, S> DenseVectorStorage<T> for DenseVectorStorageImpl<T, S>
+impl<T, S> DenseVectorStorageRead<T> for DenseVectorStorageImpl<T, S>
 where
     T: PrimitiveVectorElement,
     S: UniversalRead,
 {
     fn vector_dim(&self) -> usize {
-        self.vectors.as_ref().unwrap().dim
+        self.vectors.as_ref().unwrap().dim()
     }
 
     fn get_dense<P: AccessPattern>(&self, key: PointOffsetType) -> Cow<'_, [T]> {
@@ -227,9 +256,98 @@ where
             .unwrap_or_else(|| panic!("vector not found: {key}"))
     }
 
-    fn for_each_in_dense_batch<F: FnMut(usize, &[T])>(&self, keys: &[PointOffsetType], f: F) {
+    fn for_each_in_dense_batch<F: FnMut(usize, &[T])>(
+        &self,
+        keys: &[PointOffsetType],
+        f: F,
+    ) -> OperationResult<()> {
         let mmap_store = self.vectors.as_ref().unwrap();
-        mmap_store.for_each_in_batch(keys, f);
+        mmap_store.for_each_in_batch(keys, f)
+    }
+
+    fn read_dense_bytes<P: AccessPattern, U: Copy>(
+        &self,
+        keys: impl IntoIterator<Item = (U, PointOffsetType)>,
+        mut callback: impl FnMut(U, PointOffsetType, Vec<u8>),
+    ) -> OperationResult<()> {
+        // Split into parallel arrays in one pass: `for_each_in_batch` needs an
+        // offsets slice (it chunks it for batched reads), but we still want
+        // `user_data[idx]` available inside the callback.
+        let (user_data, point_offsets): (Vec<U>, Vec<PointOffsetType>) = keys.into_iter().unzip();
+
+        self.vectors
+            .as_ref()
+            .unwrap()
+            .for_each_in_batch(&point_offsets, |idx, vector| {
+                callback(
+                    user_data[idx],
+                    point_offsets[idx],
+                    bytemuck::cast_slice(vector).to_vec(),
+                );
+            })
+    }
+}
+
+impl<T, S> DenseVectorStorage<T> for DenseVectorStorageImpl<T, S>
+where
+    T: PrimitiveVectorElement,
+    S: UniversalRead,
+{
+    fn update_from<'a>(
+        &mut self,
+        other_vectors: &mut impl Iterator<Item = (Cow<'a, [T]>, bool)>,
+        stopped: &AtomicBool,
+    ) -> OperationResult<Range<PointOffsetType>> {
+        let dim = self.vector_dim();
+        let start_index = self.vectors.as_ref().unwrap().num_vectors() as PointOffsetType;
+        let mut end_index = start_index;
+
+        // Extend vectors file, write other vectors into it
+        let mut vectors_file = BufWriter::new(open_append(&self.vectors_path)?);
+        let mut deleted_ids = vec![];
+        for (offset, (other_vector, other_deleted)) in other_vectors.enumerate() {
+            check_process_stopped(stopped)?;
+            // Vectors are already in the storage's element type — write as-is.
+            // Safety: T implements zerocopy::IntoBytes.
+            #[expect(deprecated, reason = "legacy code")]
+            let raw_bites = unsafe { mmap::transmute_to_u8_slice(other_vector.as_ref()) };
+            vectors_file.write_all(raw_bites)?;
+            end_index += 1;
+
+            // Remember deleted IDs so we can propagate deletions later
+            if other_deleted {
+                deleted_ids.push(start_index as PointOffsetType + offset as PointOffsetType);
+            }
+        }
+
+        // Explicitly fsync file contents to ensure durability
+        vectors_file.flush()?;
+        vectors_file
+            .into_inner()
+            .map_err(io::IntoInnerError::into_error)?
+            .sync_data()?;
+
+        // Load store with updated files
+        self.vectors.replace(ImmutableDenseVectors::open(
+            &self.fs,
+            &self.vectors_path,
+            &self.deleted_path,
+            dim,
+            Populate::No, // No need to populate
+        )?);
+
+        // Flush deleted flags into store
+        // We must do that in the updated store, and cannot do it in the previous loop. That is
+        // because the file backing delete storage must be resized, and for that we'd need to know
+        // the exact number of vectors beforehand. When opening the store it is done automatically.
+        let store = self.vectors.as_mut().unwrap();
+        for id in deleted_ids {
+            check_process_stopped(stopped)?;
+            store.delete(id);
+        }
+        store.flusher()()?;
+
+        Ok(start_index..end_index)
     }
 }
 
@@ -238,6 +356,10 @@ where
     T: PrimitiveVectorElement,
     S: UniversalRead,
 {
+    fn size_of_available_vectors_in_bytes(&self) -> usize {
+        self.available_vector_count() * self.vector_dim() * std::mem::size_of::<T>()
+    }
+
     fn distance(&self) -> Distance {
         self.distance
     }
@@ -251,7 +373,7 @@ where
     }
 
     fn total_vector_count(&self) -> usize {
-        self.vectors.as_ref().unwrap().num_vectors
+        self.vectors.as_ref().unwrap().num_vectors()
     }
 
     fn get_vector<P: AccessPattern>(&self, key: PointOffsetType) -> CowVector<'_> {
@@ -279,7 +401,8 @@ where
             .for_each_in_batch(&point_offsets, |idx, vector| {
                 let vector = CowVector::from(T::slice_to_float_cow(Cow::Borrowed(vector)));
                 callback(user_data[idx], point_offsets[idx], vector);
-            });
+            })
+            .expect("read vectors");
     }
 
     fn get_vector_opt<P: AccessPattern>(&self, key: PointOffsetType) -> Option<CowVector<'_>> {
@@ -301,6 +424,14 @@ where
     fn deleted_vector_bitslice(&self) -> &BitSlice {
         self.vectors.as_ref().unwrap().deleted_vector_bitslice()
     }
+
+    fn read_vector_bytes<P: AccessPattern, U: Copy + UserData>(
+        &self,
+        keys: impl IntoIterator<Item = (U, PointOffsetType)>,
+        callback: impl FnMut(U, PointOffsetType, Vec<u8>),
+    ) -> OperationResult<()> {
+        self.read_dense_bytes::<P, U>(keys, callback)
+    }
 }
 
 impl<T, S> VectorStorage for DenseVectorStorageImpl<T, S>
@@ -315,63 +446,6 @@ where
         _hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         panic!("Can't directly update vector in mmap storage")
-    }
-
-    fn update_from<'a>(
-        &mut self,
-        other_vectors: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
-        stopped: &AtomicBool,
-    ) -> OperationResult<Range<PointOffsetType>> {
-        let dim = self.vector_dim();
-        let start_index = self.vectors.as_ref().unwrap().num_vectors as PointOffsetType;
-        let mut end_index = start_index;
-
-        // Extend vectors file, write other vectors into it
-        let mut vectors_file = BufWriter::new(open_append(&self.vectors_path)?);
-        let mut deleted_ids = vec![];
-        for (offset, (other_vector, other_deleted)) in other_vectors.enumerate() {
-            check_process_stopped(stopped)?;
-            let vector = T::slice_from_float_cow(Cow::try_from(other_vector)?);
-            // Safety: T implements zerocopy::IntoBytes.
-            #[expect(deprecated, reason = "legacy code")]
-            let raw_bites = unsafe { mmap::transmute_to_u8_slice(vector.as_ref()) };
-            vectors_file.write_all(raw_bites)?;
-            end_index += 1;
-
-            // Remember deleted IDs so we can propagate deletions later
-            if other_deleted {
-                deleted_ids.push(start_index as PointOffsetType + offset as PointOffsetType);
-            }
-        }
-
-        // Explicitly fsync file contents to ensure durability
-        vectors_file.flush()?;
-        vectors_file
-            .into_inner()
-            .map_err(io::IntoInnerError::into_error)?
-            .sync_data()?;
-
-        // Load store with updated files
-        self.vectors.replace(ImmutableDenseVectors::open(
-            &self.fs,
-            &self.vectors_path,
-            &self.deleted_path,
-            dim,
-            false, // No need to populate
-        )?);
-
-        // Flush deleted flags into store
-        // We must do that in the updated store, and cannot do it in the previous loop. That is
-        // because the file backing delete storage must be resized, and for that we'd need to know
-        // the exact number of vectors beforehand. When opening the store it is done automatically.
-        let store = self.vectors.as_mut().unwrap();
-        for id in deleted_ids {
-            check_process_stopped(stopped)?;
-            store.delete(id);
-        }
-        store.flusher()()?;
-
-        Ok(start_index..end_index)
     }
 
     fn flusher(&self) -> Flusher {
@@ -422,6 +496,7 @@ mod tests {
     use crate::fixtures::payload_context_fixture::create_id_tracker_fixture;
     use crate::id_tracker::{IdTracker, IdTrackerRead};
     use crate::index::hnsw_index::point_scorer::{BatchFilteredSearcher, FilteredScorer};
+    use crate::segment_constructor::batched_reader::merge_from_single_source;
     use crate::types::{PointIdType, QuantizationConfig, ScalarQuantizationConfig};
     use crate::vector_storage::dense::volatile_dense_vector_storage::new_volatile_dense_vector_storage;
     use crate::vector_storage::quantized::quantized_vectors::{
@@ -440,7 +515,8 @@ mod tests {
             vec![1.0, 1.0, 0.0, 1.0],
             vec![1.0, 0.0, 0.0, 0.0],
         ];
-        let mut storage = open_dense_vector_storage(dir.path(), 4, Distance::Dot, false).unwrap();
+        let mut storage =
+            open_dense_vector_storage(dir.path(), 4, Distance::Dot, Memory::Cold).unwrap();
         let mut id_tracker = create_id_tracker_fixture(points.len());
 
         // Assert this storage lists both the vector and deleted file
@@ -467,13 +543,7 @@ mod tests {
                     .insert_vector(2, points[2].as_slice().into(), &hw_counter)
                     .unwrap();
             }
-            let mut iter = (0..3).map(|i| {
-                let i = i as PointOffsetType;
-                let vector = storage2.get_vector::<Random>(i);
-                let deleted = storage2.is_deleted_vector(i);
-                (vector, deleted)
-            });
-            storage.update_from(&mut iter, &Default::default()).unwrap();
+            merge_from_single_source(&mut storage, &storage2, 3).unwrap();
         }
 
         assert_eq!(storage.total_vector_count(), 3);
@@ -495,13 +565,7 @@ mod tests {
                     .insert_vector(4, points[4].as_slice().into(), &hw_counter)
                     .unwrap();
             }
-            let mut iter = (0..2).map(|i| {
-                let i = i as PointOffsetType;
-                let vector = storage2.get_vector::<Random>(i);
-                let deleted = storage2.is_deleted_vector(i);
-                (vector, deleted)
-            });
-            storage.update_from(&mut iter, &Default::default()).unwrap();
+            merge_from_single_source(&mut storage, &storage2, 2).unwrap();
         }
 
         assert_eq!(storage.total_vector_count(), 5);
@@ -558,7 +622,8 @@ mod tests {
         ];
         let delete_mask = [false, false, true, true, false];
         let id_tracker = create_id_tracker_fixture(points.len());
-        let mut storage = open_dense_vector_storage(dir.path(), 4, Distance::Dot, false).unwrap();
+        let mut storage =
+            open_dense_vector_storage(dir.path(), 4, Distance::Dot, Memory::Cold).unwrap();
 
         let hw_counter = HardwareCounterCell::new();
 
@@ -571,13 +636,8 @@ mod tests {
                         .unwrap();
                 });
             }
-            let mut iter = (0..points.len()).map(|i| {
-                let i = i as PointOffsetType;
-                let vector = storage2.get_vector::<Random>(i);
-                let deleted = storage2.is_deleted_vector(i);
-                (vector, deleted)
-            });
-            storage.update_from(&mut iter, &Default::default()).unwrap();
+            merge_from_single_source(&mut storage, &storage2, points.len() as PointOffsetType)
+                .unwrap();
         }
 
         assert_eq!(storage.total_vector_count(), 5);
@@ -684,7 +744,8 @@ mod tests {
             vec![1.0, 0.0, 0.0, 0.0],
         ];
         let delete_mask = [false, false, true, true, false];
-        let mut storage = open_dense_vector_storage(dir.path(), 4, Distance::Dot, false).unwrap();
+        let mut storage =
+            open_dense_vector_storage(dir.path(), 4, Distance::Dot, Memory::Cold).unwrap();
         let id_tracker = create_id_tracker_fixture(points.len());
 
         let hw_counter = HardwareCounterCell::new();
@@ -701,13 +762,8 @@ mod tests {
                     }
                 });
             }
-            let mut iter = (0..points.len()).map(|i| {
-                let i = i as PointOffsetType;
-                let vector = storage2.get_vector::<Random>(i);
-                let deleted = storage2.is_deleted_vector(i);
-                (vector, deleted)
-            });
-            storage.update_from(&mut iter, &Default::default()).unwrap();
+            merge_from_single_source(&mut storage, &storage2, points.len() as PointOffsetType)
+                .unwrap();
         }
 
         assert_eq!(
@@ -758,7 +814,8 @@ mod tests {
             vec![1.0, 1.0, 0.0, 1.0],
             vec![1.0, 0.0, 0.0, 0.0],
         ];
-        let mut storage = open_dense_vector_storage(dir.path(), 4, Distance::Dot, false).unwrap();
+        let mut storage =
+            open_dense_vector_storage(dir.path(), 4, Distance::Dot, Memory::Cold).unwrap();
         let id_tracker = create_id_tracker_fixture(points.len());
 
         let hw_counter = HardwareCounterCell::new();
@@ -772,13 +829,8 @@ mod tests {
                         .unwrap();
                 }
             }
-            let mut iter = (0..points.len()).map(|i| {
-                let i = i as PointOffsetType;
-                let vector = storage2.get_vector::<Random>(i);
-                let deleted = storage2.is_deleted_vector(i);
-                (vector, deleted)
-            });
-            storage.update_from(&mut iter, &Default::default()).unwrap();
+            merge_from_single_source(&mut storage, &storage2, points.len() as PointOffsetType)
+                .unwrap();
         }
 
         let vector = vec![-1.0, -1.0, -1.0, -1.0];
@@ -831,7 +883,8 @@ mod tests {
             vec![1.0, 1.0, 0.0, 1.0],
             vec![1.0, 0.0, 0.0, 0.0],
         ];
-        let mut storage = open_dense_vector_storage(dir.path(), 4, Distance::Dot, false).unwrap();
+        let mut storage =
+            open_dense_vector_storage(dir.path(), 4, Distance::Dot, Memory::Cold).unwrap();
 
         let hw_counter = HardwareCounterCell::new();
 
@@ -844,16 +897,12 @@ mod tests {
                         .unwrap();
                 }
             }
-            let mut iter = (0..points.len()).map(|i| {
-                let i = i as PointOffsetType;
-                let vector = storage2.get_vector::<Random>(i);
-                let deleted = storage2.is_deleted_vector(i);
-                (vector, deleted)
-            });
-            storage.update_from(&mut iter, &Default::default()).unwrap();
+            merge_from_single_source(&mut storage, &storage2, points.len() as PointOffsetType)
+                .unwrap();
         }
 
         let config: QuantizationConfig = ScalarQuantizationConfig {
+            memory: None,
             r#type: Default::default(),
             quantile: None,
             always_ram: None,

@@ -127,8 +127,10 @@ impl PlannedQuery {
             params,
         } = request;
 
-        // Adjust limit so that we have enough results when we cut off the offset at a higher level
-        let limit = limit + offset;
+        // Adjust limit so that we have enough results when we cut off the offset at a higher level.
+        // Use saturating_add so an unbounded user-supplied limit/offset cannot overflow
+        // (debug panic / release wraparound to a tiny limit) — it clamps to usize::MAX instead.
+        let limit = limit.saturating_add(offset);
 
         // Adjust with_vector based on the root query variant
         let with_vector = match &query {
@@ -191,7 +193,7 @@ impl PlannedQuery {
                 rescore: query.clone().unwrap(),
                 limit,
                 score_threshold: score_threshold.map(OrderedFloat),
-                params,
+                params: params.clone(),
             })),
         };
 
@@ -251,7 +253,7 @@ impl PlannedQuery {
                     ))),
                     limit: *candidates_limit,
                     score_threshold: score_threshold.map(OrderedFloat),
-                    params,
+                    params: params.clone(),
                 };
 
                 let collection_level = RescoreParams {

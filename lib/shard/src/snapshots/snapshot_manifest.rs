@@ -31,7 +31,9 @@ impl SnapshotManifest {
         let mut snapshot_manifest = SnapshotManifest::default();
 
         for segment_entry in fs::read_dir(segments_path)? {
-            let segment_path = segment_entry?.path();
+            let segment_entry = segment_entry?;
+
+            let segment_path = segment_entry.path();
 
             if !segment_path.is_dir() {
                 log::warn!(

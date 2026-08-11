@@ -56,7 +56,7 @@ where
             + TransformInto<TOriginalQuery, MultiDenseVectorInternal, TypedMultiDenseVector<TElement>>,
     {
         let original_query: TOriginalQuery = raw_query
-            .transform(|vector| {
+            .transform(&|vector| {
                 let mut preprocessed = Vec::new();
                 for slice in vector.multi_vectors() {
                     preprocessed.extend_from_slice(&TMetric::preprocess(slice.to_vec()));
@@ -70,7 +70,7 @@ where
             .unwrap();
 
         let query: TQuery = original_query
-            .transform(|original_vector| {
+            .transform(&|original_vector| {
                 let original_vector_prequantized = TElement::quantization_preprocess(
                     quantization_config,
                     TMetric::distance(),
@@ -100,8 +100,6 @@ where
     OffsetStorage: MultivectorOffsetsStorage,
     TQuery: Query<Vec<QuantizedStorage::EncodedQuery>>,
 {
-    type TVector = ();
-
     fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {
         debug_assert_eq!(ids.len(), scores.len());
 
@@ -130,10 +128,6 @@ where
             self.quantized_multivector_storage
                 .score_point(this, idx, &self.hardware_counter)
         })
-    }
-
-    fn score(&self, _v2: &()) -> ScoreType {
-        unimplemented!("This method is not expected to be called for quantized scorer");
     }
 
     fn score_internal(&self, _point_a: PointOffsetType, _point_b: PointOffsetType) -> ScoreType {

@@ -1,7 +1,7 @@
 use common::types::ScoreType;
 use half::f16;
 
-use crate::data_types::vectors::{DenseVector, TypedDenseVector, VectorElementTypeHalf};
+use crate::data_types::vectors::{DenseVector, VectorElementTypeHalf};
 use crate::spaces::metric::Metric;
 #[cfg(target_arch = "x86_64")]
 use crate::spaces::metric_f16::avx::dot::avx_dot_similarity_half;
@@ -51,13 +51,6 @@ impl Metric<VectorElementTypeHalf> for DotProductMetric {
         dot_similarity_half(v1, v2)
     }
 
-    fn query_similarity(
-        query: &TypedDenseVector<VectorElementTypeHalf>,
-        vector: &[VectorElementTypeHalf],
-    ) -> ScoreType {
-        Self::similarity(query, vector)
-    }
-
     fn preprocess(vector: DenseVector) -> DenseVector {
         vector
     }
@@ -69,6 +62,6 @@ pub fn dot_similarity_half(
 ) -> ScoreType {
     v1.iter()
         .zip(v2)
-        .map(|(a, b)| f16::to_f32(a * b))
+        .map(|(a, b)| f16::to_f32(*a) * f16::to_f32(*b))
         .sum::<f32>()
 }

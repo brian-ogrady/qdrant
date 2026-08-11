@@ -20,15 +20,13 @@ use fs_err::File;
 pub trait EncodedStorage {
     fn get_vector_data(&self, index: PointOffsetType) -> Cow<'_, [u8]>;
 
-    fn iter_batch(
+    fn get_vector_data_opt(&self, index: PointOffsetType) -> Option<Cow<'_, [u8]>>;
+
+    fn for_each_batch(
         &self,
         offsets: &[PointOffsetType],
-    ) -> impl Iterator<Item = (usize, Cow<'_, [u8]>)> {
-        offsets
-            .iter()
-            .map(move |&offset| self.get_vector_data(offset))
-            .enumerate()
-    }
+        callback: impl FnMut(usize, Cow<'_, [u8]>),
+    );
 
     fn is_in_ram_or_mmap() -> bool;
     fn is_on_disk(&self) -> bool;
@@ -51,6 +49,16 @@ pub trait EncodedStorage {
     /// Additional heap memory used by this storage beyond what's tracked in files.
     /// RAM-based storages should report their in-memory data size here.
     fn heap_size_bytes(&self) -> usize;
+}
+
+pub fn default_for_each_batch<E: EncodedStorage + ?Sized>(
+    this: &E,
+    offsets: &[u32],
+    mut callback: impl FnMut(usize, Cow<'_, [u8]>),
+) {
+    for (index, &offset) in offsets.iter().enumerate() {
+        callback(index, this.get_vector_data(offset));
+    }
 }
 
 pub trait EncodedStorageBuilder {
@@ -136,6 +144,11 @@ impl TestEncodedStorage {
 #[cfg(feature = "testing")]
 impl EncodedStorage for TestEncodedStorage {
     fn get_vector_data(&self, index: PointOffsetType) -> Cow<'_, [u8]> {
+        self.get_vector_data_opt(index)
+            .unwrap_or(Cow::Borrowed(&[]))
+    }
+
+    fn get_vector_data_opt(&self, index: PointOffsetType) -> Option<Cow<'_, [u8]>> {
         let start = self
             .quantized_vector_size
             .get()
@@ -145,7 +158,15 @@ impl EncodedStorage for TestEncodedStorage {
             .get()
             .saturating_mul(index as usize + 1);
 
-        Cow::Borrowed(self.data.get(start..end).unwrap_or(&[]))
+        Some(Cow::Borrowed(self.data.get(start..end)?))
+    }
+
+    fn for_each_batch(
+        &self,
+        offsets: &[PointOffsetType],
+        callback: impl FnMut(usize, Cow<'_, [u8]>),
+    ) {
+        default_for_each_batch(self, offsets, callback);
     }
 
     fn upsert_vector(

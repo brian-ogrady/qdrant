@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -7,7 +11,7 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::flags::FeatureFlags;
 use common::progress_tracker::ProgressTracker;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use rand::prelude::StdRng;
+use rand::prelude::SmallRng;
 use rand::{Rng, SeedableRng};
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_multi_vector};
 use segment::entry::entry_point::SegmentEntry;
@@ -34,7 +38,7 @@ const TOP: usize = 10;
 // intent: bench `search` without filter
 fn multi_vector_search_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("multi-vector-search-group");
-    let mut rnd = StdRng::seed_from_u64(42);
+    let mut rnd = SmallRng::seed_from_u64(42);
 
     let hnsw_index = make_segment_index(&mut rnd, Dot);
     group.bench_function("hnsw-multivec-search-dot", |b| {
@@ -91,7 +95,7 @@ fn make_segment_index<R: Rng + ?Sized>(rng: &mut R, distance: Distance) -> HNSWI
 
     let hw_counter = HardwareCounterCell::new();
 
-    let mut segment = build_segment(segment_dir.path(), &segment_config, None, true).unwrap();
+    let (mut segment, _) = build_segment(segment_dir.path(), &segment_config, None, true).unwrap();
     for n in 0..NUM_POINTS {
         let idx = (n as u64).into();
         let multi_vec = random_multi_vector(rng, VECTOR_DIM, NUM_VECTORS_PER_POINT);
@@ -103,6 +107,7 @@ fn make_segment_index<R: Rng + ?Sized>(rng: &mut R, distance: Distance) -> HNSWI
 
     // build HNSW index
     let hnsw_config = HnswConfig {
+        memory: None,
         m: 8,
         ef_construct: 16,
         full_scan_threshold: 10, // low value to trigger index usage by default

@@ -10,18 +10,45 @@ use sparse::common::types::DimId;
 use sparse::index::inverted_index::InvertedIndex;
 
 use super::SparseVectorIndex;
-use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
+use crate::common::operation_error::{OperationError, OperationResult};
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::query_context::VectorQueryContext;
-use crate::data_types::vectors::{QueryVector, VectorInternal, VectorRef};
+use crate::data_types::vectors::{QueryVector, VectorRef};
 use crate::id_tracker::IdTrackerRead;
 use crate::index::sparse_index::indices_tracker::IndicesTracker;
 use crate::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use crate::index::{VectorIndex, VectorIndexRead};
 use crate::telemetry::VectorIndexSearchesTelemetry;
 use crate::types::{Filter, SearchParams};
-use crate::vector_storage::query::TransformInto;
+use crate::vector_storage::sparse::StoredSparseVector;
 use crate::vector_storage::{VectorStorage, VectorStorageRead};
+
+impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
+    /// Plain (full-scan) sparse search over a set of pre-filtered points.
+    ///
+    /// Thin wrapper that drives the shared [`SparseVectorIndexReadView`]; kept on
+    /// the index for benches and other direct callers.
+    ///
+    /// [`SparseVectorIndexReadView`]: super::read_view::SparseVectorIndexReadView
+    pub fn search_plain(
+        &self,
+        sparse_vector: &SparseVector,
+        filter: &Filter,
+        top: usize,
+        prefiltered_points: &mut Option<Vec<PointOffsetType>>,
+        vector_query_context: &VectorQueryContext,
+    ) -> OperationResult<Vec<ScoredPointOffset>> {
+        self.with_view(|view| {
+            view.search_plain(
+                sparse_vector,
+                filter,
+                top,
+                prefiltered_points,
+                vector_query_context,
+            )
+        })
+    }
+}
 
 impl<TInvertedIndex: InvertedIndex> VectorIndexRead for SparseVectorIndex<TInvertedIndex> {
     fn search(
@@ -32,62 +59,29 @@ impl<TInvertedIndex: InvertedIndex> VectorIndexRead for SparseVectorIndex<TInver
         _params: Option<&SearchParams>,
         query_context: &VectorQueryContext,
     ) -> OperationResult<Vec<Vec<ScoredPointOffset>>> {
-        let mut results = Vec::with_capacity(vectors.len());
-        let mut prefiltered_points = None;
-
-        for vector in vectors {
-            check_process_stopped(&query_context.is_stopped())?;
-
-            let search_results = if query_context.is_require_idf() {
-                let vector = (*vector).clone().transform(|mut vector| {
-                    match &mut vector {
-                        VectorInternal::Dense(_) | VectorInternal::MultiDense(_) => {
-                            return Err(OperationError::WrongSparse);
-                        }
-                        VectorInternal::Sparse(sparse) => {
-                            query_context.remap_idf_weights(&sparse.indices, &mut sparse.values)
-                        }
-                    }
-
-                    Ok(vector)
-                })?;
-
-                self.search_query(&vector, filter, top, &mut prefiltered_points, query_context)?
-            } else {
-                self.search_query(vector, filter, top, &mut prefiltered_points, query_context)?
-            };
-
-            results.push(search_results);
-        }
-        Ok(results)
+        self.with_view(|view| view.search(vectors, filter, top, query_context))
     }
 
     fn get_telemetry_data(&self, detail: TelemetryDetail) -> VectorIndexSearchesTelemetry {
-        self.searches_telemetry.get_telemetry_data(detail)
+        self.with_view(|view| view.get_telemetry_data(detail))
     }
 
     fn indexed_vector_count(&self) -> usize {
-        self.inverted_index.vector_count()
+        self.with_view(|view| view.indexed_vector_count())
     }
 
     fn size_of_searchable_vectors_in_bytes(&self) -> usize {
-        self.inverted_index.total_sparse_vectors_size()
+        self.with_view(|view| view.size_of_searchable_vectors_in_bytes())
     }
 
-    /// Update statistics for idf-dot similarity.
     fn fill_idf_statistics(
         &self,
         idf: &mut HashMap<DimId, usize>,
+        corpus: Option<&Filter>,
+        is_stopped: &std::sync::atomic::AtomicBool,
         hw_counter: &HardwareCounterCell,
-    ) -> OperationResult<()> {
-        for (dim_id, count) in idf.iter_mut() {
-            if let Some(remapped_dim_id) = self.indices_tracker.remap_index(*dim_id) {
-                *count += self
-                    .inverted_index
-                    .posting_list_len(remapped_dim_id, hw_counter)?;
-            }
-        }
-        Ok(())
+    ) -> OperationResult<usize> {
+        self.with_view(|view| view.fill_idf_statistics(idf, corpus, is_stopped, hw_counter))
     }
 
     fn is_index(&self) -> bool {
@@ -195,5 +189,20 @@ impl<TInvertedIndex: InvertedIndex> VectorIndex for SparseVectorIndex<TInvertedI
         }
 
         Ok(())
+    }
+
+    fn update_vector_raw(
+        &mut self,
+        id: PointOffsetType,
+        vector: Option<&[u8]>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        // The raw form is the lossless `StoredSparseVector` encoding; the
+        // inverted index needs the decoded values anyway, so decode and
+        // delegate to the regular path.
+        let sparse = vector
+            .map(StoredSparseVector::decode_untrusted_bytes)
+            .transpose()?;
+        self.update_vector(id, sparse.as_ref().map(VectorRef::from), hw_counter)
     }
 }

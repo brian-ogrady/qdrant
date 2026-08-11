@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
+use common::condition_checker::ConditionChecker;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use segment::fixtures::payload_context_fixture::create_id_tracker_fixture;
-use segment::index::struct_payload_index::StructPayloadIndex;
+use segment::index::struct_payload_index::{IndexLoadMode, StorageType, StructPayloadIndex};
 use segment::index::{PayloadIndex, PayloadIndexRead};
 use segment::json_path::JsonPath;
 use segment::payload_json;
@@ -78,8 +79,8 @@ fn test_filtering_context_consistency() {
         id_tracker,
         HashMap::new(),
         dir.path(),
-        true,
-        true,
+        StorageType::Appendable,
+        IndexLoadMode::CreateIfMissing,
     )
     .unwrap();
 
@@ -150,7 +151,7 @@ fn test_filtering_context_consistency() {
                 .unwrap();
             let filter_context = v.filter_context(&nested_filter_0, &hw_counter).unwrap();
             let check_res0: Vec<_> = (0..NUM_POINTS as PointOffsetType)
-                .filter(|point_id| filter_context.check(*point_id as PointOffsetType))
+                .filter(|point_id| filter_context.check(*point_id as PointOffsetType).unwrap())
                 .collect();
             (res0, check_res0)
         });
@@ -191,7 +192,7 @@ fn test_filtering_context_consistency() {
                 .unwrap();
             let filter_context = v.filter_context(&nested_filter_1, &hw_counter).unwrap();
             let check_res1: Vec<_> = (0..NUM_POINTS as PointOffsetType)
-                .filter(|point_id| filter_context.check(*point_id as PointOffsetType))
+                .filter(|point_id| filter_context.check(*point_id as PointOffsetType).unwrap())
                 .collect();
             (res1, check_res1)
         });
@@ -229,7 +230,7 @@ fn test_filtering_context_consistency() {
                 .unwrap();
             let filter_context = v.filter_context(&nested_filter_2, &hw_counter).unwrap();
             let check_res2: Vec<_> = (0..NUM_POINTS as PointOffsetType)
-                .filter(|point_id| filter_context.check(*point_id as PointOffsetType))
+                .filter(|point_id| filter_context.check(*point_id as PointOffsetType).unwrap())
                 .collect();
             (res2, check_res2)
         });
@@ -277,7 +278,7 @@ fn test_filtering_context_consistency() {
                 .unwrap();
             let filter_context = v.filter_context(&nested_filter_3, &hw_counter).unwrap();
             let check_res3: Vec<_> = (0..NUM_POINTS as PointOffsetType)
-                .filter(|point_id| filter_context.check(*point_id as PointOffsetType))
+                .filter(|point_id| filter_context.check(*point_id as PointOffsetType).unwrap())
                 .collect();
             (res3, check_res3)
         });

@@ -8,9 +8,9 @@ use common::types::{PointOffsetType, ScoreType};
 use zerocopy::FromBytes;
 
 use crate::data_types::primitive::PrimitiveVectorElement;
-use crate::data_types::vectors::DenseVector;
+use crate::data_types::vectors::{DenseVector, TypedDenseVector};
 use crate::spaces::metric::Metric;
-use crate::vector_storage::DenseVectorStorage;
+use crate::vector_storage::DenseVectorStorageRead;
 use crate::vector_storage::query::{Query, TransformInto};
 use crate::vector_storage::query_scorer::QueryScorer;
 
@@ -18,8 +18,8 @@ pub struct CustomQueryScorer<
     'a,
     TElement: PrimitiveVectorElement,
     TMetric: Metric<TElement>,
-    TVectorStorage: DenseVectorStorage<TElement>,
-    TStoredQuery: Query<TElement::QueryType>,
+    TVectorStorage: DenseVectorStorageRead<TElement>,
+    TStoredQuery: Query<TypedDenseVector<TElement>>,
 > {
     vector_storage: &'a TVectorStorage,
     query: TStoredQuery,
@@ -32,8 +32,8 @@ impl<
     'a,
     TElement: PrimitiveVectorElement,
     TMetric: Metric<TElement>,
-    TVectorStorage: DenseVectorStorage<TElement>,
-    TStoredQuery: Query<TElement::QueryType>,
+    TVectorStorage: DenseVectorStorageRead<TElement>,
+    TStoredQuery: Query<TypedDenseVector<TElement>>,
 > CustomQueryScorer<'a, TElement, TMetric, TVectorStorage, TStoredQuery>
 {
     pub fn new<TInputQuery>(
@@ -42,20 +42,19 @@ impl<
         mut hardware_counter: HardwareCounterCell,
     ) -> Self
     where
-        TInputQuery:
-            Query<DenseVector> + TransformInto<TStoredQuery, DenseVector, TElement::QueryType>,
+        TInputQuery: Query<DenseVector>
+            + TransformInto<TStoredQuery, DenseVector, TypedDenseVector<TElement>>,
     {
-        let mut dim = 0;
         let query = query
-            .transform(|vector| {
-                dim = vector.len();
+            .transform(&|vector| {
                 let preprocessed_vector = TMetric::preprocess(vector);
-                Ok(TElement::query_from_float_cow(Cow::from(
-                    preprocessed_vector,
+                Ok(TypedDenseVector::from(TElement::slice_from_float_cow(
+                    Cow::from(preprocessed_vector),
                 )))
             })
             .unwrap();
 
+        let dim = vector_storage.vector_dim();
         hardware_counter.set_cpu_multiplier(dim * size_of::<TElement>());
         if vector_storage.is_on_disk() {
             hardware_counter.set_vector_io_read_multiplier(dim * size_of::<TElement>());
@@ -71,17 +70,28 @@ impl<
             hardware_counter,
         }
     }
+
+    /// Score the query against an explicit vector (not one stored in the
+    /// storage). Used internally by `score_stored`/`score_stored_batch`/
+    /// [`QueryScorer::score_bytes`].
+    #[inline]
+    fn score(&self, against: &[TElement]) -> ScoreType {
+        let cpu_counter = self.hardware_counter.cpu_counter();
+
+        self.query.score_by(|example| {
+            cpu_counter.incr();
+            TMetric::similarity(example, against)
+        })
+    }
 }
 
 impl<
     TElement: PrimitiveVectorElement,
     TMetric: Metric<TElement>,
-    TVectorStorage: DenseVectorStorage<TElement>,
-    TStoredQuery: Query<TElement::QueryType>,
+    TVectorStorage: DenseVectorStorageRead<TElement>,
+    TStoredQuery: Query<TypedDenseVector<TElement>>,
 > QueryScorer for CustomQueryScorer<'_, TElement, TMetric, TVectorStorage, TStoredQuery>
 {
-    type TVector = [TElement];
-
     #[inline]
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
         let stored = self.vector_storage.get_dense::<Random>(idx);
@@ -97,17 +107,8 @@ impl<
         self.hardware_counter.vector_io_read().incr_delta(ids.len());
 
         self.vector_storage
-            .for_each_in_dense_batch(ids, |idx, vector| scores[idx] = self.score(vector));
-    }
-
-    #[inline]
-    fn score(&self, against: &[TElement]) -> ScoreType {
-        let cpu_counter = self.hardware_counter.cpu_counter();
-
-        self.query.score_by(|example| {
-            cpu_counter.incr();
-            TMetric::query_similarity(example, against)
-        })
+            .for_each_in_dense_batch(ids, |idx, vector| scores[idx] = self.score(vector))
+            .expect("read vectors");
     }
 
     fn score_internal(&self, _point_a: PointOffsetType, _point_b: PointOffsetType) -> ScoreType {

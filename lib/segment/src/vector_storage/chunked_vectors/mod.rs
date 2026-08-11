@@ -1,10 +1,61 @@
+//! Fixed-dimension vectors stored flattened across a directory of
+//! equally-sized chunk files.
+//!
+//! The directory holds a config file, a status file carrying the vector count,
+//! and `chunk_<n>.mmap` files preallocated to the configured chunk size. A
+//! vector never straddles a chunk boundary.
+//!
+//! Two types share that layout:
+//!
+//! - [`ChunkedVectors`] — the writable storage. Its impls are split across
+//!   [`lifecycle`] (open, config creation, flush) and [`write_ops`] (insert,
+//!   push).
+//! - [`read_only::ReadOnlyChunkedVectors`] — the read-only view, which
+//!   [`ChunkedVectors`] wraps and derefs to for every read.
+//!
+//! [`chunks`] and [`config`] hold what both sides need: the chunk files and
+//! the on-disk metadata files respectively.
+
 mod chunks;
 mod config;
-mod read;
-mod write;
+mod lifecycle;
+pub mod read_only;
+mod write_ops;
 
-pub use read::ChunkedVectorsRead;
-pub use write::ChunkedVectors;
+use std::ops::Deref;
+
+use common::universal_io::{StoredStruct, UniversalWrite};
+
+use self::config::Status;
+use self::read_only::ReadOnlyChunkedVectors;
+
+/// Writable chunked vectors.
+///
+/// Wraps the read-only view — every read goes through the [`Deref`] — and adds
+/// the writable status mapping, so appends update the stored vector count in
+/// the same place they extend the chunks.
+#[derive(Debug)]
+pub struct ChunkedVectors<T, S>
+where
+    T: bytemuck::Pod + Send,
+    S: UniversalWrite + Send + 'static,
+{
+    inner: ReadOnlyChunkedVectors<T, S>,
+    status: StoredStruct<S, Status>,
+    fs: S::Fs,
+}
+
+impl<T, S> Deref for ChunkedVectors<T, S>
+where
+    T: bytemuck::Pod + Send,
+    S: UniversalWrite + Send + 'static,
+{
+    type Target = ReadOnlyChunkedVectors<T, S>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -12,7 +63,7 @@ mod tests {
 
     use common::counter::hardware_counter::HardwareCounterCell;
     use common::mmap::AdviceSetting;
-    use common::universal_io::{MmapFile, MmapFs};
+    use common::universal_io::{MmapFile, MmapFs, Populate};
     use rand::SeedableRng;
     use rand::prelude::StdRng;
     use tempfile::Builder;
@@ -36,8 +87,14 @@ mod tests {
 
         {
             let mut chunked_mmap: ChunkedVectors<VectorElementType, MmapFile> =
-                ChunkedVectors::open(MmapFs, dir.path(), dim, AdviceSetting::Global, Some(true))
-                    .unwrap();
+                ChunkedVectors::open(
+                    MmapFs,
+                    dir.path(),
+                    dim,
+                    AdviceSetting::Global,
+                    Populate::Blocking,
+                )
+                .unwrap();
 
             for vec in &vectors {
                 chunked_mmap.push(vec, &hw_counter).unwrap();
@@ -46,12 +103,15 @@ mod tests {
             let random_offset = 666;
             let batch_size = 10;
 
-            let batch_ids = (random_offset..random_offset + batch_size).collect::<Vec<_>>();
+            let batch_ids = (random_offset as u32..random_offset as u32 + batch_size as u32)
+                .collect::<Vec<_>>();
             let mut vectors_buffer = Vec::with_capacity(batch_size);
-            chunked_mmap.for_each_in_batch(&batch_ids, |i, vec| {
-                assert_eq!(i, vectors_buffer.len());
-                vectors_buffer.push(vec.to_vec());
-            });
+            chunked_mmap
+                .for_each_in_batch(&batch_ids, |i, vec| {
+                    assert_eq!(i, vectors_buffer.len());
+                    vectors_buffer.push(vec.to_vec());
+                })
+                .unwrap();
 
             for (i, (vec, loaded_vec)) in zip(
                 &vectors[random_offset..random_offset + batch_size],

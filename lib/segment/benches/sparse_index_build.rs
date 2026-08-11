@@ -8,10 +8,11 @@ use std::sync::atomic::AtomicBool;
 use atomic_refcell::AtomicRefCell;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
+use common::universal_io::MmapFs;
 use criterion::{Criterion, criterion_group, criterion_main};
 use half::f16;
 use rand::SeedableRng;
-use rand::rngs::StdRng;
+use rand::rngs::SmallRng;
 use segment::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
 use segment::fixtures::payload_context_fixture::create_id_tracker_fixture;
 use segment::index::VectorIndex;
@@ -19,7 +20,7 @@ use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, Spars
 use segment::index::sparse_index::sparse_vector_index::{
     SparseVectorIndex, SparseVectorIndexOpenArgs,
 };
-use segment::index::struct_payload_index::StructPayloadIndex;
+use segment::index::struct_payload_index::{IndexLoadMode, StorageType, StructPayloadIndex};
 use segment::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
 use segment::types::VectorStorageDatatype;
 use segment::vector_storage::sparse::simple_sparse_vector_storage::open_simple_sparse_vector_storage;
@@ -37,7 +38,7 @@ fn sparse_vector_index_build_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("sparse-vector-build-group");
 
     let stopped = AtomicBool::new(false);
-    let mut rnd = StdRng::seed_from_u64(42);
+    let mut rnd = SmallRng::seed_from_u64(42);
 
     let payload_dir = Builder::new().prefix("payload_dir").tempdir().unwrap();
     let storage_dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
@@ -52,8 +53,8 @@ fn sparse_vector_index_build_benchmark(c: &mut Criterion) {
         id_tracker.clone(),
         std::collections::HashMap::new(),
         payload_dir.path(),
-        true,
-        true,
+        StorageType::Appendable,
+        IndexLoadMode::CreateIfMissing,
     )
     .unwrap();
     let wrapped_payload_index = Arc::new(AtomicRefCell::new(payload_index));
@@ -76,6 +77,7 @@ fn sparse_vector_index_build_benchmark(c: &mut Criterion) {
         Some(10_000),
         SparseIndexType::MutableRam,
         Some(VectorStorageDatatype::Float32),
+        None,
     );
 
     let vector_storage = Arc::new(AtomicRefCell::new(vector_storage));
@@ -85,6 +87,7 @@ fn sparse_vector_index_build_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let sparse_vector_index: SparseVectorIndex<InvertedIndexRam> =
                 SparseVectorIndex::open(SparseVectorIndexOpenArgs {
+                    fs: &MmapFs,
                     config: index_config,
                     id_tracker: id_tracker.clone(),
                     vector_storage: vector_storage.clone(),
@@ -101,6 +104,7 @@ fn sparse_vector_index_build_benchmark(c: &mut Criterion) {
     // build once to reuse in mmap conversion benchmark
     let sparse_vector_index: SparseVectorIndex<InvertedIndexRam> =
         SparseVectorIndex::open(SparseVectorIndexOpenArgs {
+            fs: &MmapFs,
             config: index_config,
             id_tracker,
             vector_storage,
@@ -116,6 +120,7 @@ fn sparse_vector_index_build_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let mmap_index_dir = Builder::new().prefix("mmap_index_dir").tempdir().unwrap();
             let mmap_inverted_index = InvertedIndexCompressedMmap::<f32>::from_ram_index(
+                &MmapFs,
                 Cow::Borrowed(sparse_vector_index.inverted_index()),
                 &mmap_index_dir,
             )
@@ -128,6 +133,7 @@ fn sparse_vector_index_build_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let mmap_index_dir = Builder::new().prefix("mmap_index_dir").tempdir().unwrap();
             let mmap_inverted_index = InvertedIndexCompressedMmap::<f16>::from_ram_index(
+                &MmapFs,
                 Cow::Borrowed(sparse_vector_index.inverted_index()),
                 &mmap_index_dir,
             )

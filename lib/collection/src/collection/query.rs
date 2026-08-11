@@ -16,13 +16,14 @@ use tokio::time::Instant;
 use super::Collection;
 use crate::collection::mmr::mmr_from_points_with_vector;
 use crate::collection_manager::probabilistic_search_sampling::find_search_sampling_over_point_distribution;
-use crate::common::batching::batch_requests;
+use crate::common::batching::{batch_requests, empty_batch_results};
 use crate::common::fetch_vectors::{
     build_vector_resolver_queries, resolve_referenced_vectors_batch,
 };
 use crate::common::retrieve_request_trait::RetrieveRequest;
 use crate::common::transpose_iterator::transposed_iter;
 use crate::operations::consistency_params::ReadConsistency;
+use crate::operations::routing::RoutingToken;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::{CollectionError, CollectionResult};
 use crate::operations::universal_query::collection_query::CollectionQueryRequest;
@@ -46,6 +47,7 @@ impl Collection {
         &self,
         request: ShardQueryRequest,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -57,6 +59,7 @@ impl Collection {
             .do_query_batch(
                 vec![request],
                 read_consistency,
+                routing_token,
                 shard_selection,
                 timeout,
                 hw_measurement_acc,
@@ -147,6 +150,7 @@ impl Collection {
         &self,
         batch_request: Arc<Vec<ShardQueryRequest>>,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -178,6 +182,7 @@ impl Collection {
                 .query_batch(
                     request_clone,
                     read_consistency,
+                    routing_token,
                     shard_selection.is_shard_id(),
                     timeout,
                     hw_measurement_acc.clone(),
@@ -203,6 +208,7 @@ impl Collection {
         &self,
         requests_batch: Vec<ShardQueryRequest>,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -211,7 +217,7 @@ impl Collection {
 
         // shortcuts batch if all requests with limit=0
         if requests_batch.iter().all(|s| s.limit == 0) {
-            return Ok(vec![]);
+            return Ok(empty_batch_results(requests_batch.len()));
         }
 
         let is_payload_required = requests_batch.iter().all(|s| s.with_payload.is_required());
@@ -256,6 +262,7 @@ impl Collection {
                 .do_query_batch_impl(
                     without_payload_batch,
                     read_consistency,
+                    routing_token,
                     &shard_selection,
                     timeout,
                     hw_measurement_acc.clone(),
@@ -270,6 +277,7 @@ impl Collection {
                         Some(req.with_payload),
                         req.with_vector,
                         read_consistency,
+                        routing_token,
                         &shard_selection,
                         timeout,
                         hw_measurement_acc.clone(),
@@ -281,6 +289,7 @@ impl Collection {
             self.do_query_batch_impl(
                 requests_batch,
                 read_consistency,
+                routing_token,
                 &shard_selection,
                 timeout,
                 hw_measurement_acc.clone(),
@@ -294,6 +303,7 @@ impl Collection {
         &self,
         requests_batch: Vec<ShardQueryRequest>,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
@@ -306,6 +316,7 @@ impl Collection {
             .batch_query_shards_concurrently(
                 requests_batch.clone(),
                 read_consistency,
+                routing_token,
                 shard_selection,
                 timeout,
                 hw_measurement_acc.clone(),
@@ -447,6 +458,7 @@ impl Collection {
         requests_batch: Vec<(CollectionQueryRequest, ShardSelectorInternal)>,
         collection_by_name: F,
         read_consistency: Option<ReadConsistency>,
+        routing_token: Option<RoutingToken>,
         timeout: Option<Duration>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>>
@@ -465,6 +477,7 @@ impl Collection {
             self,
             collection_by_name,
             read_consistency,
+            routing_token,
             timeout,
             hw_measurement_acc.clone(),
         )
@@ -507,6 +520,7 @@ impl Collection {
                 futures.push(self.do_query_batch(
                     shard_requests,
                     read_consistency,
+                    routing_token,
                     shard_selection,
                     timeout,
                     hw_measurement_acc.clone(),
@@ -543,6 +557,8 @@ impl Collection {
         let all_shards_results = self
             .batch_query_shards_concurrently(
                 Arc::clone(&requests_arc),
+                None,
+                // Internal node-to-node call: routing was already resolved by the coordinator.
                 None,
                 shard_selection,
                 timeout,

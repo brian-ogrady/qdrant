@@ -14,12 +14,13 @@ use crate::data_types::vectors::{
 use crate::fixtures::payload_context_fixture::create_id_tracker_fixture;
 use crate::id_tracker::IdTrackerRead;
 use crate::index::hnsw_index::point_scorer::BatchFilteredSearcher;
+use crate::segment_constructor::batched_reader::merge_from_single_source;
 use crate::types::{Distance, MultiVectorConfig};
 use crate::vector_storage::common::CHUNK_SIZE;
 use crate::vector_storage::multi_dense::appendable_mmap_multi_dense_vector_storage::open_appendable_memmap_multi_vector_storage_full;
 use crate::vector_storage::multi_dense::volatile_multi_dense_vector_storage::new_volatile_multi_dense_vector_storage;
 use crate::vector_storage::{
-    DEFAULT_STOPPED, MultiVectorStorage, VectorStorage, VectorStorageEnum, VectorStorageRead,
+    DEFAULT_STOPPED, MultiVectorStorageRead, VectorStorage, VectorStorageEnum, VectorStorageRead,
 };
 
 #[derive(Clone, Copy)]
@@ -83,7 +84,11 @@ fn do_test_delete_points(vector_dim: usize, vec_count: usize, storage: &mut Vect
             | VectorStorageEnum::DenseUringHalf(_) => unreachable!(),
             VectorStorageEnum::DenseAppendableMemmap(_)
             | VectorStorageEnum::DenseAppendableMemmapByte(_)
-            | VectorStorageEnum::DenseAppendableMemmapHalf(_) => unreachable!(),
+            | VectorStorageEnum::DenseAppendableMemmapHalf(_)
+            | VectorStorageEnum::DenseTurboMemmap(_)
+            | VectorStorageEnum::DenseTurboAppendableMemmap(_) => unreachable!(),
+            #[cfg(target_os = "linux")]
+            VectorStorageEnum::DenseTurboUring(_) => unreachable!(),
             VectorStorageEnum::SparseMmap(_) => unreachable!(),
             #[cfg(test)]
             VectorStorageEnum::SparseVolatile(_) => unreachable!(),
@@ -100,7 +105,8 @@ fn do_test_delete_points(vector_dim: usize, vec_count: usize, storage: &mut Vect
                 }
             }
             VectorStorageEnum::MultiDenseAppendableMemmapByte(_)
-            | VectorStorageEnum::MultiDenseAppendableMemmapHalf(_) => unreachable!(),
+            | VectorStorageEnum::MultiDenseAppendableMemmapHalf(_)
+            | VectorStorageEnum::MultiDenseTurbo(_) => unreachable!(),
             VectorStorageEnum::EmptyDense(_) | VectorStorageEnum::EmptySparse(_) => {
                 unreachable!()
             }
@@ -113,7 +119,8 @@ fn do_test_delete_points(vector_dim: usize, vec_count: usize, storage: &mut Vect
         .enumerate()
         .filter(|(_, d)| *d)
         .for_each(|(i, _)| {
-            storage.delete_vector(i as PointOffsetType).unwrap();
+            let was_deleted = storage.delete_vector(i as PointOffsetType).unwrap();
+            assert!(was_deleted, "deleting a live vector must return true");
         });
     assert_eq!(
         storage.deleted_vector_count(),
@@ -139,8 +146,14 @@ fn do_test_delete_points(vector_dim: usize, vec_count: usize, storage: &mut Vect
     assert_eq!(closest[2].idx, 0);
 
     // Delete 1, redelete 2
-    storage.delete_vector(1 as PointOffsetType).unwrap();
-    storage.delete_vector(2 as PointOffsetType).unwrap();
+    assert!(
+        storage.delete_vector(1 as PointOffsetType).unwrap(),
+        "deleting a live vector must return true"
+    );
+    assert!(
+        !storage.delete_vector(2 as PointOffsetType).unwrap(),
+        "redeleting a deleted vector must return false"
+    );
     assert_eq!(
         storage.deleted_vector_count(),
         3,
@@ -165,8 +178,8 @@ fn do_test_delete_points(vector_dim: usize, vec_count: usize, storage: &mut Vect
     assert_eq!(closest[1].idx, 0);
 
     // Delete all
-    storage.delete_vector(0 as PointOffsetType).unwrap();
-    storage.delete_vector(4 as PointOffsetType).unwrap();
+    assert!(storage.delete_vector(0 as PointOffsetType).unwrap());
+    assert!(storage.delete_vector(4 as PointOffsetType).unwrap());
     assert_eq!(
         storage.deleted_vector_count(),
         5,
@@ -218,13 +231,7 @@ fn do_test_update_from_delete_points(
                 }
             });
         }
-        let mut iter = (0..points.len()).map(|i| {
-            let i = i as PointOffsetType;
-            let vec = storage2.get_vector::<Random>(i);
-            let deleted = storage2.is_deleted_vector(i);
-            (vec, deleted)
-        });
-        storage.update_from(&mut iter, &Default::default()).unwrap();
+        merge_from_single_source(storage, &storage2, points.len() as PointOffsetType).unwrap();
     }
 
     assert_eq!(

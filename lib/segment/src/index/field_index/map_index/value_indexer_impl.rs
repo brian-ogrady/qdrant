@@ -1,7 +1,7 @@
+use blobstore::Blob;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use common::universal_io::UniversalRead;
-use gridstore::Blob;
 use serde_json::{Number, Value};
 use uuid::Uuid;
 
@@ -30,8 +30,8 @@ impl ValueIndexer for MapIndex<str> {
             MapIndex::Immutable(_) => Err(OperationError::service_error(
                 "Can't add values to immutable map index",
             )),
-            MapIndex::Mmap(_) => Err(OperationError::service_error(
-                "Can't add values to mmap map index",
+            MapIndex::OnDisk(_) => Err(OperationError::service_error(
+                "Can't add values to on-disk map index",
             )),
         }
     }
@@ -62,7 +62,7 @@ impl ValueIndexer for MapIndex<IntPayloadType> {
             MapIndex::Immutable(_) => Err(OperationError::service_error(
                 "Can't add values to immutable map index",
             )),
-            MapIndex::Mmap(_) => Err(OperationError::service_error(
+            MapIndex::OnDisk(_) => Err(OperationError::service_error(
                 "Can't add values to mmap map index",
             )),
         }
@@ -91,7 +91,7 @@ impl ValueIndexer for MapIndex<UuidIntType> {
             MapIndex::Immutable(_) => Err(OperationError::service_error(
                 "Can't add values to immutable map index",
             )),
-            MapIndex::Mmap(_) => Err(OperationError::service_error(
+            MapIndex::OnDisk(_) => Err(OperationError::service_error(
                 "Can't add values to mmap map index",
             )),
         }
@@ -179,7 +179,7 @@ where
 // Shared per-K bodies, parameterized over `T: MapIndexRead<N>` so a single
 // implementation serves both `MapIndex<N>` and `ReadOnlyMapIndex<N, S>`.
 
-fn value_retriever_str<'a, T: MapIndexRead<str> + 'a>(
+fn value_retriever_str<'a, T: MapIndexRead<'a, str> + 'a>(
     index: &'a T,
     hw_counter: &'a HardwareCounterCell,
 ) -> VariableRetrieverFn<'a> {
@@ -193,7 +193,7 @@ fn value_retriever_str<'a, T: MapIndexRead<str> + 'a>(
     })
 }
 
-fn value_retriever_int<'a, T: MapIndexRead<IntPayloadType> + 'a>(
+fn value_retriever_int<'a, T: MapIndexRead<'a, IntPayloadType> + 'a>(
     index: &'a T,
     hw_counter: &'a HardwareCounterCell,
 ) -> VariableRetrieverFn<'a> {
@@ -207,7 +207,7 @@ fn value_retriever_int<'a, T: MapIndexRead<IntPayloadType> + 'a>(
     })
 }
 
-fn value_retriever_uuid<'a, T: MapIndexRead<UuidIntType> + 'a>(
+fn value_retriever_uuid<'a, T: MapIndexRead<'a, UuidIntType> + 'a>(
     index: &'a T,
     hw_counter: &'a HardwareCounterCell,
 ) -> VariableRetrieverFn<'a> {

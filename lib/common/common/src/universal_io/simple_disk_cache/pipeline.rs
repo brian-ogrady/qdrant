@@ -1,32 +1,49 @@
 use std::cell::OnceCell;
+use std::collections::VecDeque;
 use std::ops::Range;
+
+use slab::Slab;
 
 use crate::ext::aligned_vec::ACow;
 use crate::generic_consts::{AccessPattern, Random, Sequential};
 use crate::universal_io::simple_disk_cache::local_state::LocalState;
 use crate::universal_io::simple_disk_cache::{
-    BLOCK_SIZE, DiskCache, DiskCacheRemote, to_block_range,
+    DiskCache, DiskCacheRemote, block_aligned_fetch, to_block_range,
 };
-use crate::universal_io::traits::BorrowedReadPipeline;
-use crate::universal_io::{
-    self, OwnedReadPipeline, Result, UniversalIoError, UniversalRead, UserData,
-};
+use crate::universal_io::{ReadPipeline, UioResult, UniversalIoError, UniversalRead, UserData};
 
-struct RemoteMeta<File, U> {
-    file: File,
-    scheduled_read: ScheduledRead,
-    user_data: U,
+#[cfg(target_os = "linux")]
+/// Required alignment when using io_uring with `O_DIRECT` on Linux
+pub(super) const REMOTE_READ_ALIGNMENT: usize = crate::universal_io::io_uring::KERNEL_PAGE_SIZE;
+
+#[cfg(not(target_os = "linux"))]
+/// Default alignment on non-Linux platforms
+pub(super) const REMOTE_READ_ALIGNMENT: usize = 1;
+
+/// A remote fetch in flight: which file and blocks it covers, and every
+/// scheduled read waiting on it — the read that triggered the fetch, plus any
+/// later reads whose blocks it fully covers. See [`DiskCachePipeline::schedule`].
+///
+/// Lives in `DiskCachePipeline::in_flight`, keyed by its slab slot, which
+/// also serves as the fetch's user data on the remote pipeline.
+struct InFlightFetch<'file, R, U>
+where
+    R: UniversalRead + 'static,
+{
+    /// Identifies which file this fetch belongs to. Matched by reference
+    /// identity (see `schedule`'s piggyback check): sound because `DiskCache`
+    /// isn't `Clone`, and `'file` pins the borrow for the pipeline's lifetime,
+    /// so two live `&'file DiskCache<R>` referring to the same logical file
+    /// are guaranteed to be the same reference.
+    file: &'file DiskCache<R>,
+    /// Blocks the fetch covers; committed to the local mirror on completion.
+    blocks_range: Range<u32>,
+    /// `(user_data, byte range)` of every read resolved by this fetch; each is
+    /// re-read from the local mirror once the fetch commits. Never empty.
+    reads: Vec<(U, Range<u64>)>,
 }
 
-enum ScheduledRead {
-    Range {
-        blocks_range: Range<u32>,
-        read_range: Range<u64>,
-    },
-    Whole,
-}
-
-/// Outcome of [`plan_schedule`]: either the requested range is already available
+/// Outcome of [`pick_source`]: either the requested range is already available
 /// locally (or is empty) and needs no remote work, or a remote read must be
 /// scheduled for `blocks_byte_range` covering `blocks_range`.
 enum Source {
@@ -43,7 +60,7 @@ enum Source {
 /// Decide whether `range` can be answered from local mmap or needs a remote fetch.
 ///
 /// Avoids materializing the local file for empty reads.
-fn pick_source<P>(local: &LocalState, range: Range<u64>) -> Result<Source>
+fn pick_source<P>(local: &LocalState, range: Range<u64>) -> UioResult<Source>
 where
     P: AccessPattern,
 {
@@ -73,11 +90,10 @@ where
         });
     }
 
-    // BLOCK_SIZE aligned, clamped to EOF.
-    let byte_offset = u64::from(blocks_range.start) * BLOCK_SIZE as u64;
-    let fetch_length = blocks_range.len() as u64 * BLOCK_SIZE as u64;
-    let max_length = local.mmap().len::<u8>()?.saturating_sub(byte_offset);
-    let blocks_byte_range = byte_offset..byte_offset + max_length.min(fetch_length);
+    // BLOCK_SIZE aligned, clamped to EOF. `range` is non-empty here, so the
+    // block range is non-empty and `block_aligned_fetch` yields `Some`.
+    let (blocks_range, blocks_byte_range) = block_aligned_fetch(range, local.mmap().len::<u8>()?)
+        .expect("non-empty range has a non-empty block range");
 
     Ok(Source::Remote {
         blocks_range,
@@ -90,20 +106,20 @@ where
 ///
 /// # Safety
 /// `byte_range` must correspond to blocks already known to be local (typically
-/// because [`plan_schedule`] returned [`SchedulePlan::Local`] for it, or
-/// [`complete_remote_read`] just fetched them).
+/// because [`pick_source`] returned [`Source::Local`] for it, or
+/// [`commit_and_read`] just fetched them).
 unsafe fn read_local<R>(
     file: &DiskCache<R>,
     range: Range<u64>,
     is_sequential: bool,
-) -> universal_io::Result<&[u8]>
+) -> UioResult<&[u8]>
 where
     R: DiskCacheRemote,
 {
     if range.is_empty() {
         return Ok(&[]);
     }
-    let local = file.local_state()?;
+    let local = file.state()?.local;
     if is_sequential {
         unsafe { local.read_mmap_bytes::<Sequential>(range) }
     } else {
@@ -111,58 +127,57 @@ where
     }
 }
 
-/// Commit remote-fetched `bytes` into local mmap and re-read the user's slice.
+/// Commit remote-fetched `bytes` into local mmap and resolve every read waiting
+/// on `fetch`, pushing the resulting slices to `results`.
 ///
 /// # Safety
-/// `blocks_range` and `read_range` must correspond to the `bytes` section of the mmap.
-unsafe fn commit_and_read<'a, R>(
-    file: &'a DiskCache<R>,
+/// `bytes` must be the remote content of `fetch.blocks_range` (clamped to EOF),
+/// and every range in `fetch.reads` must be covered by those blocks.
+unsafe fn commit_and_read<'file, R, U>(
+    fetch: InFlightFetch<'file, R, U>,
     bytes: &[u8],
-    scheduled_read: ScheduledRead,
-) -> universal_io::Result<&'a [u8]>
+    results: &mut VecDeque<(U, &'file [u8])>,
+) -> UioResult<()>
 where
     R: DiskCacheRemote,
+    U: UserData,
 {
-    let mut known_len = None;
-    let (blocks_range, read_range) = match scheduled_read {
-        ScheduledRead::Range {
-            blocks_range,
-            read_range,
-        } => (blocks_range, read_range),
-        ScheduledRead::Whole => {
-            // derive whole ranges from the actual bytes returned.
-            let byte_len = bytes.len() as u64;
-            known_len = Some(byte_len);
-            let blocks_range = to_block_range(0..byte_len);
-            (blocks_range, 0..byte_len)
-        }
-    };
+    let InFlightFetch {
+        file,
+        blocks_range,
+        reads,
+    } = fetch;
 
-    let local = if let Some(state) = file.local.get() {
-        state
-    } else {
-        file.init_local_state(true, known_len)?;
-        file.local.get().expect("just initialized")
-    };
+    // The mirror is already materialized: scheduling this remote read went
+    // through `file.state()` (see `schedule`), which forces initialization.
+    let local = file.state()?.local;
 
     unsafe {
         local.write_mmap_bytes(bytes, blocks_range);
-        local.read_mmap_bytes::<Random>(read_range)
+        for (user_data, read_range) in reads {
+            let slice = local.read_mmap_bytes::<Random>(read_range)?;
+            results.push_back((user_data, slice));
+        }
     }
+
+    Ok(())
 }
 
-type BorrowedRemotePipeline<'file, R, U> =
-    <R as UniversalRead>::BorrowedReadPipeline<'file, RemoteMeta<&'file DiskCache<R>, U>>;
+type RemotePipeline<'file, R> = <R as UniversalRead>::ReadPipeline<'file, u64>;
 
 pub struct DiskCachePipeline<'file, R, U>
 where
-    R: UniversalRead,
+    R: UniversalRead + 'static,
     U: UserData,
 {
-    /// Pipeline for queuing remote reads.
-    remote_pipeline: OnceCell<BorrowedRemotePipeline<'file, R, U>>,
-    /// A result of (user_data, bytes)
-    result: Option<(U, &'file [u8])>,
+    /// Pipeline for queuing remote reads. Each read's user data is its
+    /// `in_flight` slot key.
+    remote_pipeline: OnceCell<RemotePipeline<'file, R>>,
+    /// One entry per remote read scheduled and not yet completed, keyed by
+    /// the id passed to the remote pipeline as user data.
+    in_flight: Slab<InFlightFetch<'file, R, U>>,
+    /// Resolved reads, ready to be returned by `wait`.
+    results: VecDeque<(U, &'file [u8])>,
 }
 
 impl<'file, R, U> DiskCachePipeline<'file, R, U>
@@ -170,33 +185,43 @@ where
     R: UniversalRead + 'file,
     U: UserData,
 {
-    fn get_or_init_remote_pipeline(
-        &mut self,
-    ) -> universal_io::Result<&mut BorrowedRemotePipeline<'file, R, U>> {
-        if self.remote_pipeline.get().is_none() {
-            let remote = R::BorrowedReadPipeline::new()?;
-            // We just observed the cell as empty and hold `&mut self`, so set cannot fail.
-            let _ = self.remote_pipeline.set(remote);
+    /// Takes the field instead of `&mut self` so callers can keep disjoint
+    /// borrows of other fields (see the `vacant_entry` in `schedule`).
+    fn get_or_init_remote_pipeline<'a>(
+        remote_pipeline: &'a mut OnceCell<RemotePipeline<'file, R>>,
+    ) -> UioResult<&'a mut RemotePipeline<'file, R>> {
+        if remote_pipeline.get().is_none() {
+            let remote = R::ReadPipeline::new()?;
+            // We just observed the cell as empty and hold `&mut`, so set cannot fail.
+            let _ = remote_pipeline.set(remote);
         }
-        Ok(self.remote_pipeline.get_mut().expect("just initialized"))
+        Ok(remote_pipeline.get_mut().expect("just initialized"))
+    }
+
+    /// Number of remote fetches currently in flight.
+    #[cfg(test)]
+    pub(super) fn in_flight_fetches(&self) -> usize {
+        self.in_flight.len()
     }
 }
 
-impl<'file, R, U> BorrowedReadPipeline<'file, U> for DiskCachePipeline<'file, R, U>
+impl<'file, R, U> ReadPipeline<'file, U> for DiskCachePipeline<'file, R, U>
 where
     R: DiskCacheRemote + 'file,
+    U: UserData,
 {
     type File = DiskCache<R>;
 
-    fn new() -> universal_io::Result<Self> {
+    fn new() -> UioResult<Self> {
         Ok(Self {
             remote_pipeline: OnceCell::new(),
-            result: None,
+            in_flight: Slab::new(),
+            results: VecDeque::new(),
         })
     }
 
     fn can_schedule(&mut self) -> bool {
-        self.result.is_none()
+        self.results.is_empty()
             && self
                 .remote_pipeline
                 .get_mut()
@@ -208,189 +233,113 @@ where
         user_data: U,
         file: &'file DiskCache<R>,
         range: Range<u64>,
-        align: usize,
-    ) -> universal_io::Result<()> {
-        match pick_source::<P>(file.local_state()?, range.clone())? {
+        _align: usize,
+    ) -> UioResult<()> {
+        let state = file.state()?;
+        match pick_source::<P>(state.local, range.clone())? {
             Source::Local {
                 range,
                 is_sequential,
             } => {
                 // SAFETY: Source::Local confirms the range is local (or empty).
                 let bytes = unsafe { read_local::<R>(file, range, is_sequential)? };
-                self.result = Some((user_data, bytes));
+                self.results.push_back((user_data, bytes));
             }
             Source::Remote {
                 blocks_range,
                 blocks_byte_range,
             } => {
-                let remote_meta = RemoteMeta {
-                    file,
-                    scheduled_read: ScheduledRead::Range {
-                        blocks_range,
-                        read_range: range,
-                    },
-                    user_data,
-                };
-                let remote_pipeline = self.get_or_init_remote_pipeline()?;
+                // An in-flight fetch for the same file covering all needed
+                // blocks resolves this read too: piggyback on it instead of
+                // fetching the same blocks twice.
+                if let Some((_, fetch)) = self.in_flight.iter_mut().find(|(_, inflight)| {
+                    std::ptr::eq(inflight.file, file)
+                        && inflight.blocks_range.start <= blocks_range.start
+                        && blocks_range.end <= inflight.blocks_range.end
+                }) {
+                    fetch.reads.push((user_data, range));
+                    return Ok(());
+                }
+
+                // Reserve the slot without occupying it: only the
+                // `entry.insert` below commits it, so a failed remote schedule
+                // leaves no trace, and inserting through the entry guarantees
+                // the fetch lands on the key the remote read was tagged with.
+                let remote_pipeline = Self::get_or_init_remote_pipeline(&mut self.remote_pipeline)?;
+                let entry = self.in_flight.vacant_entry();
                 remote_pipeline.schedule::<P>(
-                    remote_meta,
-                    file.remote()?,
+                    entry.key() as u64,
+                    state.remote,
                     blocks_byte_range,
-                    align,
+                    REMOTE_READ_ALIGNMENT,
                 )?;
+                entry.insert(InFlightFetch {
+                    file,
+                    blocks_range,
+                    reads: vec![(user_data, range)],
+                });
             }
         }
         Ok(())
     }
 
-    fn wait(&mut self) -> universal_io::Result<Option<(U, ACow<'file>)>> {
-        if let Some((user_data, slice)) = self.result.take() {
+    fn schedule_whole(
+        &mut self,
+        user_data: U,
+        file: &'file DiskCache<R>,
+        from: u64,
+    ) -> UioResult<()>
+    where
+        Self::File: UniversalRead,
+    {
+        let state = file.state()?;
+        let eof = state.local.mmap().len::<u8>()?;
+
+        if from >= eof {
+            return Ok(());
+        }
+
+        self.schedule::<Sequential>(user_data, file, from..eof, 1)
+    }
+
+    fn wait(&mut self) -> UioResult<Option<(U, ACow<'file>)>> {
+        if let Some((user_data, slice)) = self.results.pop_front() {
             return Ok(Some((user_data, ACow::Borrowed(slice))));
         }
 
         let Some(remote_pipeline) = self.remote_pipeline.get_mut() else {
             return Ok(None);
         };
-        let Some((remote_meta, bytes)) = remote_pipeline.wait()? else {
-            return Ok(None);
-        };
-
-        let RemoteMeta {
-            file,
-            scheduled_read,
-            user_data,
-        } = remote_meta;
-
-        // SAFETY: `blocks_range` and `read_range` match what was scheduled.
-        let items = unsafe { commit_and_read::<R>(file, &bytes, scheduled_read)? };
-        Ok(Some((user_data, ACow::Borrowed(items))))
-    }
-}
-
-pub struct OwnedDiskCachePipeline<R, U>
-where
-    R: UniversalRead,
-    U: UserData,
-{
-    /// The file being cached.
-    file: DiskCache<R>,
-    /// Pipeline for queuing remote reads.
-    remote_pipeline: OnceCell<R::OwnedReadPipeline<RemoteMeta<(), U>>>,
-    /// A result ready to be read, contains (user_data, byte_range).
-    ready: Option<(U, Range<u64>, bool)>,
-}
-
-impl<R, U> OwnedDiskCachePipeline<R, U>
-where
-    R: DiskCacheRemote,
-    U: UserData,
-{
-    fn get_or_init_remote_pipeline(
-        &mut self,
-    ) -> universal_io::Result<&mut R::OwnedReadPipeline<RemoteMeta<(), U>>> {
-        if self.remote_pipeline.get().is_none() {
-            let remote = R::OwnedReadPipeline::new(self.file.remote()?.clone())?;
-            // We just observed the cell as empty and hold `&mut self`, so set cannot fail.
-            let _ = self.remote_pipeline.set(remote);
-        }
-        Ok(self.remote_pipeline.get_mut().expect("just initialized"))
-    }
-}
-
-impl<R, U> OwnedReadPipeline<U> for OwnedDiskCachePipeline<R, U>
-where
-    R: DiskCacheRemote,
-{
-    type File = DiskCache<R>;
-
-    fn new(file: Self::File) -> universal_io::Result<Self> {
-        Ok(Self {
-            file,
-            remote_pipeline: OnceCell::new(),
-            ready: None,
-        })
-    }
-
-    fn can_schedule(&mut self) -> bool {
-        self.ready.is_none()
-            && self
-                .remote_pipeline
-                .get_mut()
-                .is_none_or(|remote| remote.can_schedule())
-    }
-
-    fn schedule<P: AccessPattern>(
-        &mut self,
-        user_data: U,
-        range: Range<u64>,
-        align: usize,
-    ) -> universal_io::Result<()> {
-        match pick_source::<P>(self.file.local_state()?, range.clone())? {
-            Source::Local {
-                range,
-                is_sequential,
-            } => {
-                self.ready = Some((user_data, range, is_sequential));
+        let completion = match remote_pipeline.wait() {
+            Ok(completion) => completion,
+            Err(err) => {
+                // Note: `wait()` interface is blind to which request belongs
+                // to which response, so, we can't remove the requests waiting for
+                // this particular failed response.
+                //
+                // Let's just drop all in-flight requests.
+                self.in_flight.clear();
+                self.remote_pipeline.take();
+                return Err(err);
             }
-            Source::Remote {
-                blocks_range,
-                blocks_byte_range,
-            } => {
-                let remote_meta = RemoteMeta {
-                    file: (),
-                    scheduled_read: ScheduledRead::Range {
-                        blocks_range,
-                        read_range: range,
-                    },
-                    user_data,
-                };
-                let remote_pipeline = self.get_or_init_remote_pipeline()?;
-                remote_pipeline.schedule::<P>(remote_meta, blocks_byte_range, align)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn schedule_whole(&mut self, user_data: U) -> Result<()> {
-        // If local has already been initialized, use the mmap length
-        if let Some(local) = self.file.local.get() {
-            let length = local.mmap().len::<u8>()?;
-            return self.schedule::<Sequential>(user_data, 0..length, 1);
-        }
-
-        // Use schedule_whole on the remote pipeline directly
-        let remote_meta = RemoteMeta {
-            file: (),
-            scheduled_read: ScheduledRead::Whole,
-            user_data,
         };
-        let remote_pipeline = self.get_or_init_remote_pipeline()?;
-        remote_pipeline.schedule_whole(remote_meta)
-    }
-
-    fn wait(&mut self) -> universal_io::Result<Option<(U, ACow<'_>)>> {
-        if let Some((user_data, range, is_sequential)) = self.ready.take() {
-            // SAFETY: being in `pending` confirms the range is local (or empty).
-            let bytes = unsafe { read_local::<R>(&self.file, range, is_sequential)? };
-            return Ok(Some((user_data, ACow::Borrowed(bytes))));
-        }
-
-        let Some(remote_pipeline) = self.remote_pipeline.get_mut() else {
-            return Ok(None);
-        };
-        let Some((remote_meta, bytes)) = remote_pipeline.wait()? else {
+        let Some((fetch_id, bytes)) = completion else {
             return Ok(None);
         };
 
-        let RemoteMeta {
-            file: _,
-            scheduled_read,
-            user_data,
-        } = remote_meta;
+        let fetch = self
+            .in_flight
+            .try_remove(fetch_id as usize)
+            .expect("completed fetch has an in-flight entry");
 
-        let items =
-            // TODO: if schedule_whole is used other than during `open`, `commit_and_read` will call `remote.len()` regardless.
-            unsafe { commit_and_read::<R>(&self.file, &bytes, scheduled_read)? };
-        Ok(Some((user_data, ACow::Borrowed(items))))
+        // SAFETY: `bytes` is the content of `fetch.blocks_range` as scheduled,
+        // and piggybacked reads were accepted only when covered by those blocks.
+        unsafe { commit_and_read(fetch, &bytes, &mut self.results)? };
+
+        let (user_data, slice) = self
+            .results
+            .pop_front()
+            .expect("a completed fetch resolves at least one read");
+        Ok(Some((user_data, ACow::Borrowed(slice))))
     }
 }

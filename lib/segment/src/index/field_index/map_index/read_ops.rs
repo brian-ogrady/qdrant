@@ -1,17 +1,22 @@
 use std::borrow::{Borrow, Cow};
 use std::hash::{BuildHasher, Hash};
 
+use blobstore::Blob;
+use common::condition_checker::{CheckItem, ConditionChecker, Partitioner, Rest, Select};
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use gridstore::Blob;
+use common::universal_io::UserData;
+use fnv::FnvBuildHasher;
 use indexmap::IndexSet;
+use itertools::Itertools;
 
 use super::key::MapIndexKey;
 use super::{IdIter, MapIndex};
-use crate::common::operation_error::OperationResult;
+use crate::common::operation_error::{OperationError, OperationResult};
 use crate::index::field_index::CardinalityEstimation;
 use crate::index::field_index::stat_tools::number_of_selected_points;
 use crate::index::payload_config::{IndexMutability, StorageType};
+use crate::payload_storage::condition_checker::INDEXSET_ITER_THRESHOLD;
 use crate::telemetry::PayloadIndexTelemetry;
 
 /// Read-only operations supported by every map-index storage variant
@@ -23,21 +28,39 @@ use crate::telemetry::PayloadIndexTelemetry;
 /// [`MapIndex`] can call them generically. Variants that don't need
 /// `hw_counter` (`Mutable` / `Immutable`) accept and ignore it; the
 /// storage-backed `Universal` variant uses it to track payload-index IO.
-pub trait MapIndexRead<N: MapIndexKey + ?Sized> {
+pub trait MapIndexRead<'a, N: MapIndexKey + ?Sized + 'a>: Sized {
     fn check_values_any(
         &self,
         idx: PointOffsetType,
         hw_counter: &HardwareCounterCell,
         check_fn: impl Fn(&N) -> bool,
-    ) -> bool;
+    ) -> OperationResult<bool>;
 
-    fn get_values<'a>(
+    /// Batched counterpart of [`Self::check_values_any`].
+    fn for_each_matching_value<I, F, M, U>(
+        &self,
+        items: I,
+        hw_counter: &HardwareCounterCell,
+        check_fn: F,
+        mut on_match: M,
+    ) -> OperationResult<()>
+    where
+        U: UserData,
+        I: Iterator<Item = (U, PointOffsetType)>,
+        F: Fn(&N) -> bool,
+        M: FnMut(U, bool),
+    {
+        for (tag, idx) in items {
+            on_match(tag, self.check_values_any(idx, hw_counter, &check_fn)?);
+        }
+        Ok(())
+    }
+
+    fn get_values(
         &'a self,
         idx: PointOffsetType,
         hw_counter: &HardwareCounterCell,
-    ) -> Option<impl Iterator<Item = Cow<'a, N>> + 'a>
-    where
-        N: 'a;
+    ) -> Option<impl Iterator<Item = Cow<'a, N>> + 'a>;
 
     fn values_count(&self, idx: PointOffsetType) -> Option<usize>;
 
@@ -102,6 +125,36 @@ pub trait MapIndexRead<N: MapIndexKey + ?Sized> {
         self.values_count(idx).unwrap_or(0) == 0
     }
 
+    /// Use each value's posting of point ids, invoking `f` once per value.
+    ///
+    /// Order of invocations is not guaranteed.
+    fn for_values_map<V: Borrow<N>>(
+        &self,
+        values: impl Iterator<Item = V>,
+        hw_counter: &HardwareCounterCell,
+        mut f: impl FnMut(&N, &mut dyn Iterator<Item = PointOffsetType>) -> OperationResult<()>,
+    ) -> OperationResult<()> {
+        for value in values {
+            let value = value.borrow();
+            let mut ids = self.get_iterator(value, hw_counter);
+            f(value, &mut ids)?;
+        }
+        Ok(())
+    }
+
+    /// Iterator over deduplicated points matching **any** of the given `values`.
+    fn iter_for_values<V: Borrow<N> + 'a>(
+        &'a self,
+        values: impl Iterator<Item = V> + 'a,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> OperationResult<IdIter<'a>> {
+        Ok(Box::new(
+            values
+                .flat_map(move |value| self.get_iterator(value.borrow(), hw_counter))
+                .unique(),
+        ))
+    }
+
     fn match_cardinality(
         &self,
         value: &N,
@@ -120,13 +173,13 @@ pub trait MapIndexRead<N: MapIndexKey + ?Sized> {
     /// # Returns
     ///
     /// * `CardinalityEstimation` - estimation of cardinality
-    fn except_cardinality<'a>(
-        &'a self,
-        excluded: impl Iterator<Item = &'a N>,
+    fn except_cardinality<'b>(
+        &self,
+        excluded: impl Iterator<Item = &'b N>,
         hw_counter: &HardwareCounterCell,
     ) -> CardinalityEstimation
     where
-        N: 'a,
+        N: 'b,
     {
         // Minimal case: we exclude as many points as possible.
         let excluded_value_counts: Vec<_> = excluded
@@ -174,7 +227,7 @@ pub trait MapIndexRead<N: MapIndexKey + ?Sized> {
         }
     }
 
-    fn except_set<'a, K, A>(
+    fn except_set<K, A>(
         &'a self,
         excluded: &'a IndexSet<K, A>,
         hw_counter: &'a HardwareCounterCell,
@@ -194,9 +247,67 @@ pub trait MapIndexRead<N: MapIndexKey + ?Sized> {
         })?;
         Ok(Box::new(points.into_iter()))
     }
+
+    /// Condition checker for [`crate::types::Match::Value`].
+    fn match_value_checker(
+        &'a self,
+        hw_counter: HardwareCounterCell,
+        value: impl Borrow<N>,
+    ) -> MapConditionChecker<'a, N, Self> {
+        MapConditionChecker {
+            index: self,
+            hw_counter,
+            predicate: MapPredicate::Value(<N as MapIndexKey>::to_owned(value.borrow())),
+        }
+    }
+
+    /// Condition checker for [`crate::types::Match::Prefix`].
+    ///
+    /// Checks a point's values through the forward index, so it works in
+    /// every variant regardless of whether prefix structures were built.
+    fn match_prefix_checker(
+        &'a self,
+        hw_counter: HardwareCounterCell,
+        prefix: impl Borrow<N>,
+    ) -> MapConditionChecker<'a, N, Self> {
+        MapConditionChecker {
+            index: self,
+            hw_counter,
+            predicate: MapPredicate::Prefix(<N as MapIndexKey>::to_owned(prefix.borrow())),
+        }
+    }
+
+    /// Condition checker for
+    /// - [`crate::types::Match::Any`] (when `negate` is `false`),
+    /// - [`crate::types::Match::Except`] (when `negate` is `true`).
+    fn match_any_checker<K, A>(
+        &'a self,
+        hw_counter: HardwareCounterCell,
+        list: IndexSet<K, A>,
+        negate: bool,
+    ) -> MapConditionChecker<'a, N, Self>
+    where
+        A: BuildHasher,
+        K: Borrow<N> + Hash + Eq,
+    {
+        let scan = list.len() < INDEXSET_ITER_THRESHOLD;
+        let list = list
+            .iter()
+            .map(|key| <N as MapIndexKey>::to_owned(key.borrow()))
+            .collect();
+        MapConditionChecker {
+            index: self,
+            hw_counter,
+            predicate: if scan {
+                MapPredicate::AnyScan { list, negate }
+            } else {
+                MapPredicate::AnyProbe { list, negate }
+            },
+        }
+    }
 }
 
-impl<N: MapIndexKey + ?Sized> MapIndexRead<N> for MapIndex<N>
+impl<'a, N: MapIndexKey + ?Sized + 'a> MapIndexRead<'a, N> for MapIndex<N>
 where
     Vec<<N as MapIndexKey>::Owned>: Blob + Send + Sync,
 {
@@ -205,26 +316,23 @@ where
         idx: PointOffsetType,
         hw_counter: &HardwareCounterCell,
         check_fn: impl Fn(&N) -> bool,
-    ) -> bool {
+    ) -> OperationResult<bool> {
         match self {
             MapIndex::Mutable(index) => index.check_values_any(idx, hw_counter, check_fn),
             MapIndex::Immutable(index) => index.check_values_any(idx, hw_counter, check_fn),
-            MapIndex::Mmap(index) => index.check_values_any(idx, hw_counter, check_fn),
+            MapIndex::OnDisk(index) => index.check_values_any(idx, hw_counter, check_fn),
         }
     }
 
-    fn get_values<'a>(
+    fn get_values(
         &'a self,
         idx: PointOffsetType,
         hw_counter: &HardwareCounterCell,
-    ) -> Option<impl Iterator<Item = Cow<'a, N>> + 'a>
-    where
-        N: 'a,
-    {
+    ) -> Option<impl Iterator<Item = Cow<'a, N>> + 'a> {
         let boxed: Box<dyn Iterator<Item = Cow<'a, N>> + 'a> = match self {
             MapIndex::Mutable(index) => Box::new(index.get_values(idx, hw_counter)?),
             MapIndex::Immutable(index) => Box::new(index.get_values(idx, hw_counter)?),
-            MapIndex::Mmap(index) => Box::new(index.get_values(idx, hw_counter)?),
+            MapIndex::OnDisk(index) => Box::new(index.get_values(idx, hw_counter)?),
         };
         Some(boxed)
     }
@@ -233,7 +341,7 @@ where
         match self {
             MapIndex::Mutable(index) => index.values_count(idx),
             MapIndex::Immutable(index) => index.values_count(idx),
-            MapIndex::Mmap(index) => index.values_count(idx),
+            MapIndex::OnDisk(index) => index.values_count(idx),
         }
     }
 
@@ -241,7 +349,7 @@ where
         match self {
             MapIndex::Mutable(index) => index.get_indexed_points(),
             MapIndex::Immutable(index) => index.get_indexed_points(),
-            MapIndex::Mmap(index) => index.get_indexed_points(),
+            MapIndex::OnDisk(index) => index.get_indexed_points(),
         }
     }
 
@@ -249,7 +357,7 @@ where
         match self {
             MapIndex::Mutable(index) => index.get_values_count(),
             MapIndex::Immutable(index) => index.get_values_count(),
-            MapIndex::Mmap(index) => index.get_values_count(),
+            MapIndex::OnDisk(index) => index.get_values_count(),
         }
     }
 
@@ -257,7 +365,7 @@ where
         match self {
             MapIndex::Mutable(index) => index.get_unique_values_count(),
             MapIndex::Immutable(index) => index.get_unique_values_count(),
-            MapIndex::Mmap(index) => index.get_unique_values_count(),
+            MapIndex::OnDisk(index) => index.get_unique_values_count(),
         }
     }
 
@@ -265,7 +373,7 @@ where
         match self {
             MapIndex::Mutable(index) => index.get_count_for_value(value, hw_counter),
             MapIndex::Immutable(index) => index.get_count_for_value(value, hw_counter),
-            MapIndex::Mmap(index) => index.get_count_for_value(value, hw_counter),
+            MapIndex::OnDisk(index) => index.get_count_for_value(value, hw_counter),
         }
     }
 
@@ -273,7 +381,7 @@ where
         match self {
             MapIndex::Mutable(index) => index.get_iterator(value, hw_counter),
             MapIndex::Immutable(index) => index.get_iterator(value, hw_counter),
-            MapIndex::Mmap(index) => index.get_iterator(value, hw_counter),
+            MapIndex::OnDisk(index) => index.get_iterator(value, hw_counter),
         }
     }
 
@@ -281,7 +389,7 @@ where
         match self {
             MapIndex::Mutable(index) => index.for_each_value(f),
             MapIndex::Immutable(index) => index.for_each_value(f),
-            MapIndex::Mmap(index) => index.for_each_value(f),
+            MapIndex::OnDisk(index) => index.for_each_value(f),
         }
     }
 
@@ -299,7 +407,7 @@ where
         match self {
             MapIndex::Mutable(index) => index.for_each_count_per_value(deferred_internal_id, f),
             MapIndex::Immutable(index) => index.for_each_count_per_value(deferred_internal_id, f),
-            MapIndex::Mmap(index) => index.for_each_count_per_value(deferred_internal_id, f),
+            MapIndex::OnDisk(index) => index.for_each_count_per_value(deferred_internal_id, f),
         }
     }
 
@@ -311,7 +419,34 @@ where
         match self {
             MapIndex::Mutable(index) => index.for_each_value_map(hw_counter, f),
             MapIndex::Immutable(index) => index.for_each_value_map(hw_counter, f),
-            MapIndex::Mmap(index) => index.for_each_value_map(hw_counter, f),
+            MapIndex::OnDisk(index) => index.for_each_value_map(hw_counter, f),
+        }
+    }
+
+    // Dispatch instead of using default impl, for on-disk impl to use batched reads
+    fn for_values_map<V: Borrow<N>>(
+        &self,
+        values: impl Iterator<Item = V>,
+        hw_counter: &HardwareCounterCell,
+        f: impl FnMut(&N, &mut dyn Iterator<Item = PointOffsetType>) -> OperationResult<()>,
+    ) -> OperationResult<()> {
+        match self {
+            MapIndex::Mutable(index) => index.for_values_map(values, hw_counter, f),
+            MapIndex::Immutable(index) => index.for_values_map(values, hw_counter, f),
+            MapIndex::OnDisk(index) => index.for_values_map(values, hw_counter, f),
+        }
+    }
+
+    // Dispatch instead of using default impl, for on-disk impl to use batched reads
+    fn iter_for_values<V: Borrow<N> + 'a>(
+        &'a self,
+        values: impl Iterator<Item = V> + 'a,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> OperationResult<IdIter<'a>> {
+        match self {
+            MapIndex::Mutable(index) => index.iter_for_values(values, hw_counter),
+            MapIndex::Immutable(index) => index.iter_for_values(values, hw_counter),
+            MapIndex::OnDisk(index) => index.iter_for_values(values, hw_counter),
         }
     }
 
@@ -319,7 +454,7 @@ where
         match self {
             MapIndex::Mutable(index) => index.storage_type(),
             MapIndex::Immutable(index) => index.storage_type(),
-            MapIndex::Mmap(index) => index.storage_type(),
+            MapIndex::OnDisk(index) => index.storage_type(),
         }
     }
 
@@ -327,7 +462,7 @@ where
         match self {
             MapIndex::Mutable(index) => index.ram_usage_bytes(),
             MapIndex::Immutable(index) => index.ram_usage_bytes(),
-            MapIndex::Mmap(index) => index.ram_usage_bytes(),
+            MapIndex::OnDisk(index) => index.ram_usage_bytes(),
         }
     }
 
@@ -335,7 +470,7 @@ where
         match self {
             MapIndex::Mutable(_) => "mutable_map",
             MapIndex::Immutable(_) => "immutable_map",
-            MapIndex::Mmap(_) => "mmap_map",
+            MapIndex::OnDisk(_) => "mmap_map",
         }
     }
 }
@@ -347,13 +482,13 @@ where
     pub fn get_telemetry_data(&self) -> PayloadIndexTelemetry {
         PayloadIndexTelemetry {
             field_name: None,
-            points_count: <Self as MapIndexRead<N>>::get_indexed_points(self),
-            points_values_count: <Self as MapIndexRead<N>>::get_values_count(self),
+            points_count: <Self as MapIndexRead<'_, N>>::get_indexed_points(self),
+            points_values_count: <Self as MapIndexRead<'_, N>>::get_values_count(self),
             histogram_bucket_size: None,
             index_type: match self {
                 MapIndex::Mutable(_) => "mutable_map",
                 MapIndex::Immutable(_) => "immutable_map",
-                MapIndex::Mmap(_) => "mmap_map",
+                MapIndex::OnDisk(_) => "mmap_map",
             },
         }
     }
@@ -362,13 +497,13 @@ where
     /// [`MapIndexRead::values_count`] for callers outside this module who
     /// don't have the (`pub(super)`) trait in scope.
     pub fn values_count(&self, idx: PointOffsetType) -> usize {
-        <Self as MapIndexRead<N>>::values_count(self, idx).unwrap_or(0)
+        <Self as MapIndexRead<'_, N>>::values_count(self, idx).unwrap_or(0)
     }
 
     /// `bool`-returning convenience wrapper around
     /// [`MapIndexRead::values_is_empty`]; see [`Self::values_count`] for why.
     pub fn values_is_empty(&self, idx: PointOffsetType) -> bool {
-        <Self as MapIndexRead<N>>::values_is_empty(self, idx)
+        <Self as MapIndexRead<'_, N>>::values_is_empty(self, idx)
     }
 
     /// Convenience wrapper around [`MapIndexRead::get_values`] that boxes the
@@ -379,21 +514,21 @@ where
         idx: PointOffsetType,
         hw_counter: &HardwareCounterCell,
     ) -> Option<Box<dyn Iterator<Item = Cow<'_, N>> + '_>> {
-        let iter = <Self as MapIndexRead<N>>::get_values(self, idx, hw_counter)?;
+        let iter = <Self as MapIndexRead<'_, N>>::get_values(self, idx, hw_counter)?;
         Some(Box::new(iter))
     }
 
     /// Convenience wrapper around [`MapIndexRead::ram_usage_bytes`]; see
     /// [`Self::values_count`] for why.
     pub fn ram_usage_bytes(&self) -> usize {
-        <Self as MapIndexRead<N>>::ram_usage_bytes(self)
+        <Self as MapIndexRead<'_, N>>::ram_usage_bytes(self)
     }
 
     pub fn is_on_disk(&self) -> bool {
         match self {
             MapIndex::Mutable(_) => false,
             MapIndex::Immutable(_) => false,
-            MapIndex::Mmap(index) => index.is_on_disk(),
+            MapIndex::OnDisk(index) => index.is_on_disk(),
         }
     }
 
@@ -401,7 +536,7 @@ where
         match self {
             Self::Mutable(_) => IndexMutability::Mutable,
             Self::Immutable(_) => IndexMutability::Immutable,
-            Self::Mmap(_) => IndexMutability::Immutable,
+            Self::OnDisk(_) => IndexMutability::Immutable,
         }
     }
 
@@ -409,7 +544,76 @@ where
         match self {
             Self::Mutable(index) => index.storage_type(),
             Self::Immutable(index) => index.storage_type(),
-            Self::Mmap(index) => index.storage_type(),
+            Self::OnDisk(index) => index.storage_type(),
+        }
+    }
+}
+
+pub struct MapConditionChecker<'a, N: MapIndexKey + ?Sized, T> {
+    index: &'a T,
+    hw_counter: HardwareCounterCell,
+    predicate: MapPredicate<N>,
+}
+
+enum MapPredicate<N: MapIndexKey + ?Sized> {
+    /// For [`crate::types::Match::Value`].
+    Value(<N as MapIndexKey>::Owned),
+    /// For [`crate::types::Match::Prefix`]; meaningful for string keys only
+    /// ([`MapIndexKey::starts_with`] is constant `false` elsewhere).
+    Prefix(<N as MapIndexKey>::Owned),
+    /// For [`crate::types::Match::Any`] and [`crate::types::Match::Except`],
+    /// Linear scan version.
+    AnyScan {
+        list: IndexSet<<N as MapIndexKey>::Owned, FnvBuildHasher>,
+        negate: bool,
+    },
+    /// For [`crate::types::Match::Any`] and [`crate::types::Match::Except`],
+    /// hash-probe version.
+    AnyProbe {
+        list: IndexSet<<N as MapIndexKey>::Owned, FnvBuildHasher>,
+        negate: bool,
+    },
+}
+
+impl<'a, N, T> ConditionChecker for MapConditionChecker<'a, N, T>
+where
+    N: MapIndexKey + ?Sized + 'a,
+    T: MapIndexRead<'a, N>,
+{
+    type Error = OperationError;
+
+    fn check(&self, point_id: PointOffsetType) -> OperationResult<bool> {
+        self.index
+            .check_values_any(point_id, &self.hw_counter, |value| self.matches(value))
+    }
+
+    fn check_batched<K: CheckItem>(
+        &self,
+        ids: &mut [K],
+        select: Select,
+        _rest: Rest,
+    ) -> OperationResult<usize> {
+        let p = Partitioner::new(ids);
+        self.index.for_each_matching_value(
+            p.iter().map(|item| (item, item.point_id())),
+            &self.hw_counter,
+            |value| self.matches(value),
+            |item, matched| p.write(item, matched == select.is_match()),
+        )?;
+        Ok(p.finish())
+    }
+}
+
+impl<'a, N: MapIndexKey + ?Sized + 'a, T> MapConditionChecker<'a, N, T> {
+    /// Whether a single indexed `value` satisfies this checker's predicate.
+    fn matches(&self, value: &N) -> bool {
+        match &self.predicate {
+            MapPredicate::Value(expected) => value == expected.borrow(),
+            MapPredicate::Prefix(prefix) => N::starts_with(value, prefix.borrow()),
+            MapPredicate::AnyScan { list, negate } => {
+                list.iter().any(|key| key.borrow() == value) != *negate
+            }
+            MapPredicate::AnyProbe { list, negate } => list.contains(value) != *negate,
         }
     }
 }

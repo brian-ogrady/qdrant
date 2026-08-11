@@ -3,11 +3,12 @@ mod prof;
 
 use std::sync::atomic::AtomicBool;
 
+use common::condition_checker::ConditionChecker;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use criterion::{Criterion, criterion_group, criterion_main};
 use itertools::Itertools;
-use rand::rngs::StdRng;
+use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
 use segment::fixtures::payload_context_fixture::{
     create_plain_payload_index, create_struct_payload_index,
@@ -22,7 +23,7 @@ const CHECK_SAMPLE_SIZE: usize = 1000;
 fn conditional_plain_search_benchmark(c: &mut Criterion) {
     let seed = 42;
 
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = SmallRng::seed_from_u64(seed);
     let mut group = c.benchmark_group("conditional-search-group");
 
     let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
@@ -78,7 +79,7 @@ fn conditional_plain_search_benchmark(c: &mut Criterion) {
             let context = plain_index.filter_context(&filter, &hw_counter).unwrap();
             let filtered_sample = sample
                 .into_iter()
-                .filter(|id| context.check(*id))
+                .filter(|id| context.check(*id).unwrap())
                 .collect_vec();
             result_size += filtered_sample.len();
             query_count += 1;
@@ -101,7 +102,7 @@ fn conditional_plain_search_benchmark(c: &mut Criterion) {
             let context = plain_index.filter_context(&filter, &hw_counter).unwrap();
             let filtered_sample = sample
                 .into_iter()
-                .filter(|id| context.check(*id))
+                .filter(|id| context.check(*id).unwrap())
                 .collect_vec();
             result_size += filtered_sample.len();
             query_count += 1;
@@ -117,7 +118,7 @@ fn conditional_plain_search_benchmark(c: &mut Criterion) {
             let context = plain_index.filter_context(&filter, &hw_counter).unwrap();
             let filtered_sample = sample
                 .into_iter()
-                .filter(|id| context.check(*id))
+                .filter(|id| context.check(*id).unwrap())
                 .collect_vec();
             result_size += filtered_sample.len();
             query_count += 1;
@@ -128,7 +129,7 @@ fn conditional_plain_search_benchmark(c: &mut Criterion) {
 }
 
 fn conditional_struct_search_benchmark(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = SmallRng::seed_from_u64(42);
     let mut group = c.benchmark_group("conditional-search-group");
 
     let seed = 42;
@@ -177,7 +178,10 @@ fn conditional_struct_search_benchmark(c: &mut Criterion) {
                 .collect_vec();
             let filtered_count = struct_index.with_view(|v| {
                 let context = v.filter_context(&filter, &hw_counter).unwrap();
-                sample.into_iter().filter(|id| context.check(*id)).count()
+                sample
+                    .into_iter()
+                    .filter(|id| context.check(*id).unwrap())
+                    .count()
             });
             result_size += filtered_count;
             query_count += 1;

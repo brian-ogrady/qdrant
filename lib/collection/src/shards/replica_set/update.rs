@@ -192,7 +192,15 @@ impl ShardReplicaSet {
                     if err.is_transient() {
                         // Deactivate the peer if forwarding failed with transient error
                         let replica_state = self.replica_state.read();
-                        let from_state = replica_state.get_peer_state(leader_peer);
+
+                        // Note, we explicitly *don't* want to use `from_state` for `ReshardingScaleDown`,
+                        // because it interacts poorly with how abort resharding currently works. 😔
+                        //
+                        // See https://github.com/qdrant/qdrant/pull/7849#issuecomment-4720894619
+                        let from_state = replica_state
+                            .get_peer_state(leader_peer)
+                            .filter(|state| !state.is_partial_or_recovery());
+
                         self.add_locally_disabled(Some(&replica_state), leader_peer, from_state);
 
                         // Return service error
@@ -350,7 +358,21 @@ impl ShardReplicaSet {
         // Local is defined and can receive updates
         let local_is_updatable = local.is_some() && self.is_peer_updatable(this_peer_id);
 
+        // A resource quota describes this node, not the operation, so it only
+        // disqualifies the local replica from taking the write. The other
+        // replicas are on other machines and answer for themselves.
+        let local_quota_failure = (local_is_updatable && operation.consumes_quota())
+            .then(|| shard::quota::global().check_update().err())
+            .flatten();
+        let local_is_updatable = local_is_updatable && local_quota_failure.is_none();
+
         if updatable_remote_shards.is_empty() && !local_is_updatable {
+            // With nowhere else for the write to land, the quota is the answer
+            // the client gets, rather than a note about a deactivated replica.
+            if let Some(err) = local_quota_failure {
+                return Err(err.into());
+            }
+
             return Err(CollectionError::service_error(format!(
                 "The replica set for shard {} on peer {this_peer_id} has no active replica",
                 self.shard_id,
@@ -400,7 +422,7 @@ impl ShardReplicaSet {
         // completion. Holding the guard across a deferred-points wait would
         // deadlock concurrent shard transfers that need `local.write()`.
         // Proxy variants are transient and keep the inline-await path.
-        let all_res: Vec<Result<(PeerId, UpdateResult), (PeerId, CollectionError)>> =
+        let mut all_res: Vec<Result<(PeerId, UpdateResult), (PeerId, CollectionError)>> =
             match local.deref() {
                 Some(Shard::Local(local_shard)) if local_is_updatable => {
                     let outcome = local_shard
@@ -448,6 +470,13 @@ impl ShardReplicaSet {
                     res
                 }
             };
+
+        // Recorded as a failure of this peer, so the replica set treats a node
+        // over its quota exactly like one that went offline: deactivate it, and
+        // let the operation stand if enough replicas took the write.
+        if let Some(err) = local_quota_failure {
+            all_res.push(Err((this_peer_id, err.into())));
+        }
 
         let write_consistency_factor = self
             .collection_config
@@ -745,19 +774,13 @@ impl ShardReplicaSet {
 
             // Deactivate replica in consensus if it matches the state we expect.
             // We filter out transient transfer states (Partial, Recovery, etc.)
-            // because those can change rapidly between proposal and apply, and
-            // we want the deactivation to go through even if the state has
-            // moved on. Resharding/ReshardingScaleDown are stable through the
-            // resharding lifecycle (only flipped by finish_migrating_points
-            // → Active or by this same deactivation flow → Dead), so we keep
-            // them populated. Carrying the captured pre-state in the consensus
-            // log entry is what lets the local `abort_resharding` side-effect
-            // in `Collection::set_shard_replica_state` re-fire correctly on
-            // replay — without it, replay reads `current_state` as Dead from
-            // disk and silently skips the side-effect, leaving
-            // resharding_state stale.
-            let from_state = Some(peer_state)
-                .filter(|state| !state.is_partial_or_recovery() || state.is_resharding());
+            // because those can change rapidly between proposal and apply.
+            //
+            // Note, we explicitly *don't* want to use `from_state` for `ReshardingScaleDown`,
+            // because it interacts poorly with how abort resharding currently works. 😔
+            //
+            // See https://github.com/qdrant/qdrant/pull/7849#issuecomment-4720894619
+            let from_state = Some(peer_state).filter(|state| !state.is_partial_or_recovery());
 
             self.add_locally_disabled(Some(state), *peer_id, from_state);
         }
