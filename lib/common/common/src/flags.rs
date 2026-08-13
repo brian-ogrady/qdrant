@@ -26,8 +26,32 @@ pub struct FeatureFlags {
 
     /// Use single-file mmap in-ram vector storage (InRamMmap)
     ///
-    /// Enabled by default in Qdrant 1.17.1+
+    /// Enabled by default in Qdrant 1.18.3+
     pub single_file_mmap_vector_storage: bool,
+
+    /// Allow the io_uring-based payload storage implementation.
+    /// When disabled, io_uring payload storage is *never* used.
+    /// When enabled, payload storage backend is decided based on `storage.performance.io_uring` option and payload storage type.
+    pub async_payload_storage: bool,
+
+    /// Write a segment manifest (`segments_manifest.json`, next to the `segments/` directory)
+    /// listing the shard's segments and their
+    /// state, so out-of-process readers can discover segments without scanning the filesystem.
+    pub write_segment_manifest: bool,
+
+    /// Build new segments in append-only mode: in-place point mutations become clone-and-tombstone
+    /// appends instead. Intended for testing the append-only storage path.
+    pub append_only_mutations: bool,
+
+    /// Persist write-once bitmasks in the compact `StoredBitmask` format instead of raw dense
+    /// bitslices. Only gates writing: both formats are always readable.
+    pub compact_bitmask: bool,
+
+    /// Serverless-compatible deployment mode. Automatically enables [`Self::write_segment_manifest`],
+    /// [`Self::append_only_mutations`] and [`Self::compact_bitmask`].
+    ///
+    /// Note that this will only be applied when passed into [`init_feature_flags`].
+    serverless_compatible: bool,
 }
 
 impl Default for FeatureFlags {
@@ -36,7 +60,12 @@ impl Default for FeatureFlags {
             all: false,
             incremental_hnsw_building: true,
             appendable_quantization: true,
-            single_file_mmap_vector_storage: false,
+            single_file_mmap_vector_storage: true,
+            async_payload_storage: true,
+            write_segment_manifest: false,
+            append_only_mutations: false,
+            compact_bitmask: false,
+            serverless_compatible: false,
         }
     }
 }
@@ -46,24 +75,51 @@ impl FeatureFlags {
     pub fn is_default(self) -> bool {
         self == FeatureFlags::default()
     }
+
+    /// Whether segments should be produced in a serverless-compatible way (e.g.
+    /// the disk-resident id-tracker format). See the field docs for implications.
+    pub fn serverless_compatible(self) -> bool {
+        self.serverless_compatible
+    }
+
+    fn all() -> Self {
+        Self {
+            all: true,
+            incremental_hnsw_building: true,
+            appendable_quantization: true,
+            single_file_mmap_vector_storage: true,
+            async_payload_storage: true,
+            write_segment_manifest: true,
+            // Deliberately not enabled by `all`: this is a test-only escape hatch that changes
+            // mutation semantics, and `all` is enabled in dev and e2e configs.
+            append_only_mutations: false,
+            compact_bitmask: true,
+            serverless_compatible: false,
+        }
+    }
+
+    fn normalize(mut self) -> Self {
+        let serverless_compatible = self.serverless_compatible;
+
+        if self.all {
+            self = Self::all();
+        }
+
+        if serverless_compatible {
+            self.serverless_compatible = true;
+            self.write_segment_manifest = true;
+            self.append_only_mutations = true;
+            self.compact_bitmask = true;
+        }
+
+        self
+    }
 }
 
 /// Initializes the global feature flags with `flags`. Must only be called once at
 /// startup or otherwise throws a warning and discards the values.
-pub fn init_feature_flags(mut flags: FeatureFlags) {
-    let FeatureFlags {
-        all,
-        incremental_hnsw_building,
-        appendable_quantization,
-        single_file_mmap_vector_storage,
-    } = &mut flags;
-
-    // If all is set, explicitly set all feature flags
-    if *all {
-        *incremental_hnsw_building = true;
-        *appendable_quantization = true;
-        *single_file_mmap_vector_storage = true;
-    }
+pub fn init_feature_flags(flags: FeatureFlags) {
+    let flags = flags.normalize();
 
     let res = FEATURE_FLAGS.set(flags);
     if res.is_err() {
@@ -94,5 +150,32 @@ mod tests {
 
         assert!(feature_flags().is_default());
         assert!(FeatureFlags::default().is_default());
+    }
+
+    #[test]
+    fn test_serverless_compatible_enables_sub_flags() {
+        let flags = FeatureFlags {
+            serverless_compatible: true,
+            ..Default::default()
+        }
+        .normalize();
+
+        assert!(flags.write_segment_manifest);
+        assert!(flags.append_only_mutations);
+        assert!(flags.compact_bitmask);
+    }
+
+    #[test]
+    fn test_serverless_compatible_after_all() {
+        let flags = FeatureFlags {
+            all: true,
+            serverless_compatible: true,
+            ..Default::default()
+        }
+        .normalize();
+
+        assert!(flags.write_segment_manifest);
+        assert!(flags.append_only_mutations);
+        assert!(flags.compact_bitmask);
     }
 }

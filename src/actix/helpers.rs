@@ -226,6 +226,7 @@ impl HttpError {
             StorageError::NotFound { .. } => {}
             StorageError::ServiceError { .. } => {}
             StorageError::BadRequest { .. } => {}
+            StorageError::StandaloneMode { .. } => {}
             StorageError::Locked { .. } => {}
             StorageError::Timeout { .. } => {}
             StorageError::ChecksumMismatch { .. } => {}
@@ -234,6 +235,7 @@ impl HttpError {
             StorageError::InferenceError { .. } => {}
             StorageError::ShardUnavailable { .. } => {}
             StorageError::EmptyPartialSnapshot { .. } => {}
+            StorageError::InsufficientStorage { .. } => {}
         }
         headers
     }
@@ -246,6 +248,7 @@ impl ResponseError for HttpError {
             StorageError::NotFound { .. } => http::StatusCode::NOT_FOUND,
             StorageError::ServiceError { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
             StorageError::BadRequest { .. } => http::StatusCode::BAD_REQUEST,
+            StorageError::StandaloneMode { .. } => http::StatusCode::METHOD_NOT_ALLOWED,
             StorageError::Locked { .. } => http::StatusCode::FORBIDDEN,
             StorageError::Timeout { .. } => http::StatusCode::REQUEST_TIMEOUT,
             StorageError::AlreadyExists { .. } => http::StatusCode::CONFLICT,
@@ -256,6 +259,7 @@ impl ResponseError for HttpError {
             StorageError::RateLimitExceeded { .. } => http::StatusCode::TOO_MANY_REQUESTS,
             StorageError::ShardUnavailable { .. } => http::StatusCode::SERVICE_UNAVAILABLE,
             StorageError::EmptyPartialSnapshot { .. } => http::StatusCode::NOT_MODIFIED,
+            StorageError::InsufficientStorage { .. } => http::StatusCode::INSUFFICIENT_STORAGE,
         }
     }
 }

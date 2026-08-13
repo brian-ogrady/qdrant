@@ -11,6 +11,7 @@ use common::mmap::MmapFlusher;
 use common::mmap::{transmute_from_u8_to_slice, transmute_to_u8_slice};
 use common::typelevel::True;
 use common::types::PointOffsetType;
+use common::universal_io::{UioResult, UniversalReadFs, read_json_via};
 use fs_err as fs;
 use serde::{Deserialize, Serialize};
 use strum::EnumIter;
@@ -425,6 +426,10 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         &self.encoded_vectors
     }
 
+    pub fn storage_mut(&mut self) -> &mut TStorage {
+        &mut self.encoded_vectors
+    }
+
     pub fn encode<'a>(
         orig_data: impl Iterator<Item = impl AsRef<[f32]> + 'a> + Clone,
         mut storage_builder: impl EncodedStorageBuilder<Storage = TStorage>,
@@ -506,9 +511,12 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         })
     }
 
-    pub fn load(encoded_vectors: TStorage, meta_path: &Path) -> std::io::Result<Self> {
-        let contents = fs::read_to_string(meta_path)?;
-        let metadata: Metadata = serde_json::from_str(&contents)?;
+    pub fn load<Fs: UniversalReadFs>(
+        fs: &Fs,
+        encoded_vectors: TStorage,
+        meta_path: &Path,
+    ) -> UioResult<Self> {
+        let metadata: Metadata = read_json_via(fs, meta_path)?;
         let result = Self {
             metadata,
             metadata_path: Some(meta_path.to_path_buf()),
@@ -853,11 +861,12 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
         )
     }
 
-    fn iter_batch(
+    fn for_each_batch(
         &self,
         offsets: &[PointOffsetType],
-    ) -> impl Iterator<Item = (usize, Cow<'_, [u8]>)> {
-        self.encoded_vectors.iter_batch(offsets)
+        callback: impl FnMut(usize, Cow<'_, [u8]>),
+    ) {
+        self.encoded_vectors.for_each_batch(offsets, callback)
     }
 
     fn score(

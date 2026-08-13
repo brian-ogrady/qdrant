@@ -3,6 +3,7 @@ pub mod disk_usage_watcher;
 pub(super) mod facet;
 pub(super) mod formula_rescore;
 pub(super) mod query;
+pub(super) mod resolve_submit;
 pub(super) mod scroll;
 pub(super) mod search;
 pub(super) mod shard_ops;
@@ -11,6 +12,8 @@ mod snapshot;
 mod telemetry;
 pub(super) mod updaters;
 
+#[cfg(test)]
+mod optimizer_config_update_tests;
 #[cfg(test)]
 mod snapshot_tests;
 
@@ -55,6 +58,7 @@ use shard::files::{NEWEST_CLOCKS_PATH, OLDEST_CLOCKS_PATH, ShardDataFiles};
 use shard::operations::CollectionUpdateOperations;
 use shard::operations::optimization::{OptimizationSegmentInfo, PendingOptimization};
 use shard::operations::point_ops::{PointInsertOperationsInternal, PointOperations};
+use shard::segment_holder::FlushMode;
 use shard::segment_holder::locked::LockedSegmentHolder;
 use shard::wal::SerdeWal;
 use tokio::runtime::Handle;
@@ -78,8 +82,8 @@ use crate::config::CollectionConfigInternal;
 use crate::operations::OperationWithClockTag;
 use crate::operations::shared_storage_config::SharedStorageConfig;
 use crate::operations::types::{
-    CollectionError, CollectionResult, OptimizersStatus, ShardInfoInternal, ShardStatus,
-    ShardUpdateQueueInfo,
+    CollectionError, CollectionResult, OptimizersStatus, RateLimiterKind, ShardInfoInternal,
+    ShardStatus, ShardUpdateQueueInfo,
 };
 use crate::optimizers_builder::{OptimizersConfig, build_optimizers, clear_temp_segments};
 use crate::shards::CollectionId;
@@ -160,6 +164,7 @@ impl LocalShard {
         let ShardDataFiles {
             wal_path: wal_from,
             segments_path: segments_from,
+            segment_manifest_path: segment_manifest_path_from,
             newest_clocks_path: newest_clocks_path_from,
             oldest_clocks_path: oldest_clocks_path_from,
             applied_seq_path: applied_seq_path_from,
@@ -168,6 +173,7 @@ impl LocalShard {
         let ShardDataFiles {
             wal_path: wal_to,
             segments_path: segments_to,
+            segment_manifest_path: segment_manifest_path_to,
             newest_clocks_path: newest_clocks_path_to,
             oldest_clocks_path: oldest_clocks_path_to,
             applied_seq_path: applied_seq_path_to,
@@ -175,6 +181,10 @@ impl LocalShard {
 
         move_dir(wal_from, wal_to).await?;
         move_dir(segments_from, segments_to).await?;
+
+        if segment_manifest_path_from.exists() {
+            move_file(segment_manifest_path_from, segment_manifest_path_to).await?;
+        }
 
         if newest_clocks_path_from.exists() {
             move_file(newest_clocks_path_from, newest_clocks_path_to).await?;
@@ -205,6 +215,7 @@ impl LocalShard {
         let ShardDataFiles {
             wal_path,
             segments_path,
+            segment_manifest_path,
             newest_clocks_path,
             oldest_clocks_path,
             applied_seq_path,
@@ -216,6 +227,10 @@ impl LocalShard {
 
         if segments_path.exists() {
             tokio_fs::remove_dir_all(segments_path).await?;
+        }
+
+        if segment_manifest_path.exists() {
+            tokio_fs::remove_file(segment_manifest_path).await?;
         }
 
         if newest_clocks_path.exists() {
@@ -460,7 +475,7 @@ impl LocalShard {
                     .get(),
             );
 
-        let mut segment_holder = SegmentHolder::default();
+        let mut segment_holder = SegmentHolder::builder();
 
         while let Some(result) = segment_stream.next().await {
             let Some(segment) = result?? else {
@@ -479,6 +494,7 @@ impl LocalShard {
         clear_temp_segments(shard_path);
         let optimizers = build_optimizers(
             shard_path,
+            collection_config.clone(),
             &collection_config_read.params,
             &effective_optimizers_config,
             &collection_config_read.hnsw_config,
@@ -508,6 +524,9 @@ impl LocalShard {
                 deferred_internal_id,
             )?;
         }
+
+        // Finalize the holder, wiring up the segment manifest from the freshly populated set.
+        let segment_holder = segment_holder.build(shard_path)?;
 
         let local_shard = LocalShard::new(
             collection_id.clone(),
@@ -611,7 +630,7 @@ impl LocalShard {
                 ))
             })?;
 
-        let mut segment_holder = SegmentHolder::default();
+        let mut segment_holder = SegmentHolder::builder();
         let mut build_handlers = vec![];
 
         let vector_params = config
@@ -646,7 +665,7 @@ impl LocalShard {
             .collect_vec();
 
         for join_result in join_results {
-            let segment = join_result.map_err(|err| {
+            let (segment, _token) = join_result.map_err(|err| {
                 let message = panic::downcast_str(&err).unwrap_or("");
                 let separator = if !message.is_empty() { "with:\n" } else { "" };
 
@@ -663,6 +682,7 @@ impl LocalShard {
 
         let optimizers = build_optimizers(
             shard_path,
+            collection_config.clone(),
             &config.params,
             &effective_optimizers_config,
             &config.hnsw_config,
@@ -671,6 +691,9 @@ impl LocalShard {
         );
 
         drop(config); // release `shared_config` from borrow checker
+
+        // Finalize the holder, wiring up the segment manifest from the freshly populated set.
+        let segment_holder = segment_holder.build(shard_path)?;
 
         let local_shard = LocalShard::new(
             collection_id,
@@ -714,7 +737,35 @@ impl LocalShard {
 
         let from = wal.first_index();
         let last_wal_index = from + wal.len(false);
-        let op_num_upper_bound = self.applied_seq_handler.op_num_upper_bound();
+
+        // Honor `applied_seq` only when the collection prevents unoptimized segments, the same
+        // condition that gates the update worker's deferred-points wait.
+        //
+        // The split it drives skips no work: the synchronous pass below still starts at
+        // `first_index` and covers `[from, applied_seq + APPLIED_SEQ_SAVE_INTERVAL + 1)`, which is
+        // the *already applied* prefix. What it hands to the update worker instead is the
+        // genuinely unapplied tail. Routing that tail through the worker is what deferred points
+        // need: the worker signals the optimizer per operation, and optimization is the only thing
+        // that makes deferred points visible.
+        //
+        // Everywhere else that routing buys nothing and costs correctness. The tail is applied in
+        // the background *after* `load` returns, so the shard starts serving reads while
+        // operations that were already acknowledged to a client are still missing, and they
+        // reappear one by one as the worker catches up. Replaying the whole WAL synchronously here
+        // (the pre-`applied_seq` behavior) keeps the shard unavailable until every acknowledged
+        // operation is applied, which is what every read path assumes.
+        let prevent_unoptimized = self
+            .collection_config
+            .read()
+            .await
+            .optimizer_config
+            .prevent_unoptimized
+            .unwrap_or_default();
+        let op_num_upper_bound = if prevent_unoptimized {
+            self.applied_seq_handler.op_num_upper_bound()
+        } else {
+            None
+        };
         let to = op_num_upper_bound.unwrap_or(last_wal_index);
 
         // Cap the number of WAL entries to move to the update queue size,
@@ -726,11 +777,16 @@ impl LocalShard {
         );
 
         let to = cmp::min(to, last_wal_index);
-        debug_assert!(
-            from <= to,
-            "WAL first_index ({from}) is ahead of replay target ({to}) (last_wal_index:{last_wal_index} op_num_upper_bound:{op_num_upper_bound:?})"
-        );
-        let wal_entries_to_replay = to.saturating_sub(from);
+
+        // The WAL is only truncated past operations whose segment flush was confirmed, so
+        // `first_index` is itself a durable lower bound on the applied sequence and nothing
+        // before it ever needs replay. The persisted applied_seq can legitimately lag behind
+        // it: it is saved every `APPLIED_SEQ_SAVE_INTERVAL` update-worker calls from a counter
+        // that restarts at zero on every process start, and the synchronous replay below never
+        // feeds it. Without this clamp, a replay target computed from such a stale applied_seq
+        // would sit before `first_index`, targeting already-truncated entries.
+        let to = cmp::max(to, from);
+        let wal_entries_to_replay = to - from;
 
         assert!(
             last_wal_index - to <= update_queue_size as u64,
@@ -780,8 +836,17 @@ impl LocalShard {
         // (`SerdeWal::read_all` may even start reading WAL from some already truncated
         // index *occasionally*), but the storage can handle it.
 
+        // Vector names that currently exist in the collection. Historical WAL operations may
+        // reference a vector name that was since removed by `delete_named_vector`; replaying
+        // such an operation against the post-deletion segment config fails validation and the
+        // whole operation (with its points) is dropped. We strip the dead names before applying.
+        //
+        // Seeded from the current config and grown as the replay re-applies `CreateVectorName`
+        // operations, so a name that is created and used within the replay window stays valid.
+        let mut valid_vector_names = self.collection_config.read().await.params.vector_names();
+
         for entry in wal.read_range(from..to) {
-            let (op_num, update) = entry.map_err(|e| {
+            let (op_num, mut update) = entry.map_err(|e| {
                 CollectionError::service_error(format!(
                     "Failed to read WAL during recovery of {}: {e}",
                     self.path.display(),
@@ -790,6 +855,14 @@ impl LocalShard {
             if let Some(clock_tag) = update.clock_tag {
                 newest_clocks.advance_clock(clock_tag);
             }
+
+            // A historical `CreateVectorName` makes its name valid for every operation that
+            // follows it in the WAL; track it before stripping so those references survive.
+            if let Some(name) = update.operation.created_vector_name() {
+                valid_vector_names.insert(name.clone());
+            }
+
+            update.operation.retain_vector_names(&valid_vector_names);
 
             // Capture the operation type before `update.operation` is moved, so we can
             // report it if applying this operation turns out to be slow.
@@ -858,7 +931,7 @@ impl LocalShard {
             // Force a flush after re-applying WAL operations, to ensure we maintain on-disk data
             // consistency, if we happened to only apply *past* operations to a segment with newer
             // version.
-            segments.flush_all(true, true)?;
+            segments.flush_all(FlushMode::Sync, true)?;
         }
 
         bar.finish();
@@ -874,6 +947,38 @@ impl LocalShard {
 
         // Send remaining pending WAL elements to the update channel
         if to < last_wal_index {
+            // The update worker applies these queued tail entries but discards their clock tags
+            // (it deserializes only the operation), so advance the newest clocks here, exactly
+            // like the synchronous replay above. These operations are durably in the WAL, which
+            // is what the recovery point tracks; skipping them would let the recovery point
+            // regress across a restart, and the first post-restart updates would then reuse
+            // clock ticks that earlier WAL entries already carry for different operations.
+            //
+            // This tail is only ever non-empty under `prevent_unoptimized`: the
+            // `op_num_upper_bound` gate above gives up on `applied_seq` otherwise, which makes
+            // the synchronous replay exhaustive and leaves nothing to queue here.
+            //
+            // An unreadable entry is logged and skipped (its clock tag is lost, but its op_num is
+            // still enqueued below): the worker re-reads it and tolerates the same failure by
+            // log-and-skip, and failing the whole shard load here would turn a single bad tail
+            // entry into a node that cannot start.
+            //
+            // Two passes because the `read_range` iterator borrows the WAL and is not `Send`,
+            // so it cannot be held across the channel-send await below. The range end is
+            // `last_wal_index` *exclusive*: it is one past the last entry (`first_index + len`).
+            for entry in wal.read_range(to..last_wal_index) {
+                match entry {
+                    Ok((_op_num, update)) => {
+                        if let Some(clock_tag) = update.clock_tag {
+                            newest_clocks.advance_clock(clock_tag);
+                        }
+                    }
+                    Err(err) => log::error!(
+                        "Failed to read WAL tail entry during recovery of {}: {err}",
+                        self.path.display(),
+                    ),
+                }
+            }
             log::info!(
                 "Loading remaining {} WAL entries from:{to} into update queue",
                 last_wal_index - to
@@ -881,7 +986,7 @@ impl LocalShard {
             let update_sender = self.update_sender.load();
             // TODO use proper collection's hardware measurement
             let hw_measurements = HwMeasurementAcc::disposable();
-            for op_num in to..=last_wal_index {
+            for op_num in to..last_wal_index {
                 update_sender
                     .send(UpdateSignal::Operation(OperationData {
                         op_num,
@@ -1081,7 +1186,8 @@ impl LocalShard {
                 // TODO: snapshotting also creates temp proxy segments. should differentiate.
                 let has_special_segment = segments
                     .iter()
-                    .map(|(_, segment)| segment.get().read().info().segment_type)
+                    // `size_info` carries `segment_type` and cannot fail.
+                    .map(|(_, segment)| segment.get().read().size_info().segment_type)
                     .any(|segment_type| segment_type == SegmentType::Special);
                 if has_special_segment {
                     Some((ShardStatus::Yellow, OptimizersStatus::Ok))
@@ -1151,7 +1257,7 @@ impl LocalShard {
                 for segment in segments {
                     segments_count += 1;
 
-                    let segment_info = segment.get().read().info();
+                    let segment_info = segment.get().read().info()?;
 
                     indexed_vectors_count += segment_info.num_indexed_vectors;
                     points_count += segment_info.num_points;
@@ -1162,9 +1268,14 @@ impl LocalShard {
                             .or_insert(val);
                     }
                 }
-                (schema, indexed_vectors_count, points_count, segments_count)
+                OperationResult::Ok((schema, indexed_vectors_count, points_count, segments_count))
             })
             .await;
+
+        // Flatten the join error and the per-segment info error into one.
+        let segment_info = segment_info
+            .map_err(CollectionError::from)
+            .and_then(|info| info.map_err(CollectionError::from));
 
         if let Err(err) = &segment_info {
             log::error!("Failed to get local shard info: {err}");
@@ -1335,7 +1446,7 @@ impl LocalShard {
                 .try_consume(cost as f64)
                 .map_err(|err| {
                     log::debug!("Read rate limit error on {context} with {err:?}");
-                    CollectionError::rate_limit_error(err, cost, false)
+                    CollectionError::rate_limit_error(err, cost, RateLimiterKind::Read)
                 })?;
         }
         Ok(())
@@ -1363,7 +1474,9 @@ impl LocalShard {
             rate_limiter
                 .lock()
                 .try_consume(cost as f64)
-                .map_err(|err| CollectionError::rate_limit_error(err, cost, true))?;
+                .map_err(|err| {
+                    CollectionError::rate_limit_error(err, cost, RateLimiterKind::Write)
+                })?;
         }
         Ok(())
     }
@@ -1486,6 +1599,32 @@ impl LocalShardClocks {
         if oldest_clocks_from.exists() {
             tar.blocking_append_file(&oldest_clocks_from, Path::new(OLDEST_CLOCKS_PATH))?;
         }
+
+        Ok(())
+    }
+
+    /// Put the given clock maps into an archive.
+    ///
+    /// Unlike [`Self::archive_data`], which copies the persisted clock files from disk, this
+    /// serializes the provided clock maps directly into the archive. It is used for snapshots that
+    /// exclude the WAL (such as shard transfer): the persisted clocks track the WAL write position
+    /// and may be ahead of the snapshotted segment data, and without a WAL the recovered shard
+    /// cannot replay operations to catch up. The caller is responsible for providing clock maps that
+    /// the snapshot's segment data is guaranteed to include.
+    pub fn archive_data_from(
+        newest_clocks: &ClockMap,
+        oldest_clocks: &ClockMap,
+        tar: &tar_ext::BuilderExt,
+    ) -> CollectionResult<()> {
+        let newest_clocks_data = serde_json::to_vec(newest_clocks).map_err(|err| {
+            CollectionError::service_error(format!("Failed to serialize newest clock map: {err}"))
+        })?;
+        tar.blocking_append_data(&newest_clocks_data, Path::new(NEWEST_CLOCKS_PATH))?;
+
+        let oldest_clocks_data = serde_json::to_vec(oldest_clocks).map_err(|err| {
+            CollectionError::service_error(format!("Failed to serialize oldest clock map: {err}"))
+        })?;
+        tar.blocking_append_data(&oldest_clocks_data, Path::new(OLDEST_CLOCKS_PATH))?;
 
         Ok(())
     }

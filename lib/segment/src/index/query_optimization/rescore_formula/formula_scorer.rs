@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ops::Neg;
 
 use ahash::AHashMap;
+use common::condition_checker::ConditionChecker;
 use common::types::{PointOffsetType, ScoreType};
 use geo::{Distance, Haversine};
 use serde_json::Value;
@@ -11,7 +12,7 @@ use super::parsed_formula::{
 };
 use super::value_retriever::VariableRetrieverFn;
 use crate::common::operation_error::{OperationError, OperationResult};
-use crate::index::query_optimization::optimized_filter::{OptimizedCondition, check_condition};
+use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::json_path::JsonPath;
 use crate::types::{DateTimePayloadType, GeoPoint};
 
@@ -27,7 +28,7 @@ pub struct FormulaScorer<'a> {
     /// Payload key -> retriever function
     payload_retrievers: HashMap<JsonPath, VariableRetrieverFn<'a>>,
     /// Condition id -> checker function
-    condition_checkers: Vec<OptimizedCondition<'a>>,
+    condition_checkers: Vec<ConditionCheckerEnum<'a>>,
     /// Default values for all variables
     defaults: HashMap<VariableId, Value>,
 }
@@ -59,7 +60,7 @@ impl<'a> FormulaScorer<'a> {
         formula: ParsedExpression,
         prefetches_scores: &'a [AHashMap<PointOffsetType, ScoreType>],
         payload_retrievers: HashMap<JsonPath, VariableRetrieverFn<'a>>,
-        condition_checkers: Vec<OptimizedCondition<'a>>,
+        condition_checkers: Vec<ConditionCheckerEnum<'a>>,
         defaults: HashMap<VariableId, Value>,
     ) -> Self {
         FormulaScorer {
@@ -114,7 +115,7 @@ impl FormulaScorer<'_> {
                     })
                 }
                 VariableId::Condition(id) => {
-                    let value = check_condition(&self.condition_checkers[*id], point_id);
+                    let value = self.condition_checkers[*id].check(point_id)?;
                     let score = if value { 1.0 } else { 0.0 };
                     Ok(score)
                 }
@@ -346,6 +347,7 @@ fn linear_decay(x: PreciseScore, target: PreciseScore, lambda: PreciseScore) -> 
 mod tests {
     use std::collections::HashMap;
 
+    use common::condition_checker::ConstantConditionChecker;
     use rstest::rstest;
     use serde_json::json;
     use smallvec::smallvec;
@@ -399,8 +401,8 @@ mod tests {
             );
 
             let condition_checkers = vec![
-                OptimizedCondition::Checker(Box::new(|_| true)),
-                OptimizedCondition::Checker(Box::new(|_| false)),
+                ConditionCheckerEnum::Constant(ConstantConditionChecker::MATCH_ALL),
+                ConditionCheckerEnum::Constant(ConstantConditionChecker::MATCH_NONE),
             ];
 
             FormulaScorer {

@@ -7,9 +7,7 @@ use super::{BucketOffset, Key, MaybeIncompleteEntry, MaybeIncompleteEntryKind, U
 use crate::aligned_buf::AlignedBuf;
 use crate::generic_consts::Random;
 use crate::persisted_hashmap::uio::parse_bucket_offset;
-use crate::universal_io::{
-    BorrowedReadPipeline, Result, UniversalIoError, UniversalRead, UserData,
-};
+use crate::universal_io::{ReadPipeline, UioResult, UniversalIoError, UniversalRead, UserData};
 
 pub(super) enum Request<'a, K: Key + ?Sized> {
     /// Request an entry by the given offset with unknown key.
@@ -36,6 +34,21 @@ where
 struct Entry<'a, U: UserData, K: Key + ?Sized> {
     user_data: U,
     state: State<'a, K>,
+}
+
+// Manual `Debug` impl: `Entry` is used as user data for the read pipeline, so it
+// must be `Debug` (via `UserData`). Only `user_data` is printed; `state` carries
+// buffers and key references that are not `Debug`.
+impl<U: std::fmt::Debug + UserData, K: Key + ?Sized> std::fmt::Debug for Entry<'_, U, K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            user_data,
+            state: _,
+        } = self;
+        f.debug_struct("Entry")
+            .field("user_data", user_data)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Lifecycle:
@@ -81,7 +94,7 @@ where
         E: From<UniversalIoError>,
     {
         let mut sparse = PipelineDriver::new(self, entry_kind)?;
-        let mut pipeline = S::BorrowedReadPipeline::new()?;
+        let mut pipeline = S::ReadPipeline::new()?;
         let mut requests = requests.into_iter();
         loop {
             while pipeline.can_schedule() {
@@ -117,7 +130,7 @@ where
     fn new(
         map: &'map UniversalHashMap<K, V, S>,
         entry_kind: MaybeIncompleteEntryKind,
-    ) -> Result<Self> {
+    ) -> UioResult<Self> {
         Ok(Self {
             map,
             entry_kind,

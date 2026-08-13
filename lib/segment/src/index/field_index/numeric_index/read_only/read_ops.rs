@@ -3,24 +3,25 @@
 
 use std::ops::Bound;
 
+use blobstore::Blob;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use common::universal_io::UniversalRead;
-use gridstore::Blob;
+use common::universal_io::{UniversalRead, UserData};
 
-use super::super::Encodable;
 use super::super::numeric_index_read::NumericIndexRead;
+use super::super::{Encodable, NumericIndexValue};
 use super::ReadOnlyNumericIndex;
 use crate::common::operation_error::OperationResult;
+use crate::index::UniversalReadExt;
+use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::index::field_index::histogram::Histogram;
 use crate::index::field_index::numeric_point::{Numericable, Point};
-use crate::index::field_index::stored_point_to_values::StoredValue;
+use crate::index::field_index::on_disk_point_to_values::StoredValue;
 use crate::index::field_index::{
     CardinalityEstimation, PayloadBlockCondition, PayloadFieldIndexRead,
 };
 use crate::index::payload_config::StorageType;
-use crate::index::query_optimization::optimized_filter::ConditionCheckerFn;
 use crate::types::{FieldCondition, PayloadKeyType};
 
 impl<T: Encodable + Numericable + StoredValue + Send + Sync + Default, P, S: UniversalRead>
@@ -35,6 +36,23 @@ where
         hw_counter: &HardwareCounterCell,
     ) -> bool {
         self.inner.check_values_any(idx, check_fn, hw_counter)
+    }
+
+    fn for_each_matching_value<I, F, M, U>(
+        &self,
+        items: I,
+        hw_counter: &HardwareCounterCell,
+        check_fn: F,
+        on_match: M,
+    ) -> OperationResult<()>
+    where
+        U: UserData,
+        I: Iterator<Item = (U, PointOffsetType)>,
+        F: Fn(&T) -> bool,
+        M: FnMut(U, bool),
+    {
+        self.inner
+            .for_each_matching_value(items, hw_counter, check_fn, on_match)
     }
 
     fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>> {
@@ -91,12 +109,12 @@ where
     }
 }
 
-impl<T: Encodable + Numericable + StoredValue + Send + Sync + Default, P, S: UniversalRead>
-    PayloadFieldIndexRead for ReadOnlyNumericIndex<T, P, S>
+impl<T: NumericIndexValue, P, S: UniversalReadExt> PayloadFieldIndexRead
+    for ReadOnlyNumericIndex<T, P, S>
 where
     Vec<T>: Blob,
 {
-    fn count_indexed_points(&self) -> usize {
+    fn count_indexed_points(&self) -> OperationResult<usize> {
         self.inner.count_indexed_points()
     }
 
@@ -129,7 +147,7 @@ where
         &'a self,
         condition: &FieldCondition,
         hw_acc: HwMeasurementAcc,
-    ) -> Option<ConditionCheckerFn<'a>> {
+    ) -> OperationResult<Option<ConditionCheckerEnum<'a>>> {
         self.inner.condition_checker(condition, hw_acc)
     }
 }

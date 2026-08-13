@@ -418,6 +418,9 @@ ACTION_ACCESS = {
     "cluster_telemetry": EndpointAccess(True, True, True, "GET /cluster/telemetry"),
     "recover_raft_state": EndpointAccess(False, False, True, "POST /cluster/recover"),
     "delete_peer": EndpointAccess(False, False, True, "DELETE /cluster/peer/{peer_id}"),
+    ### Quotas ###
+    "get_quotas": EndpointAccess(True, False, True, "GET /quotas", coll_r=False),
+    "update_quotas": EndpointAccess(False, False, True, "PUT /quotas"),
     ### Points ###
     "get_point": EndpointAccess(
         True,
@@ -641,9 +644,6 @@ ACTION_ACCESS = {
     ),
     "storage_read_read_batch": EndpointAccess(
         True, True, True, None, "qdrant.StorageRead/ReadBatch"
-    ),
-    "storage_read_read_multi": EndpointAccess(
-        True, True, True, None, "qdrant.StorageRead/ReadMulti"
     ),
 }
 
@@ -1540,6 +1540,15 @@ def test_delete_peer():
     check_access("delete_peer", path_params={"peer_id": "2000"})
 
 
+def test_get_quotas():
+    check_access("get_quotas")
+
+
+def test_update_quotas():
+    # Keep quotas disabled, so an authorized call does not affect other tests
+    check_access("update_quotas", rest_request={"enabled": False})
+
+
 def test_get_point():
     check_access(
         "get_point",
@@ -2088,16 +2097,5 @@ def test_storage_read_read_batch():
             "shard_id": STORAGE_READ_SHARD_ID,
             "path": STORAGE_READ_TEST_PATH,
             "ranges": [{"byteOffset": 0, "length": 1}],
-        },
-    )
-
-
-def test_storage_read_read_multi():
-    check_access(
-        "storage_read_read_multi",
-        grpc_request={
-            "collection_name": COLL_NAME,
-            "shard_id": STORAGE_READ_SHARD_ID,
-            "reads": [{"path": STORAGE_READ_TEST_PATH, "byteOffset": 0, "length": 1}],
         },
     )

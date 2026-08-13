@@ -1,3 +1,6 @@
+use common::condition_checker::{
+    CheckItem, ConditionChecker, ConstantConditionChecker, Partitioner, Rest, Select,
+};
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
@@ -8,15 +11,15 @@ use super::FullTextIndex;
 use super::full_text_index_read::{FullTextIndexRead, PayloadMatchQueryType};
 use super::inverted_index::{ParsedQuery, TokenId};
 use super::tokenizers::Tokenizer;
-use crate::common::operation_error::OperationResult;
+use crate::common::operation_error::{OperationError, OperationResult};
+use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::index::field_index::{
     CardinalityEstimation, PayloadBlockCondition, PayloadFieldIndexRead,
 };
 use crate::index::payload_config::StorageType;
-use crate::index::query_optimization::optimized_filter::ConditionCheckerFn;
 use crate::types::{
-    FieldCondition, Match, MatchAny, MatchExcept, MatchPhrase, MatchText, MatchTextAny, MatchValue,
-    PayloadKeyType,
+    FieldCondition, Match, MatchAny, MatchExcept, MatchPhrase, MatchPrefix, MatchText,
+    MatchTextAny, MatchValue, PayloadKeyType,
 };
 
 impl FullTextIndexRead for FullTextIndex {
@@ -24,7 +27,7 @@ impl FullTextIndexRead for FullTextIndex {
         match self {
             Self::Mutable(index) => index.tokenizer(),
             Self::Immutable(index) => index.tokenizer(),
-            Self::Mmap(index) => index.tokenizer(),
+            Self::OnDisk(index) => index.tokenizer(),
         }
     }
 
@@ -32,7 +35,7 @@ impl FullTextIndexRead for FullTextIndex {
         match self {
             Self::Mutable(index) => index.telemetry_index_type(),
             Self::Immutable(index) => index.telemetry_index_type(),
-            Self::Mmap(index) => index.telemetry_index_type(),
+            Self::OnDisk(index) => index.telemetry_index_type(),
         }
     }
 
@@ -40,7 +43,7 @@ impl FullTextIndexRead for FullTextIndex {
         match self {
             Self::Mutable(index) => index.points_count(),
             Self::Immutable(index) => index.points_count(),
-            Self::Mmap(index) => index.points_count(),
+            Self::OnDisk(index) => index.points_count(),
         }
     }
 
@@ -48,7 +51,7 @@ impl FullTextIndexRead for FullTextIndex {
         match self {
             Self::Mutable(index) => index.values_count(point_id),
             Self::Immutable(index) => index.values_count(point_id),
-            Self::Mmap(index) => index.values_count(point_id),
+            Self::OnDisk(index) => index.values_count(point_id),
         }
     }
 
@@ -56,7 +59,7 @@ impl FullTextIndexRead for FullTextIndex {
         match self {
             Self::Mutable(index) => index.values_is_empty(point_id),
             Self::Immutable(index) => index.values_is_empty(point_id),
-            Self::Mmap(index) => index.values_is_empty(point_id),
+            Self::OnDisk(index) => index.values_is_empty(point_id),
         }
     }
 
@@ -69,7 +72,7 @@ impl FullTextIndexRead for FullTextIndex {
         match self {
             Self::Mutable(index) => index.for_each_token_id(iter, hw_counter, f),
             Self::Immutable(index) => index.for_each_token_id(iter, hw_counter, f),
-            Self::Mmap(index) => index.for_each_token_id(iter, hw_counter, f),
+            Self::OnDisk(index) => index.for_each_token_id(iter, hw_counter, f),
         }
     }
 
@@ -81,7 +84,7 @@ impl FullTextIndexRead for FullTextIndex {
         match self {
             Self::Mutable(index) => index.filter_query(query, hw_counter),
             Self::Immutable(index) => index.filter_query(query, hw_counter),
-            Self::Mmap(index) => index.filter_query(query, hw_counter),
+            Self::OnDisk(index) => index.filter_query(query, hw_counter),
         }
     }
 
@@ -96,7 +99,7 @@ impl FullTextIndexRead for FullTextIndex {
             Self::Immutable(index) => {
                 index.estimate_query_cardinality(query, condition, hw_counter)
             }
-            Self::Mmap(index) => index.estimate_query_cardinality(query, condition, hw_counter),
+            Self::OnDisk(index) => index.estimate_query_cardinality(query, condition, hw_counter),
         }
     }
 
@@ -104,7 +107,20 @@ impl FullTextIndexRead for FullTextIndex {
         match self {
             Self::Mutable(index) => index.check_match(query, point_id),
             Self::Immutable(index) => index.check_match(query, point_id),
-            Self::Mmap(index) => index.check_match(query, point_id),
+            Self::OnDisk(index) => index.check_match(query, point_id),
+        }
+    }
+
+    fn check_match_batch<U: UserData>(
+        &self,
+        query: &ParsedQuery,
+        items: impl Iterator<Item = (U, PointOffsetType)>,
+        on_match: impl FnMut(U, bool),
+    ) -> OperationResult<()> {
+        match self {
+            Self::Mutable(index) => index.check_match_batch(query, items, on_match),
+            Self::Immutable(index) => index.check_match_batch(query, items, on_match),
+            Self::OnDisk(index) => index.check_match_batch(query, items, on_match),
         }
     }
 
@@ -117,7 +133,7 @@ impl FullTextIndexRead for FullTextIndex {
         match self {
             Self::Mutable(index) => index.for_each_payload_block_inner(threshold, key, f),
             Self::Immutable(index) => index.for_each_payload_block_inner(threshold, key, f),
-            Self::Mmap(index) => index.for_each_payload_block_inner(threshold, key, f),
+            Self::OnDisk(index) => index.for_each_payload_block_inner(threshold, key, f),
         }
     }
 
@@ -125,7 +141,7 @@ impl FullTextIndexRead for FullTextIndex {
         match self {
             Self::Mutable(index) => FullTextIndexRead::get_storage_type(index),
             Self::Immutable(index) => FullTextIndexRead::get_storage_type(index),
-            Self::Mmap(index) => FullTextIndexRead::get_storage_type(index.as_ref()),
+            Self::OnDisk(index) => FullTextIndexRead::get_storage_type(index),
         }
     }
 
@@ -133,7 +149,7 @@ impl FullTextIndexRead for FullTextIndex {
         match self {
             Self::Mutable(index) => FullTextIndexRead::ram_usage_bytes(index),
             Self::Immutable(index) => FullTextIndexRead::ram_usage_bytes(index),
-            Self::Mmap(index) => FullTextIndexRead::ram_usage_bytes(index.as_ref()),
+            Self::OnDisk(index) => FullTextIndexRead::ram_usage_bytes(index),
         }
     }
 
@@ -141,14 +157,14 @@ impl FullTextIndexRead for FullTextIndex {
         match self {
             Self::Mutable(index) => FullTextIndexRead::is_on_disk(index),
             Self::Immutable(index) => FullTextIndexRead::is_on_disk(index),
-            Self::Mmap(index) => FullTextIndexRead::is_on_disk(index.as_ref()),
+            Self::OnDisk(index) => FullTextIndexRead::is_on_disk(index),
         }
     }
 }
 
 impl PayloadFieldIndexRead for FullTextIndex {
-    fn count_indexed_points(&self) -> usize {
-        FullTextIndexRead::points_count(self)
+    fn count_indexed_points(&self) -> OperationResult<usize> {
+        Ok(FullTextIndexRead::points_count(self))
     }
 
     fn filter<'a>(
@@ -180,8 +196,13 @@ impl PayloadFieldIndexRead for FullTextIndex {
         &'a self,
         condition: &FieldCondition,
         hw_acc: HwMeasurementAcc,
-    ) -> Option<ConditionCheckerFn<'a>> {
-        condition_checker(self, condition, hw_acc)
+    ) -> OperationResult<Option<ConditionCheckerEnum<'a>>> {
+        condition_checker(
+            self,
+            condition,
+            hw_acc,
+            ConditionCheckerEnum::FullTextWritable,
+        )
     }
 
     fn special_check_condition(
@@ -225,7 +246,9 @@ pub fn filter<'a, T: FullTextIndexRead>(
         Match::TextAny(MatchTextAny { text_any }) => {
             index.parse_text_any_query(text_any, hw_counter)
         }
-        Match::Value(_) | Match::Any(_) | Match::Except(_) => return Ok(None),
+        Match::Value(_) | Match::Any(_) | Match::Except(_) | Match::Prefix(_) => {
+            return Ok(None);
+        }
     }?;
 
     let Some(parsed_query) = parsed_query_opt else {
@@ -251,7 +274,9 @@ pub fn estimate_cardinality<T: FullTextIndexRead>(
         Match::TextAny(MatchTextAny { text_any }) => {
             index.parse_text_any_query(text_any, hw_counter)
         }
-        Match::Value(_) | Match::Any(_) | Match::Except(_) => return Ok(None),
+        Match::Value(_) | Match::Any(_) | Match::Except(_) | Match::Prefix(_) => {
+            return Ok(None);
+        }
     }?;
 
     let Some(parsed_query) = parsed_query_opt else {
@@ -280,7 +305,8 @@ pub fn condition_checker<'a, T: FullTextIndexRead>(
     index: &'a T,
     condition: &FieldCondition,
     hw_acc: HwMeasurementAcc,
-) -> Option<ConditionCheckerFn<'a>> {
+    to_enum: impl FnOnce(FullTextConditionChecker<'a, T>) -> ConditionCheckerEnum<'a>,
+) -> OperationResult<Option<ConditionCheckerEnum<'a>>> {
     // Destructure explicitly (no `..`) so a new field added to
     // `FieldCondition` forces this method to be revisited.
     let FieldCondition {
@@ -295,7 +321,9 @@ pub fn condition_checker<'a, T: FullTextIndexRead>(
         is_null: _,
     } = condition;
 
-    let cond_match = r#match.as_ref()?;
+    let Some(cond_match) = r#match.as_ref() else {
+        return Ok(None);
+    };
     let hw_counter = hw_acc.get_counter_cell();
 
     // FullTextIndex serves Text / TextAny / Phrase only. Other
@@ -307,26 +335,54 @@ pub fn condition_checker<'a, T: FullTextIndexRead>(
         Match::Phrase(MatchPhrase { phrase }) => (phrase, PayloadMatchQueryType::Phrase),
         Match::Value(MatchValue { value: _ })
         | Match::Any(MatchAny { any: _ })
-        | Match::Except(MatchExcept { except: _ }) => return None,
+        | Match::Except(MatchExcept { except: _ })
+        | Match::Prefix(MatchPrefix { prefix: _ }) => return Ok(None),
     };
 
     let query_opt = match query_type {
         PayloadMatchQueryType::Phrase => index.parse_phrase_query(text, &hw_counter),
         PayloadMatchQueryType::Text => index.parse_text_query(text, &hw_counter),
         PayloadMatchQueryType::TextAny => index.parse_text_any_query(text, &hw_counter),
+    }?;
+
+    let Some(parsed_query) = query_opt else {
+        return Ok(Some(ConditionCheckerEnum::Constant(
+            ConstantConditionChecker::MATCH_NONE,
+        )));
     };
 
-    // Empty query or parse error: legacy behaviour returns a checker
-    // that always says false. FIXME(uio): the error arm silently
-    // ignores errors — see the existing TODO on `check_match` below.
-    let Ok(Some(parsed_query)) = query_opt else {
-        return Some(Box::new(|_| false));
-    };
+    Ok(Some(to_enum(FullTextConditionChecker {
+        index,
+        parsed_query,
+    })))
+}
 
-    Some(Box::new(move |point_id: PointOffsetType| {
-        // FIXME(uio): don't silently ignore errors. Log error? Update ConditionCheckerFn?
-        index.check_match(&parsed_query, point_id).unwrap_or(false)
-    }))
+pub struct FullTextConditionChecker<'a, T> {
+    index: &'a T,
+    parsed_query: ParsedQuery,
+}
+
+impl<T: FullTextIndexRead> ConditionChecker for FullTextConditionChecker<'_, T> {
+    type Error = OperationError;
+
+    fn check(&self, point_id: PointOffsetType) -> OperationResult<bool> {
+        self.index.check_match(&self.parsed_query, point_id)
+    }
+
+    fn check_batched<K: CheckItem>(
+        &self,
+        ids: &mut [K],
+        select: Select,
+        _rest: Rest,
+    ) -> OperationResult<usize> {
+        let p = Partitioner::new(ids);
+        self.index.check_match_batch(
+            &self.parsed_query,
+            p.iter().map(|item| (item, item.point_id())),
+            |item, matched| p.write(item, matched == select.is_match()),
+        )?;
+        Ok(p.finish())
+    }
 }
 
 /// Body for [`PayloadFieldIndexRead::special_check_condition`]. Shared.
@@ -355,6 +411,6 @@ pub fn special_check_condition<T: FullTextIndexRead>(
             PayloadMatchQueryType::TextAny,
             hw_counter,
         )?),
-        Some(Match::Value(_) | Match::Any(_) | Match::Except(_)) | None => None,
+        Some(Match::Value(_) | Match::Any(_) | Match::Except(_) | Match::Prefix(_)) | None => None,
     })
 }

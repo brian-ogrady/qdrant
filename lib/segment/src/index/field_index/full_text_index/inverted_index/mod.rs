@@ -1,8 +1,8 @@
 pub(super) mod immutable_inverted_index;
 pub mod immutable_postings_enum;
-pub(super) mod mmap_inverted_index;
 pub(super) mod mutable_inverted_index;
 pub(super) mod mutable_inverted_index_builder;
+pub(super) mod on_disk_inverted_index;
 mod positions;
 mod posting_list;
 mod postings_iterator;
@@ -412,17 +412,17 @@ pub trait InvertedIndex {
 #[cfg(test)]
 mod tests {
 
-    use common::bitvec::{BitSliceExt, BitVec};
+    use common::bitvec::BitVec;
     use common::counter::hardware_counter::HardwareCounterCell;
-    use common::universal_io::MmapFs;
+    use common::universal_io::{MmapFs, Populate};
     use rand::RngExt;
     use rand::seq::SliceRandom;
     use rstest::rstest;
 
     use super::{Document, InvertedIndex, ParsedQuery, TokenId, TokenSet};
     use crate::index::field_index::full_text_index::inverted_index::immutable_inverted_index::ImmutableInvertedIndex;
-    use crate::index::field_index::full_text_index::inverted_index::mmap_inverted_index::MmapInvertedIndex;
     use crate::index::field_index::full_text_index::inverted_index::mutable_inverted_index::MutableInvertedIndex;
+    use crate::index::field_index::full_text_index::inverted_index::on_disk_inverted_index::OnDiskInvertedIndex;
 
     fn generate_word() -> String {
         let mut rng = rand::rng();
@@ -560,12 +560,12 @@ mod tests {
 
         let hw_counter = HardwareCounterCell::new();
 
-        MmapInvertedIndex::create(mmap_dir.path().into(), &immutable).unwrap();
+        OnDiskInvertedIndex::create(mmap_dir.path().into(), &immutable).unwrap();
         let empty_deleted = BitVec::new();
-        let mmap: MmapInvertedIndex = MmapInvertedIndex::open(
+        let mmap: OnDiskInvertedIndex = OnDiskInvertedIndex::open(
             &MmapFs,
             mmap_dir.path().into(),
-            false,
+            Populate::No,
             phrase_matching,
             &empty_deleted,
         )
@@ -615,8 +615,8 @@ mod tests {
         for (point_id, count) in immutable.point_to_tokens_count.iter().enumerate() {
             // Check same deleted points
             assert_eq!(
-                mmap.storage.deleted_points.get_bit(point_id).unwrap(),
-                *count == 0,
+                mmap.storage.deleted_points.is_active(point_id as u32),
+                *count != 0,
                 "point_id: {point_id}",
             );
 
@@ -626,7 +626,7 @@ mod tests {
         }
 
         // Check same points count
-        assert_eq!(immutable.points_count, mmap.active_points_count);
+        assert_eq!(immutable.points_count, mmap.points_count());
         assert_eq!(immutable.points_count, imm_mmap.points_count);
     }
 
@@ -641,12 +641,12 @@ mod tests {
         let mut mut_index = mutable_inverted_index(indexed_count, deleted_count, phrase_matching);
 
         let immutable = ImmutableInvertedIndex::from(mut_index.clone());
-        MmapInvertedIndex::create(mmap_dir.path().into(), &immutable).unwrap();
+        OnDiskInvertedIndex::create(mmap_dir.path().into(), &immutable).unwrap();
         let empty_deleted = BitVec::new();
-        let mut mmap_index = MmapInvertedIndex::open(
+        let mut mmap_index = OnDiskInvertedIndex::open(
             &MmapFs,
             mmap_dir.path().into(),
-            false,
+            Populate::No,
             phrase_matching,
             &empty_deleted,
         )
@@ -698,7 +698,7 @@ mod tests {
         mmap_parsed_queries: &[Option<ParsedQuery>],
         imm_mmap_parsed_queries: &[Option<ParsedQuery>],
         mut_index: &MutableInvertedIndex,
-        mmap_index: &MmapInvertedIndex,
+        mmap_index: &OnDiskInvertedIndex,
         imm_mmap_index: &ImmutableInvertedIndex,
         hw_counter: &HardwareCounterCell,
     ) {

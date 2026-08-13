@@ -18,7 +18,7 @@ use crate::types::{Condition, Filter, MinShould};
 ///
 /// * `estimation` - cardinality estimations of number of points selected by payload filter
 /// * `available_vectors` - number of available vectors for the named vector storage
-/// * `total_vectors` - total number of points in the segment
+/// * `available_points` - number of available (non-deleted) points in the segment
 ///
 /// # Result
 ///
@@ -234,6 +234,7 @@ where
         | Condition::IsNull(_)
         | Condition::HasId(_)
         | Condition::HasVector(_)
+        | Condition::Slice(_)
         | Condition::Nested(_)
         | Condition::CustomIdChecker(_) => estimator(condition),
     }
@@ -386,6 +387,7 @@ mod tests {
             Condition::Filter(_) => panic!("unexpected Filter"),
             Condition::Nested(_) => panic!("unexpected Nested"),
             Condition::CustomIdChecker(_) => panic!("unexpected CustomIdChecker"),
+            Condition::Slice(_) => panic!("unexpected Slice"),
             Condition::Field(field) => match field.key.to_string().as_str() {
                 "color" => CardinalityEstimation {
                     primary_clauses: vec![PrimaryCondition::Condition(Box::new(field.clone()))],

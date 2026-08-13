@@ -204,7 +204,8 @@ fn build_tokens_processor(
 
     let stemmer = match stemmer {
         None => Stemmer::try_default_from_language(&language_str),
-        Some(algorithm) => Some(Stemmer::from_algorithm(&algorithm)),
+        // `Disabled` resolves to `None` here, giving an explicit opt-out of stemming.
+        Some(algorithm) => Stemmer::from_algorithm(&algorithm),
     };
 
     let stopwords_config = match stopwords {
@@ -224,6 +225,8 @@ fn build_tokens_processor(
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     #[test]
@@ -262,13 +265,35 @@ mod tests {
     }
 
     #[test]
+    fn disabled_stemmer_keeps_inflections_distinct() {
+        use segment::data_types::index::{DisabledStemmerParams, NoStemmer};
+
+        let stemmed = EdgeBm25::new(EdgeBm25Config::default()).unwrap();
+        // English default stems "running" -> "run", colliding with "run".
+        let stemmed_vec = stemmed.embed_document("running run");
+        assert_eq!(stemmed_vec.indices.len(), 1);
+
+        let cfg = EdgeBm25Config {
+            stemmer: Some(StemmingAlgorithm::Disabled(DisabledStemmerParams {
+                r#type: NoStemmer::None,
+            })),
+            // Empty stopword set: the recommended language-neutral setup.
+            stopwords: Some(StopwordsInterface::Set(Default::default())),
+            ..Default::default()
+        };
+        let unstemmed = EdgeBm25::new(cfg).unwrap();
+        let unstemmed_vec = unstemmed.embed_document("running run");
+        assert_eq!(unstemmed_vec.indices.len(), 2);
+    }
+
+    #[test]
     fn unsupported_language_is_rejected() {
         let cfg = EdgeBm25Config {
             language: Some("klingon".to_string()),
             ..Default::default()
         };
         let err = EdgeBm25::new(cfg).expect_err("klingon should not be accepted");
-        assert!(matches!(err, EdgeBm25Error::UnsupportedLanguage(ref s) if s == "klingon"));
+        assert_matches!(err, EdgeBm25Error::UnsupportedLanguage(ref s) if s == "klingon");
     }
 
     #[test]
@@ -278,6 +303,6 @@ mod tests {
             ..Default::default()
         };
         let err = EdgeBm25::new(cfg).expect_err("avg_len=0 should not be accepted");
-        assert!(matches!(err, EdgeBm25Error::Bm25(_)));
+        assert_matches!(err, EdgeBm25Error::Bm25(_));
     }
 }

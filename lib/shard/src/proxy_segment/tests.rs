@@ -55,7 +55,7 @@ impl ProxySegment {
 /// `deleted_mask` is a snapshot of the wrapped segment's deleted bitvec. If it is synced while
 /// the wrapped segment is still appendable, an upsert can still land afterwards at an internal
 /// offset past the snapshot; the scored search consults `deleted_mask` and treats every
-/// out-of-range offset as deleted (`check_deleted_condition` → `unwrap_or(true)`), silently
+/// out-of-range offset as deleted (`NotDeletedChecker` → `unwrap_or(true)`), silently
 /// excluding the live point even though scroll/retrieve still see it.
 ///
 /// [`UnsyncedProxySegment::finalize`] is what reads the mask, so the fix is timing: finalize
@@ -348,7 +348,7 @@ fn test_read_filter() {
             None,
             &is_stopped,
             &hw_counter,
-            DeferredBehavior::Exclude,
+            DeferredBehavior::VisibleOnly,
         )
         .unwrap();
 
@@ -361,7 +361,7 @@ fn test_read_filter() {
             Some(&filter),
             &is_stopped,
             &hw_counter,
-            DeferredBehavior::Exclude,
+            DeferredBehavior::VisibleOnly,
         )
         .unwrap();
 
@@ -380,7 +380,7 @@ fn test_read_filter() {
             None,
             &is_stopped,
             &hw_counter,
-            DeferredBehavior::Exclude,
+            DeferredBehavior::VisibleOnly,
         )
         .unwrap();
     let proxy_res_filtered = proxy_segment
@@ -390,7 +390,7 @@ fn test_read_filter() {
             Some(&filter),
             &is_stopped,
             &hw_counter,
-            DeferredBehavior::Exclude,
+            DeferredBehavior::VisibleOnly,
         )
         .unwrap();
 
@@ -541,7 +541,7 @@ fn test_point_vector_count() {
     let mut proxy_segment = ProxySegment::new(original_segment);
 
     // We have 5 points by default, assert counts
-    let segment_info = proxy_segment.info();
+    let segment_info = proxy_segment.info().unwrap();
     assert_eq!(segment_info.num_points, 5);
     assert_eq!(segment_info.num_vectors, 5);
 
@@ -549,13 +549,13 @@ fn test_point_vector_count() {
     proxy_segment
         .delete_point(101, 99999.into(), &hw_cell)
         .unwrap();
-    let segment_info = proxy_segment.info();
+    let segment_info = proxy_segment.info().unwrap();
     assert_eq!(segment_info.num_points, 5);
     assert_eq!(segment_info.num_vectors, 5);
 
     // Delete point 1, counts should decrease by 1
     proxy_segment.delete_point(102, 4.into(), &hw_cell).unwrap();
-    let segment_info = proxy_segment.info();
+    let segment_info = proxy_segment.info().unwrap();
     assert_eq!(segment_info.num_points, 4);
     assert_eq!(segment_info.num_vectors, 4);
 }
@@ -563,7 +563,7 @@ fn test_point_vector_count() {
 #[test]
 fn test_point_vector_count_multivec() {
     use segment::segment_constructor::simple_segment_constructor::{
-        VECTOR1_NAME, VECTOR2_NAME, build_multivec_segment,
+        VECTOR1_NAME, VECTOR2_NAME, build_segment_with_two_named_vecs,
     };
     use segment::types::Distance;
 
@@ -571,7 +571,8 @@ fn test_point_vector_count_multivec() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let dim = 1;
 
-    let mut original_segment = build_multivec_segment(dir.path(), dim, dim, Distance::Dot).unwrap();
+    let mut original_segment =
+        build_segment_with_two_named_vecs(dir.path(), dim, dim, Distance::Dot).unwrap();
 
     let hw_cell = HardwareCounterCell::new();
 
@@ -603,19 +604,19 @@ fn test_point_vector_count_multivec() {
     let mut proxy_segment = ProxySegment::new(original_segment);
 
     // Assert counts from original segment
-    let segment_info = proxy_segment.info();
+    let segment_info = proxy_segment.info().unwrap();
     assert_eq!(segment_info.num_points, 2);
     assert_eq!(segment_info.num_vectors, 4);
 
     // Delete nonexistent point, counts should remain the same
     proxy_segment.delete_point(104, 1.into(), &hw_cell).unwrap();
-    let segment_info = proxy_segment.info();
+    let segment_info = proxy_segment.info().unwrap();
     assert_eq!(segment_info.num_points, 2);
     assert_eq!(segment_info.num_vectors, 4);
 
     // Delete point 4, counts should decrease by 1
     proxy_segment.delete_point(105, 4.into(), &hw_cell).unwrap();
-    let segment_info = proxy_segment.info();
+    let segment_info = proxy_segment.info().unwrap();
     assert_eq!(segment_info.num_points, 1);
     assert_eq!(segment_info.num_vectors, 2);
 }

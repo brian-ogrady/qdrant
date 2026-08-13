@@ -1,8 +1,9 @@
 use std::ops::Bound;
 
+use blobstore::Blob;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use gridstore::Blob;
+use common::universal_io::UniversalRead;
 
 use super::super::Encodable;
 use super::super::numeric_index_read::NumericIndexRead;
@@ -10,10 +11,14 @@ use super::ImmutableNumericIndex;
 use crate::common::operation_error::OperationResult;
 use crate::index::field_index::histogram::Histogram;
 use crate::index::field_index::numeric_point::{Numericable, Point};
-use crate::index::field_index::stored_point_to_values::StoredValue;
+use crate::index::field_index::on_disk_point_to_values::StoredValue;
 use crate::index::payload_config::StorageType;
 
-impl<T: Encodable + Numericable + StoredValue + Default> ImmutableNumericIndex<T> {
+impl<T, S> ImmutableNumericIndex<T, S>
+where
+    T: Encodable + Numericable + StoredValue + Default,
+    S: UniversalRead,
+{
     pub(super) fn compute_ram_usage_bytes(&self) -> usize {
         let Self {
             map,
@@ -29,10 +34,11 @@ impl<T: Encodable + Numericable + StoredValue + Default> ImmutableNumericIndex<T
     }
 }
 
-impl<T: Encodable + Numericable + StoredValue + Send + Sync + Default> NumericIndexRead<T>
-    for ImmutableNumericIndex<T>
+impl<T, S> NumericIndexRead<T> for ImmutableNumericIndex<T, S>
 where
     Vec<T>: Blob,
+    T: Encodable + Numericable + StoredValue + Send + Sync + Default,
+    S: UniversalRead,
 {
     fn check_values_any(
         &self,
@@ -104,9 +110,7 @@ where
     }
 
     fn storage_type(&self) -> StorageType {
-        StorageType::Mmap {
-            is_on_disk: self.storage.is_on_disk(),
-        }
+        StorageType::Mmap { is_on_disk: false }
     }
 
     /// Approximate RAM usage in bytes for in-memory structures (cached at construction).

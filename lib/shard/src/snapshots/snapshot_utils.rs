@@ -32,12 +32,12 @@ impl SnapshotUtils {
         // Read dir first as the directory contents would change during restore
         let entries = fs::read_dir(segments_path(snapshot_path))?.collect::<Result<Vec<_>, _>>()?;
 
-        // Filter out hidden entries
+        // Filter out hidden entries. The segment manifest (`segments_manifest.json`) lives next to
+        // the `segments/` directory rather than inside it, so it is not encountered here; it is
+        // regenerated from the loaded segments when the shard's segment holder is built.
         let entries = entries.into_iter().filter(|entry| {
-            let is_hidden = entry
-                .file_name()
-                .to_str()
-                .is_some_and(|s| s.starts_with('.'));
+            let file_name = entry.file_name();
+            let is_hidden = file_name.to_str().is_some_and(|s| s.starts_with('.'));
             if is_hidden {
                 log::debug!(
                     "Ignoring hidden segment in local shard during snapshot recovery: {}",
@@ -97,6 +97,9 @@ impl SnapshotUtils {
         let ShardDataFiles {
             wal_path: from_wal_path,
             segments_path: from_segments_path,
+            // The segment manifest is regenerated when the holder is built, so it is not part of the
+            // partial-snapshot merge plan.
+            segment_manifest_path: _,
             newest_clocks_path: from_newest_clocks_path,
             oldest_clocks_path: from_oldest_clocks_path,
             applied_seq_path: from_applied_seq_path,
@@ -105,6 +108,7 @@ impl SnapshotUtils {
         let ShardDataFiles {
             wal_path: to_wal_path,
             segments_path: to_segments_path,
+            segment_manifest_path: _,
             newest_clocks_path: to_newest_clocks_path,
             oldest_clocks_path: to_oldest_clocks_path,
             applied_seq_path: to_applied_seq_path,

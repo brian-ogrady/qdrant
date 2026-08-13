@@ -4,17 +4,19 @@ use std::mem::size_of_val;
 use std::path::PathBuf;
 
 use ahash::HashMap;
+use blobstore::Blob;
 use common::bitvec::BitVec;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use common::universal_io::MmapFs;
-use gridstore::Blob;
+use common::universal_io::{MmapFs, Populate};
+use itertools::Itertools;
 use serde_json::Value;
 
 use super::MapIndex;
 use super::key::MapIndexKey;
-use super::universal_map_index::UniversalMapIndex;
+use super::on_disk_map_index::OnDiskMapIndex;
 use crate::common::operation_error::{OperationError, OperationResult};
+use crate::index::field_index::map_index::immutable_map_index::ImmutableMapIndex;
 use crate::index::field_index::{FieldIndexBuilderTrait, PayloadFieldIndex, ValueIndexer};
 
 pub struct MapIndexBuilder<N: MapIndexKey + ?Sized>(pub(super) MapIndex<N>)
@@ -32,7 +34,7 @@ where
         match &mut self.0 {
             MapIndex::Mutable(index) => index.clear(),
             MapIndex::Immutable(_) => unreachable!(),
-            MapIndex::Mmap(_) => unreachable!(),
+            MapIndex::OnDisk(_) => unreachable!(),
         }
     }
 
@@ -56,6 +58,7 @@ pub struct MapIndexMmapBuilder<N: MapIndexKey + ?Sized> {
     pub(super) values_to_points: HashMap<<N as MapIndexKey>::Owned, Vec<PointOffsetType>>,
     pub(super) is_on_disk: bool,
     pub(super) deleted_points: BitVec,
+    pub(super) prefix_index: bool,
 }
 
 impl<N: MapIndexKey + ?Sized> FieldIndexBuilderTrait for MapIndexMmapBuilder<N>
@@ -82,7 +85,7 @@ where
             flatten_values.extend(payload_values);
         }
         let flatten_values: Vec<<N as MapIndexKey>::Owned> =
-            flatten_values.into_iter().map(Into::into).collect();
+            flatten_values.into_iter().map_into().unique().collect();
 
         if self.point_to_values.len() <= id as usize {
             self.point_to_values.resize_with(id as usize + 1, Vec::new);
@@ -110,14 +113,24 @@ where
     }
 
     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
-        Ok(MapIndex::Mmap(Box::new(UniversalMapIndex::build(
+        let populate = Populate::from(!self.is_on_disk);
+        let on_disk_index = OnDiskMapIndex::build(
             &MmapFs,
             &self.path,
             self.point_to_values,
             self.values_to_points,
-            self.is_on_disk,
+            populate,
             &self.deleted_points,
-        )?)))
+            self.prefix_index,
+        )?;
+
+        let index = if self.is_on_disk {
+            MapIndex::OnDisk(on_disk_index)
+        } else {
+            MapIndex::Immutable(ImmutableMapIndex::load_from_on_disk(on_disk_index)?)
+        };
+
+        Ok(index)
     }
 }
 
@@ -127,14 +140,19 @@ where
 {
     dir: PathBuf,
     index: Option<MapIndex<N>>,
+    prefix_index: bool,
 }
 
 impl<N: MapIndexKey + ?Sized> MapIndexGridstoreBuilder<N>
 where
     Vec<<N as MapIndexKey>::Owned>: Blob + Send + Sync,
 {
-    pub(super) fn new(dir: PathBuf) -> Self {
-        Self { dir, index: None }
+    pub(super) fn new(dir: PathBuf, prefix_index: bool) -> Self {
+        Self {
+            dir,
+            index: None,
+            prefix_index,
+        }
     }
 }
 
@@ -152,7 +170,7 @@ where
             "index must be initialized exactly once",
         );
         self.index.replace(
-            MapIndex::new_gridstore(self.dir.clone(), true)?.ok_or_else(|| {
+            MapIndex::new_mutable(self.dir.clone(), true, self.prefix_index)?.ok_or_else(|| {
                 OperationError::service_error("Failed to create mutable map index")
             })?,
         );

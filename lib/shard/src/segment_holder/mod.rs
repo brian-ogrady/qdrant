@@ -1,5 +1,6 @@
 mod flush;
 pub mod locked;
+pub use flush::FlushMode;
 pub mod read_points;
 mod snapshot;
 #[cfg(test)]
@@ -7,10 +8,10 @@ mod tests;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::process_counter::ProcessCounter;
 use common::save_on_disk::SaveOnDisk;
 use common::toposort::TopoSort;
-use common::types::PointOffsetType;
+use common::types::{DeferredBehavior, PointOffsetType};
 use itertools::Itertools;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use rand::seq::IndexedRandom;
@@ -30,16 +31,55 @@ use segment::entry::{
 };
 use segment::segment::Segment;
 use segment::segment_constructor::build_segment;
-use segment::types::{ExtendedPointId, Payload, PointIdType, SegmentConfig, SeqNumberType};
+use segment::types::{
+    ExtendedPointId, Payload, PointIdType, SegmentConfig, SeqNumberType, VectorNameBuf,
+    WithPayload, WithVector,
+};
 use smallvec::SmallVec;
 
-use crate::locked_segment::LockedSegment;
+use crate::locked_segment::{DropDataOutcome, LockedSegment};
 use crate::payload_index_schema::PayloadIndexSchema;
+use crate::segment_manifest::{NewSegmentToken, SegmentsManifest};
 
 pub type SegmentId = usize;
 
 /// All occurrences of a point across segments: (segment_id, version, is_deferred).
 type PointOccurrences = SmallVec<[(SegmentId, SeqNumberType, bool); 2]>;
+
+/// Result of running a [`DeferredAction`].
+pub enum PostFlushOutcome {
+    /// The action completed and should be removed from the queue.
+    Done,
+    /// The action could not complete yet; keep it queued and retry on a later flush. Its ack pin
+    /// stays in effect until it completes.
+    Retry,
+}
+
+/// An action deferred until a flush proves the data it touches is durable.
+/// See [`SegmentHolder::register_post_flush_action`].
+struct DeferredAction {
+    /// Run the action once the durable waterline reaches this version.
+    ready_at: SeqNumberType,
+    /// Until the action completes, cap the WAL acknowledge at this version.
+    ack_pin: SeqNumberType,
+    /// Retryable: returns [`PostFlushOutcome::Retry`] (or `Err`) without finishing, and is called
+    /// again on a later flush. Must keep enough state to resume.
+    action: Box<dyn FnMut() -> OperationResult<PostFlushOutcome> + Send>,
+}
+
+impl std::fmt::Debug for DeferredAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            ready_at,
+            ack_pin,
+            action: _,
+        } = self;
+        f.debug_struct("DeferredAction")
+            .field("ready_at", ready_at)
+            .field("ack_pin", ack_pin)
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct SegmentHolder {
@@ -68,12 +108,33 @@ pub struct SegmentHolder {
     /// so we can clear all dependencies after flushing up to certain operation.
     flush_dependency: Arc<Mutex<TopoSort<SegmentId, SeqNumberType>>>,
 
+    /// Actions deferred until a flush proves the data they touch is durable.
+    /// Each runs once the durable waterline reaches its `ready_at`, and pins the WAL
+    /// acknowledge at its `ack_pin` until then. See [`SegmentHolder::register_post_flush_action`].
+    post_flush_actions: Mutex<Vec<DeferredAction>>,
+
+    /// Ack-pin floor of the actions `run_ready_post_flush_actions` is currently running, while they
+    /// are briefly removed from `post_flush_actions`. Folded into `pending_post_flush_ack_cap` so a
+    /// concurrent flush cannot advance the WAL acknowledge past their pins during that window.
+    /// Guarded by the `post_flush_actions` lock (always taken first) to stay consistent with it.
+    in_flight_ack_floor: Mutex<Option<SeqNumberType>>,
+
     /// Holder for a thread, which does flushing of all segments sequentially.
     /// This is used to avoid multiple concurrent flushes.
     pub flush_thread: Mutex<Option<JoinHandle<OperationResult<()>>>>,
 
     /// The amount of currently running optimizations.
     pub running_optimizations: ProcessCounter,
+
+    /// On-disk manifest of this shard's segments, kept in sync with the live segment set so that
+    /// out-of-process readers can discover segments. `None` when the `write_segment_manifest`
+    /// feature flag is off (or before the holder has been wired up, e.g. during loading).
+    ///
+    /// The manifest is owned here, by the single source of truth for segment membership, precisely
+    /// so that no segment can be added or removed without the manifest following: every mutation
+    /// funnels through [`add_existing_locked`](Self::add_existing_locked) and
+    /// [`remove`](Self::remove), which reconcile it.
+    segment_manifest: Option<Arc<SaveOnDisk<SegmentsManifest>>>,
 }
 
 impl Drop for SegmentHolder {
@@ -81,6 +142,45 @@ impl Drop for SegmentHolder {
         if let Err(flushing_err) = self.lock_flushing() {
             log::error!("Failed to flush segments holder during drop: {flushing_err}");
         }
+    }
+}
+
+/// Builder for a [`SegmentHolder`] that guarantees its segment manifest is wired up.
+///
+/// The only way to get a finished [`SegmentHolder`] out is [`build`](Self::build), which initializes
+/// the manifest from the populated segment set — so a shard's holder can never be constructed
+/// without it (no separate, easy-to-forget init step). Populate it through the deref to
+/// [`SegmentHolder`] (e.g. [`add_new`](SegmentHolder::add_new)), then call `build`.
+#[must_use = "the segment holder is only created by calling `.build(shard_path)`"]
+pub struct SegmentHolderBuilder {
+    holder: SegmentHolder,
+}
+
+impl SegmentHolderBuilder {
+    fn new() -> Self {
+        Self {
+            holder: SegmentHolder::default(),
+        }
+    }
+
+    /// Finalize: initialize the segment manifest from the current segment set and return the holder.
+    pub fn build(mut self, shard_path: &Path) -> OperationResult<SegmentHolder> {
+        self.holder.init_segment_manifest(shard_path)?;
+        Ok(self.holder)
+    }
+}
+
+impl Deref for SegmentHolderBuilder {
+    type Target = SegmentHolder;
+
+    fn deref(&self) -> &Self::Target {
+        &self.holder
+    }
+}
+
+impl DerefMut for SegmentHolderBuilder {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.holder
     }
 }
 
@@ -101,6 +201,66 @@ impl SegmentHolder {
             LockedSegment::Original(original) => Some((id, original)),
             LockedSegment::Proxy(_) => None,
         })
+    }
+
+    /// Start building a holder. The only way to obtain a finished [`SegmentHolder`] from the builder
+    /// is [`SegmentHolderBuilder::build`], which wires up the segment manifest — so a shard's holder
+    /// can never be constructed without it.
+    pub fn builder() -> SegmentHolderBuilder {
+        SegmentHolderBuilder::new()
+    }
+
+    /// Attach a pre-built segment manifest to this holder. Test-only escape hatch; production code
+    /// goes through [`SegmentHolder::builder`] so the manifest is always initialized.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_segment_manifest(&mut self, manifest: Option<Arc<SaveOnDisk<SegmentsManifest>>>) {
+        self.segment_manifest = manifest;
+    }
+
+    /// Initialize the segment manifest from the current segments and attach it to this holder, when
+    /// the `write_segment_manifest` feature flag is enabled. No-op when disabled.
+    ///
+    /// Private: only [`SegmentHolderBuilder::build`] calls this, right after the holder has been
+    /// populated, so the manifest reflects the initial segment set. From then on the holder keeps it
+    /// in sync.
+    fn init_segment_manifest(&mut self, shard_path: &Path) -> OperationResult<()> {
+        if !common::flags::feature_flags().write_segment_manifest {
+            return Ok(());
+        }
+
+        let manifest = SegmentsManifest::from_segment_holder(self);
+        let manifest = SaveOnDisk::new(crate::files::segment_manifest_path(shard_path), manifest)
+            .map_err(|err| {
+            OperationError::service_error(format!("failed to write segment manifest: {err}"))
+        })?;
+        self.segment_manifest = Some(Arc::new(manifest));
+        Ok(())
+    }
+
+    /// Register a newly built segment in the on-disk manifest, consuming its [`NewSegmentToken`].
+    ///
+    /// The token is produced when a segment is built (e.g. [`build_tmp_segment`](Self::build_tmp_segment));
+    /// its `#[must_use]` marker turns "built a segment but forgot to register it" into a compiler
+    /// warning. Reconciles the manifest with the current live segment set.
+    ///
+    /// No-op when no manifest is attached (feature flag off / not yet wired). Errors propagate so
+    /// callers that gate destructive work (deleting superseded segments from disk) on a fresh
+    /// manifest can abort instead of risking a stale manifest. Idempotent: only writes on change.
+    pub fn sync_segment_manifest(&self, token: Option<NewSegmentToken>) -> OperationResult<()> {
+        // Register the newly built segment ASAP: it exists on disk, so it must be in the manifest,
+        // even if it has not been added to the holder yet (passed as `extra_segment`).
+        SegmentsManifest::sync(self.segment_manifest.as_ref(), self, token.map(|t| t.id()))
+    }
+
+    /// Build the segment manifest (`segments_manifest.json`) describing the current live segments,
+    /// for inclusion in a shard snapshot.
+    ///
+    /// Returns `None` when no manifest is attached (the `write_segment_manifest` feature flag is
+    /// off), so the snapshot omits the file exactly when the running shard would not have one.
+    pub fn segment_manifest_for_snapshot(&self) -> Option<SegmentsManifest> {
+        self.segment_manifest
+            .as_ref()
+            .map(|_| SegmentsManifest::from_segment_holder(self))
     }
 
     pub fn len(&self) -> usize {
@@ -275,6 +435,176 @@ impl SegmentHolder {
         self.non_appendable_segments.keys().copied().collect()
     }
 
+    /// Register an action to run once a future flush proves its data durable, i.e. the durable
+    /// waterline (the version every segment is persisted up to) has reached `ready_at`. Until it
+    /// runs, the version returned by [`flush_all`](Self::flush_all), and thus the WAL acknowledge,
+    /// is capped at `ack_pin`, so any operation the not-yet-cleaned data contradicts stays
+    /// replayable across a restart.
+    ///
+    /// Optimizations use this to defer destroying a swapped-out source segment. Points are
+    /// copy-on-write moved out of it in memory, and WAL replay can re-derive such a move only
+    /// while the source's on-disk pre-image survives; the moved copies may still sit unflushed in
+    /// appendable segments, so destroying the source right at the swap would lose them on a
+    /// restart. Deferring the destruction to `ready_at` (the optimized segment's version) ensures
+    /// those copies are durable in their new home first; in the meantime a restart loads the old
+    /// files next to their replacement and load-time deduplication resolves the overlap.
+    ///
+    /// `ack_pin` is the version up to which the deferred files stay truthful (the source segment's
+    /// persisted version). Beyond it they contradict newer state living elsewhere, most importantly
+    /// deletions: the files keep a deleted point positively alive, and an absence in the
+    /// replacement segment cannot outvote it at load time. Capping the WAL acknowledge at `ack_pin`
+    /// keeps those operations replayable until the files are gone; the same pin the proxy imposed
+    /// while the optimization ran, extended until the action runs.
+    ///
+    /// `action` is retried on a later flush if it returns [`PostFlushOutcome::Retry`] or `Err`, so
+    /// the ack pin survives a transient failure (e.g. the data is briefly still in use); see
+    /// [`run_ready_post_flush_actions`](Self::run_ready_post_flush_actions).
+    pub fn register_post_flush_action(
+        &self,
+        ready_at: SeqNumberType,
+        ack_pin: SeqNumberType,
+        action: impl FnMut() -> OperationResult<PostFlushOutcome> + Send + 'static,
+    ) {
+        self.post_flush_actions.lock().push(DeferredAction {
+            ready_at,
+            ack_pin,
+            action: Box::new(action),
+        });
+    }
+
+    /// Register a [post-flush action](Self::register_post_flush_action) that destroys `segment`'s
+    /// data once durable. If the segment is still in use when the action runs, it is handed back
+    /// and the destruction is retried on a later flush, keeping the `ack_pin` in effect until the
+    /// files are actually gone.
+    pub fn register_segment_drop(
+        &self,
+        ready_at: SeqNumberType,
+        ack_pin: SeqNumberType,
+        segment: LockedSegment,
+    ) {
+        let mut segment = Some(segment);
+        self.register_post_flush_action(ready_at, ack_pin, move || {
+            let to_drop = segment
+                .take()
+                .expect("post-flush segment drop retried after completion");
+            match to_drop.try_drop_data() {
+                Ok(()) => Ok(PostFlushOutcome::Done),
+                Err(DropDataOutcome::StillInUse(returned, err)) => {
+                    log::warn!(
+                        "Deferred segment data destruction not ready yet, will retry: {err}"
+                    );
+                    segment = Some(returned);
+                    Ok(PostFlushOutcome::Retry)
+                }
+                Err(DropDataOutcome::Failed(err)) => Err(err),
+            }
+        });
+    }
+
+    /// The WAL acknowledge cap imposed by pending post-flush actions, if any: the minimum `ack_pin`
+    /// across both the queued actions and any currently being run (briefly out of the queue, see
+    /// `in_flight_ack_floor`). See [`SegmentHolder::register_post_flush_action`].
+    pub(super) fn pending_post_flush_ack_cap(&self) -> Option<SeqNumberType> {
+        // Hold the actions lock across both reads so the result is consistent with
+        // `run_ready_post_flush_actions`, which moves actions between the queue and the floor under
+        // it. Lock order is always actions then floor.
+        let actions = self.post_flush_actions.lock();
+        let queued = actions.iter().map(|action| action.ack_pin).min();
+        let in_flight = *self.in_flight_ack_floor.lock();
+        drop(actions);
+
+        match (queued, in_flight) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (cap, None) | (None, cap) => cap,
+        }
+    }
+
+    /// Run every post-flush action whose `ready_at` is covered by the durable waterline
+    /// `persisted_version` (every segment's state up to that version is on disk, so the data each
+    /// action cleans up is durable in its new home and replay of any still-unacknowledged
+    /// operation on it is an idempotent no-op).
+    ///
+    /// Returns the remaining WAL acknowledge cap: the minimum `ack_pin` of the actions that did
+    /// not run, or `None` when none are pending. See [`SegmentHolder::register_post_flush_action`].
+    ///
+    /// Like the WAL acknowledge, the maturity waterline is capped by the first failed operation:
+    /// its effects are not in the segments, and recovering it may need the deferred pre-images.
+    ///
+    /// Perf note: the waterline is the minimum persisted version across all segments, so a freshly
+    /// created appendable segment (which reports `persistent_version() == 0` until its first flush)
+    /// holds the waterline near zero and keeps actions from running. Under heavy optimizer churn
+    /// this lets the action backlog and the capped WAL grow, slowing startup replay. A fresh
+    /// segment cannot hold any operation from before it existed, so it could report its creation
+    /// version as vacuously persisted (e.g. floor `Segment::persistent_version()` on a stamped
+    /// `initial_version`) and stop dragging the waterline down. Left out here to keep this change
+    /// surgical: it changes the segment durability contract for every caller and deserves its own
+    /// change.
+    fn run_ready_post_flush_actions(
+        &self,
+        persisted_version: SeqNumberType,
+    ) -> OperationResult<Option<SeqNumberType>> {
+        let waterline = match self.failed_operation.first() {
+            Some(failed) => persisted_version.min(*failed),
+            None => persisted_version,
+        };
+        let mut ready: Vec<_> = {
+            let mut actions = self.post_flush_actions.lock();
+            let (ready, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *actions)
+                .into_iter()
+                .partition(|action| action.ready_at <= waterline);
+            *actions = keep;
+            // Record the pins of the actions we are about to run while they are out of the queue, so
+            // a concurrent flush still accounts for them and cannot advance the WAL acknowledge past
+            // data their files still contradict. Set under the actions lock (see
+            // `pending_post_flush_ack_cap`).
+            *self.in_flight_ack_floor.lock() = ready.iter().map(|action| action.ack_pin).min();
+            ready
+        };
+        // Run in `ready_at` order: an action can release a resource a later action needs to take
+        // sole ownership of (a proxy keeps its shared write segment alive, and `drop_data` needs
+        // sole ownership; `ready_at` grows with each optimization). Once an action does not
+        // complete (`Retry` or `Err`), stop and re-queue the rest: a later action likely depends on
+        // the resource the blocked one still holds. Re-queued actions keep their ack pin in effect
+        // until they complete on a later flush, so a transient failure never advances the WAL
+        // acknowledge past data that is still on disk.
+        ready.sort_by_key(|action| action.ready_at);
+        let mut first_error = None;
+        let mut blocked = false;
+        ready.retain_mut(|action| {
+            if blocked {
+                return true;
+            }
+
+            match (action.action)() {
+                Ok(PostFlushOutcome::Done) => false,
+                Ok(PostFlushOutcome::Retry) => {
+                    blocked = true;
+                    true
+                }
+                // Hard failure: the action is dropped (its data is being destroyed and cannot be
+                // retried), the error is surfaced, and the rest is deferred to the next flush.
+                Err(err) => {
+                    first_error = Some(err);
+                    blocked = true;
+                    false
+                }
+            }
+        });
+
+        {
+            // Re-queue survivors and clear the in-flight floor together under the actions lock:
+            // survivors are back in the queue before the floor stops covering them, so the cap never
+            // dips. Lock order is always actions then floor.
+            let mut actions = self.post_flush_actions.lock();
+            actions.extend(ready);
+            *self.in_flight_ack_floor.lock() = None;
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        Ok(self.pending_post_flush_ack_cap())
+    }
+
     /// Suggests a new maximum persisted segment version when calling `flush_all`. This can be used to make WAL acknowledge no-op operations,
     /// so we don't replay them on startup. This is especially helpful if the no-op operation is computational expensive and could cause
     /// WAL replay, and thus Qdrant startup, take a significant amount of time.
@@ -342,10 +672,14 @@ impl SegmentHolder {
     }
 
     /// Selects point ids, which is stored in this segment
-    fn segment_points(ids: &[PointIdType], segment: &dyn ReadSegmentEntry) -> Vec<PointIdType> {
+    fn segment_points(
+        ids: &[PointIdType],
+        segment: &dyn ReadSegmentEntry,
+        deferred_behavior: DeferredBehavior,
+    ) -> Vec<PointIdType> {
         ids.iter()
             .cloned()
-            .filter(|id| segment.has_point(*id))
+            .filter(|id| segment.has_point(*id, deferred_behavior))
             .collect()
     }
 
@@ -384,7 +718,8 @@ impl SegmentHolder {
         for (segment_id, segment) in self.iter() {
             let segment_arc = segment.get();
             let segment_lock = segment_arc.read();
-            let segment_points = Self::segment_points(ids, segment_lock.deref());
+            let segment_points =
+                Self::segment_points(ids, segment_lock.deref(), DeferredBehavior::WithDeferred);
             for segment_point in segment_points {
                 let Some(point_version) = segment_lock.point_version(segment_point) else {
                     continue;
@@ -633,6 +968,14 @@ impl SegmentHolder {
     ///
     /// Returns set of point ids which were successfully (already) applied to segments.
     ///
+    /// `point_cow_operation` receives the moved point's vectors twice: as
+    /// storage-native bytes (as read from the source; remove a named vector by
+    /// `retain`ing on the list) and as an initially empty decoded overlay
+    /// (insert fresh vectors there to overwrite names; entries may borrow from
+    /// the operation data via `'op`). Untouched names travel to the
+    /// destination as verbatim bytes, which keeps requantizing storages
+    /// (TurboQuant-as-datatype) lossless across moves.
+    ///
     /// # Warning
     ///
     /// This function must not be used to apply point deletions, and [`apply_points`] must be used
@@ -641,7 +984,7 @@ impl SegmentHolder {
     /// 1. moving a point first and deleting it after is unnecessary overhead.
     /// 2. this leaves older point versions in place, which may accidentally be revived by some
     ///    other operation later.
-    pub fn apply_points_with_conditional_move<F, G>(
+    pub fn apply_points_with_conditional_move<'op, F, G>(
         &self,
         op_num: SeqNumberType,
         ids: &[PointIdType],
@@ -651,12 +994,18 @@ impl SegmentHolder {
     ) -> OperationResult<AHashSet<PointIdType>>
     where
         F: FnMut(PointIdType, &mut RwLockWriteGuard<dyn SegmentEntry>) -> OperationResult<bool>,
-        for<'n, 'o, 'p> G: FnMut(PointIdType, &'n mut NamedVectors<'o>, &'p mut Payload),
+        G: FnMut(
+            PointIdType,
+            &mut SmallVec<[(VectorNameBuf, Vec<u8>); 1]>,
+            &mut NamedVectors<'op>,
+            &mut Payload,
+        ),
     {
         // Choose random appendable segment from this
         let appendable_segments = self.appendable_segments_ids();
 
         let mut applied_points: AHashSet<PointIdType> = Default::default();
+        let stopped = AtomicBool::new(false);
 
         let _ = self.apply_points(ids, hw_counter, |point_id, idx, write_segment| {
             if let Some(point_version) = write_segment.point_version(point_id)
@@ -682,19 +1031,88 @@ impl SegmentHolder {
                             .lock()
                             .add_dependency(idx, appendable_idx, op_num);
 
-                        let mut all_vectors = write_segment.all_vectors(point_id, hw_counter)?;
-                        let mut payload = write_segment.payload(point_id, hw_counter)?;
+                        // Read the latest head of the point, including a
+                        // deferred head that is invisible to ordinary
+                        // (`VisibleOnly`) reads. A deferred source point would
+                        // otherwise yield no record, surfacing as a spurious
+                        // "No point with id ... found" on a plain upsert that
+                        // races a `prevent_unoptimized` optimization.
+                        //
+                        // Vectors are read as storage-native bytes: names the
+                        // operation does not touch travel verbatim, avoiding
+                        // the lossy dequantize→requantize round-trip of
+                        // TurboQuant-as-datatype storages.
+                        let mut record = write_segment
+                            .retrieve_raw(
+                                &[point_id],
+                                &WithPayload {
+                                    enable: true,
+                                    payload_selector: None,
+                                },
+                                &WithVector::Bool(true),
+                                hw_counter,
+                                &stopped,
+                                DeferredBehavior::WithDeferred,
+                            )?
+                            .remove(&point_id)
+                            .ok_or(OperationError::PointIdError {
+                                missed_point_id: point_id,
+                            })?;
 
-                        point_cow_operation(point_id, &mut all_vectors, &mut payload);
+                        let mut raw_vectors = record.vectors.take().unwrap_or_default();
+                        let mut payload = record.payload.take().unwrap_or_default();
+                        let mut updated_vectors = NamedVectors::default();
 
-                        appendable_write_segment.upsert_point(
+                        point_cow_operation(
+                            point_id,
+                            &mut raw_vectors,
+                            &mut updated_vectors,
+                            &mut payload,
+                        );
+
+                        // Names overlaid with fresh data don't travel as bytes.
+                        raw_vectors
+                            .retain(|(name, _)| updated_vectors.get(name).is_none());
+
+                        // Byte portability requires encoding-compatible vector
+                        // configs on both sides (size, distance, datatype,
+                        // multivector config). Segment-role fields — storage
+                        // type, index, quantization — legitimately differ
+                        // between an optimized source and an appendable
+                        // destination; `check_compatible` ignores them.
+                        debug_assert!(
+                            raw_vectors.iter().all(|(name, _)| {
+                                let src = write_segment.config();
+                                let dst = appendable_write_segment.config();
+                                let dense = (src.vector_data.get(name), dst.vector_data.get(name));
+                                let sparse = (
+                                    src.sparse_vector_data.get(name),
+                                    dst.sparse_vector_data.get(name),
+                                );
+                                match (dense, sparse) {
+                                    ((Some(src), Some(dst)), (None, None)) => {
+                                        src.check_compatible(dst).is_ok()
+                                    }
+                                    ((None, None), (Some(src), Some(dst))) => {
+                                        src.check_compatible(dst).is_ok()
+                                    }
+                                    _ => false,
+                                }
+                            }),
+                            "CoW raw move requires encoding-compatible vector configs on source and destination",
+                        );
+
+                        // One fused write: issuing raw vectors, updated vectors and
+                        // payload as separate operations would clone the point once
+                        // per step on append-only destinations.
+                        appendable_write_segment.upsert_moved_point(
                             op_num,
                             point_id,
-                            all_vectors,
+                            &raw_vectors,
+                            updated_vectors,
+                            &payload,
                             hw_counter,
                         )?;
-                        appendable_write_segment
-                            .set_full_payload(op_num, point_id, &payload, hw_counter)?;
 
                         // Keep the source of the CoW operation as the deferred point is invisible until indexing.
                         if !appendable_write_segment.point_is_deferred(point_id) {
@@ -731,7 +1149,7 @@ impl SegmentHolder {
 
             // Partition remaining IDs: found ones go to existing_points, rest stay in remaining
             remaining_ids.retain(|&id| {
-                if segment_guard.has_point(id) {
+                if segment_guard.has_point(id, DeferredBehavior::WithDeferred) {
                     existing_points.insert(id);
                     false // Remove from remaining
                 } else {
@@ -758,13 +1176,16 @@ impl SegmentHolder {
         payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
         deferred_internal_id: Option<PointOffsetType>,
     ) -> OperationResult<LockedSegment> {
-        let segment = self.build_tmp_segment(
+        let (segment, token) = self.build_tmp_segment(
             segments_path,
             Some(segment_config),
             payload_index_schema,
             deferred_internal_id,
             true,
         )?;
+        // Register the new segment ASAP — it exists on disk, so it must be in the manifest. No-op
+        // when no manifest is attached yet (e.g. during shard load).
+        self.sync_segment_manifest(Some(token))?;
         self.add_new_locked(segment.clone());
         Ok(segment)
     }
@@ -793,7 +1214,7 @@ impl SegmentHolder {
         payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
         deferred_internal_id: Option<PointOffsetType>,
         save_version: bool,
-    ) -> OperationResult<LockedSegment> {
+    ) -> OperationResult<(LockedSegment, NewSegmentToken)> {
         let config = match segment_config {
             // Base config on collection params
             Some(config) => config,
@@ -812,7 +1233,7 @@ impl SegmentHolder {
                 .clone(),
         };
 
-        let mut segment =
+        let (mut segment, token) =
             build_segment(segments_path, &config, deferred_internal_id, save_version)?;
 
         // Internal operation.
@@ -823,7 +1244,7 @@ impl SegmentHolder {
             segment.create_field_index(0, key, Some(schema), &hw_counter)?;
         }
 
-        Ok(LockedSegment::new(segment))
+        Ok((LockedSegment::new(segment), token))
     }
 
     /// Method tries to remove the segment with the given ID under the following conditions:

@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -225,6 +229,27 @@ impl Validate for grpc::condition::ConditionOneOf {
             ConditionOneOf::HasId(_) => Ok(()),
             ConditionOneOf::IsNull(_) => Ok(()),
             ConditionOneOf::HasVector(_) => Ok(()),
+            ConditionOneOf::Slice(slice_condition) => slice_condition.validate(),
+        }
+    }
+}
+
+impl Validate for grpc::SliceCondition {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let grpc::SliceCondition { total, index } = self;
+        let mut errors = ValidationErrors::new();
+        if *total == 0 {
+            errors.add("total", ValidationError::new("must be greater than 0"));
+        } else if index >= total {
+            errors.add(
+                "index",
+                ValidationError::new("must be less than the total number of slices"),
+            );
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
         }
     }
 }
@@ -252,38 +277,52 @@ impl Validate for grpc::update_operation::Update {
 
 impl Validate for grpc::FieldCondition {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        let grpc::FieldCondition {
-            key: _,
-            r#match,
-            range,
-            datetime_range,
-            geo_bounding_box,
-            geo_radius,
-            geo_polygon,
-            values_count,
-            is_empty,
-            is_null,
-        } = self;
+        let all_fields_none = matches!(
+            self,
+            grpc::FieldCondition {
+                key: _,
+                r#match: None,
+                range: None,
+                datetime_range: None,
+                geo_bounding_box: None,
+                geo_radius: None,
+                geo_polygon: None,
+                values_count: None,
+                is_empty: None,
+                is_null: None,
+            },
+        );
 
-        let all_fields_none = r#match.is_none()
-            && range.is_none()
-            && datetime_range.is_none()
-            && geo_bounding_box.is_none()
-            && geo_radius.is_none()
-            && geo_polygon.is_none()
-            && values_count.is_none()
-            && is_empty.is_none()
-            && is_null.is_none();
+        let mut errors = ValidationErrors::new();
 
         if all_fields_none {
-            let mut errors = ValidationErrors::new();
             errors.add(
                 "match",
                 ValidationError::new("At least one field condition must be specified"),
             );
-            Err(errors)
-        } else {
+        }
+
+        let grpc::FieldCondition {
+            key: _,
+            r#match: _,
+            range: _,
+            datetime_range: _,
+            geo_bounding_box,
+            geo_radius,
+            geo_polygon,
+            values_count: _,
+            is_empty: _,
+            is_null: _,
+        } = self;
+
+        errors.merge_self("geo_bounding_box", geo_bounding_box.validate());
+        errors.merge_self("geo_radius", geo_radius.validate());
+        errors.merge_self("geo_polygon", geo_polygon.validate());
+
+        if errors.is_empty() {
             Ok(())
+        } else {
+            Err(errors)
         }
     }
 }
@@ -530,6 +569,7 @@ impl Validate for super::qdrant::IntegerIndexParams {
             is_principal: _,
             on_disk: _,
             enable_hnsw: _,
+            memory: _,
         } = &self;
         validate_integer_index_params(lookup, range)
     }
@@ -544,15 +584,94 @@ impl Validate for super::qdrant::points_selector::PointsSelectorOneOf {
     }
 }
 
+impl Validate for grpc::GeoPoint {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let grpc::GeoPoint { lon, lat } = self;
+        segment::types::GeoPoint::validate(*lon, *lat).map_err(|err| {
+            let error = ValidationError::new("geo_point").with_message(Cow::Owned(err.to_string()));
+            let mut errors = ValidationErrors::new();
+            errors.add("geo", error);
+            errors
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use validator::Validate;
 
     use crate::grpc::qdrant::{
         CreateCollection, CreateFieldIndexCollection, CreateVectorNameRequest,
-        DenseVectorCreationConfig, GeoLineString, GeoPoint, GeoPolygon, SearchPoints,
-        UpdateCollection, create_vector_name_request,
+        DenseVectorCreationConfig, FieldCondition, GeoBoundingBox, GeoLineString, GeoPoint,
+        GeoPolygon, GeoRadius, SearchPoints, UpdateCollection, create_vector_name_request,
     };
+
+    #[test]
+    fn test_geo_field_condition_rejects_out_of_range_coordinates() {
+        // Valid coordinates pass.
+        let valid = FieldCondition {
+            geo_radius: Some(GeoRadius {
+                center: Some(GeoPoint {
+                    lat: 52.5,
+                    lon: 13.4,
+                }),
+                radius: 1000.0,
+            }),
+            ..Default::default()
+        };
+        assert!(valid.validate().is_ok());
+
+        // Latitude out of range (> 90) is rejected instead of panicking in the
+        // geo index during geohash encoding.
+        let bad_radius = FieldCondition {
+            geo_radius: Some(GeoRadius {
+                center: Some(GeoPoint {
+                    lat: 200.0,
+                    lon: 13.4,
+                }),
+                radius: 1000.0,
+            }),
+            ..Default::default()
+        };
+        assert!(bad_radius.validate().is_err());
+
+        // Longitude out of range (< -180) in a bounding-box corner is rejected.
+        let bad_box = FieldCondition {
+            geo_bounding_box: Some(GeoBoundingBox {
+                top_left: Some(GeoPoint {
+                    lat: 50.0,
+                    lon: -190.0,
+                }),
+                bottom_right: Some(GeoPoint {
+                    lat: 40.0,
+                    lon: 13.4,
+                }),
+            }),
+            ..Default::default()
+        };
+        assert!(bad_box.validate().is_err());
+
+        // A well-formed polygon (>= 4 points, closed ring) whose coordinates are
+        // out of range is rejected; shape validation alone would accept it.
+        let bad_polygon = FieldCondition {
+            geo_polygon: Some(GeoPolygon {
+                exterior: Some(GeoLineString {
+                    points: vec![
+                        GeoPoint { lat: 0.0, lon: 0.0 },
+                        GeoPoint {
+                            lat: 100.0,
+                            lon: 0.0,
+                        },
+                        GeoPoint { lat: 1.0, lon: 1.0 },
+                        GeoPoint { lat: 0.0, lon: 0.0 },
+                    ],
+                }),
+                interiors: vec![],
+            }),
+            ..Default::default()
+        };
+        assert!(bad_polygon.validate().is_err());
+    }
 
     #[test]
     fn test_good_request() {
@@ -757,6 +876,45 @@ mod tests {
             good_polygon.validate().is_ok(),
             "good polygon should not error on validation"
         );
+    }
+
+    #[test]
+    fn test_field_condition_validates_geo_polygon() {
+        use crate::grpc::qdrant::FieldCondition;
+
+        // FieldCondition::validate only checks that at least one field is set; it
+        // must also reject a malformed geo polygon, otherwise the invalid shape
+        // reaches the geo index and panics. An empty exterior is invalid.
+        let bad = FieldCondition {
+            key: "location".into(),
+            geo_polygon: Some(GeoPolygon {
+                exterior: Some(GeoLineString { points: vec![] }),
+                interiors: vec![],
+            }),
+            ..Default::default()
+        };
+        assert!(
+            bad.validate().is_err(),
+            "field condition with an empty polygon exterior should error"
+        );
+
+        // A well-formed polygon still passes.
+        let good = FieldCondition {
+            key: "location".into(),
+            geo_polygon: Some(GeoPolygon {
+                exterior: Some(GeoLineString {
+                    points: vec![
+                        GeoPoint { lat: 1., lon: 1. },
+                        GeoPoint { lat: 2., lon: 2. },
+                        GeoPoint { lat: 3., lon: 3. },
+                        GeoPoint { lat: 1., lon: 1. },
+                    ],
+                }),
+                interiors: vec![],
+            }),
+            ..Default::default()
+        };
+        assert!(good.validate().is_ok());
     }
 
     #[test]

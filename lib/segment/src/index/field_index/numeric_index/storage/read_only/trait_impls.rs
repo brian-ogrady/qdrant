@@ -4,31 +4,29 @@
 //! [`query`](super::super::super::query) helpers over [`NumericIndexRead`];
 //! this impl just plugs the read-only enum into them.
 
+use blobstore::Blob;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use common::universal_io::UniversalRead;
-use gridstore::Blob;
 
 use super::super::super::numeric_index_read::NumericIndexRead;
-use super::super::super::{Encodable, query};
+use super::super::super::{NumericIndexValue, query};
 use super::ReadOnlyNumericIndexInner;
 use crate::common::operation_error::OperationResult;
-use crate::index::field_index::numeric_point::Numericable;
-use crate::index::field_index::stored_point_to_values::StoredValue;
+use crate::index::UniversalReadExt;
+use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::index::field_index::{
     CardinalityEstimation, PayloadBlockCondition, PayloadFieldIndexRead,
 };
-use crate::index::query_optimization::optimized_filter::ConditionCheckerFn;
 use crate::types::{FieldCondition, PayloadKeyType};
 
-impl<T: Encodable + Numericable + StoredValue + Send + Sync + Default, S: UniversalRead>
-    PayloadFieldIndexRead for ReadOnlyNumericIndexInner<T, S>
+impl<T: NumericIndexValue, S: UniversalReadExt> PayloadFieldIndexRead
+    for ReadOnlyNumericIndexInner<T, S>
 where
     Vec<T>: Blob,
 {
-    fn count_indexed_points(&self) -> usize {
-        self.get_points_count()
+    fn count_indexed_points(&self) -> OperationResult<usize> {
+        Ok(self.get_points_count())
     }
 
     fn filter<'a>(
@@ -60,7 +58,8 @@ where
         &'a self,
         condition: &FieldCondition,
         hw_acc: HwMeasurementAcc,
-    ) -> Option<ConditionCheckerFn<'a>> {
-        query::condition_checker(self, condition, hw_acc)
+    ) -> OperationResult<Option<ConditionCheckerEnum<'a>>> {
+        Ok(query::condition_checker(self, condition, hw_acc)
+            .map(T::condition_checker_read_only::<S>))
     }
 }

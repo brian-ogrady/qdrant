@@ -1,14 +1,15 @@
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use common::universal_io::UniversalRead;
 use serde_json::Value;
 
 use crate::common::operation_error::OperationResult;
+use crate::index::UniversalReadExt;
+use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::index::field_index::bool_index::BoolIndexRead;
 use crate::index::field_index::field_index_base::read_only::ReadOnlyFieldIndex;
 use crate::index::field_index::full_text_index::full_text_index_read::FullTextIndexRead;
-use crate::index::field_index::geo_index::GeoMapIndexRead;
+use crate::index::field_index::geo_index::GeoIndexRead;
 use crate::index::field_index::map_index::read_ops::MapIndexRead;
 use crate::index::field_index::null_index::NullIndexRead;
 use crate::index::field_index::numeric_index::{
@@ -17,13 +18,12 @@ use crate::index::field_index::numeric_index::{
 use crate::index::field_index::{
     CardinalityEstimation, FacetIndex, FieldIndexRead, PayloadBlockCondition, PayloadFieldIndexRead,
 };
-use crate::index::query_optimization::optimized_filter::ConditionCheckerFn;
 use crate::index::query_optimization::rescore_formula::value_retriever::VariableRetrieverFn;
 use crate::telemetry::PayloadIndexTelemetry;
 use crate::types::{FieldCondition, PayloadKeyType};
 
-impl<S: UniversalRead> PayloadFieldIndexRead for ReadOnlyFieldIndex<S> {
-    fn count_indexed_points(&self) -> usize {
+impl<S: UniversalReadExt> PayloadFieldIndexRead for ReadOnlyFieldIndex<S> {
+    fn count_indexed_points(&self) -> OperationResult<usize> {
         match self {
             ReadOnlyFieldIndex::IntIndex(idx) => idx.count_indexed_points(),
             ReadOnlyFieldIndex::DatetimeIndex(idx) => idx.count_indexed_points(),
@@ -112,7 +112,7 @@ impl<S: UniversalRead> PayloadFieldIndexRead for ReadOnlyFieldIndex<S> {
         &'a self,
         condition: &FieldCondition,
         hw_acc: HwMeasurementAcc,
-    ) -> Option<ConditionCheckerFn<'a>> {
+    ) -> OperationResult<Option<ConditionCheckerEnum<'a>>> {
         match self {
             ReadOnlyFieldIndex::IntIndex(idx) => idx.condition_checker(condition, hw_acc),
             ReadOnlyFieldIndex::DatetimeIndex(idx) => idx.condition_checker(condition, hw_acc),
@@ -172,25 +172,25 @@ impl<S: UniversalRead> PayloadFieldIndexRead for ReadOnlyFieldIndex<S> {
     }
 }
 
-impl<S: UniversalRead> FieldIndexRead for ReadOnlyFieldIndex<S> {
-    fn get_telemetry_data(&self) -> PayloadIndexTelemetry {
-        match self {
+impl<S: UniversalReadExt> FieldIndexRead for ReadOnlyFieldIndex<S> {
+    fn get_telemetry_data(&self) -> OperationResult<PayloadIndexTelemetry> {
+        Ok(match self {
             ReadOnlyFieldIndex::IntIndex(idx) => idx.get_telemetry_data(),
             ReadOnlyFieldIndex::DatetimeIndex(idx) => idx.get_telemetry_data(),
             ReadOnlyFieldIndex::IntMapIndex(idx) => idx.get_telemetry_data(),
             ReadOnlyFieldIndex::KeywordIndex(idx) => idx.get_telemetry_data(),
             ReadOnlyFieldIndex::FloatIndex(idx) => idx.get_telemetry_data(),
-            ReadOnlyFieldIndex::BoolIndex(idx) => idx.get_telemetry_data(),
+            ReadOnlyFieldIndex::BoolIndex(idx) => idx.get_telemetry_data()?,
             ReadOnlyFieldIndex::GeoIndex(idx) => idx.get_telemetry_data(),
             ReadOnlyFieldIndex::UuidIndex(idx) => idx.get_telemetry_data(),
             ReadOnlyFieldIndex::FullTextIndex(idx) => idx.get_telemetry_data(),
             ReadOnlyFieldIndex::UuidMapIndex(idx) => idx.get_telemetry_data(),
             ReadOnlyFieldIndex::NullIndex(idx) => idx.get_telemetry_data(),
-        }
+        })
     }
 
-    fn values_count(&self, point_id: PointOffsetType) -> usize {
-        match self {
+    fn values_count(&self, point_id: PointOffsetType) -> OperationResult<usize> {
+        Ok(match self {
             ReadOnlyFieldIndex::IntIndex(idx) => {
                 NumericIndexRead::values_count(idx, point_id).unwrap_or(0)
             }
@@ -206,8 +206,8 @@ impl<S: UniversalRead> FieldIndexRead for ReadOnlyFieldIndex<S> {
             ReadOnlyFieldIndex::FloatIndex(idx) => {
                 NumericIndexRead::values_count(idx, point_id).unwrap_or(0)
             }
-            ReadOnlyFieldIndex::BoolIndex(idx) => BoolIndexRead::values_count(idx, point_id),
-            ReadOnlyFieldIndex::GeoIndex(idx) => GeoMapIndexRead::values_count(idx, point_id),
+            ReadOnlyFieldIndex::BoolIndex(idx) => BoolIndexRead::values_count(idx, point_id)?,
+            ReadOnlyFieldIndex::GeoIndex(idx) => GeoIndexRead::values_count(idx, point_id),
             ReadOnlyFieldIndex::UuidIndex(idx) => {
                 NumericIndexRead::values_count(idx, point_id).unwrap_or(0)
             }
@@ -217,12 +217,12 @@ impl<S: UniversalRead> FieldIndexRead for ReadOnlyFieldIndex<S> {
             ReadOnlyFieldIndex::UuidMapIndex(idx) => {
                 MapIndexRead::values_count(idx, point_id).unwrap_or(0)
             }
-            ReadOnlyFieldIndex::NullIndex(idx) => NullIndexRead::values_count(idx, point_id),
-        }
+            ReadOnlyFieldIndex::NullIndex(idx) => NullIndexRead::values_count(idx, point_id)?,
+        })
     }
 
-    fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
-        match self {
+    fn values_is_empty(&self, point_id: PointOffsetType) -> OperationResult<bool> {
+        Ok(match self {
             ReadOnlyFieldIndex::IntIndex(idx) => NumericIndexRead::values_is_empty(idx, point_id),
             ReadOnlyFieldIndex::DatetimeIndex(idx) => {
                 NumericIndexRead::values_is_empty(idx, point_id)
@@ -230,21 +230,21 @@ impl<S: UniversalRead> FieldIndexRead for ReadOnlyFieldIndex<S> {
             ReadOnlyFieldIndex::IntMapIndex(idx) => MapIndexRead::values_is_empty(idx, point_id),
             ReadOnlyFieldIndex::KeywordIndex(idx) => MapIndexRead::values_is_empty(idx, point_id),
             ReadOnlyFieldIndex::FloatIndex(idx) => NumericIndexRead::values_is_empty(idx, point_id),
-            ReadOnlyFieldIndex::BoolIndex(idx) => BoolIndexRead::values_is_empty(idx, point_id),
-            ReadOnlyFieldIndex::GeoIndex(idx) => GeoMapIndexRead::values_is_empty(idx, point_id),
+            ReadOnlyFieldIndex::BoolIndex(idx) => BoolIndexRead::values_is_empty(idx, point_id)?,
+            ReadOnlyFieldIndex::GeoIndex(idx) => GeoIndexRead::values_is_empty(idx, point_id),
             ReadOnlyFieldIndex::UuidIndex(idx) => NumericIndexRead::values_is_empty(idx, point_id),
             ReadOnlyFieldIndex::FullTextIndex(idx) => {
                 FullTextIndexRead::values_is_empty(idx, point_id)
             }
             ReadOnlyFieldIndex::UuidMapIndex(idx) => MapIndexRead::values_is_empty(idx, point_id),
-            ReadOnlyFieldIndex::NullIndex(idx) => NullIndexRead::values_is_empty(idx, point_id),
-        }
+            ReadOnlyFieldIndex::NullIndex(idx) => NullIndexRead::values_is_empty(idx, point_id)?,
+        })
     }
 
     fn value_retriever<'a, 'q>(
         &'a self,
         hw_counter: &'q HardwareCounterCell,
-    ) -> Option<VariableRetrieverFn<'q>>
+    ) -> OperationResult<Option<VariableRetrieverFn<'q>>>
     where
         'a: 'q,
     {
@@ -253,18 +253,18 @@ impl<S: UniversalRead> FieldIndexRead for ReadOnlyFieldIndex<S> {
         // rather than raw payload values — neither has a value retriever yet.
         // The numeric, map, bool and geo variants build their per-variant
         // closure via an inherent `value_retriever` method.
-        match self {
+        Ok(match self {
             ReadOnlyFieldIndex::IntIndex(idx) => Some(idx.value_retriever(hw_counter)),
             ReadOnlyFieldIndex::DatetimeIndex(idx) => Some(idx.value_retriever(hw_counter)),
             ReadOnlyFieldIndex::IntMapIndex(idx) => Some(idx.value_retriever(hw_counter)),
             ReadOnlyFieldIndex::KeywordIndex(idx) => Some(idx.value_retriever(hw_counter)),
             ReadOnlyFieldIndex::FloatIndex(idx) => Some(idx.value_retriever(hw_counter)),
-            ReadOnlyFieldIndex::BoolIndex(idx) => Some(idx.value_retriever(hw_counter)),
+            ReadOnlyFieldIndex::BoolIndex(idx) => Some(idx.value_retriever(hw_counter)?),
             ReadOnlyFieldIndex::GeoIndex(idx) => Some(idx.value_retriever(hw_counter)),
             ReadOnlyFieldIndex::UuidIndex(idx) => Some(idx.value_retriever(hw_counter)),
             ReadOnlyFieldIndex::UuidMapIndex(idx) => Some(idx.value_retriever(hw_counter)),
             ReadOnlyFieldIndex::FullTextIndex(_) | ReadOnlyFieldIndex::NullIndex(_) => None,
-        }
+        })
     }
 
     fn as_numeric(&self) -> Option<impl NumericFieldIndexRead + '_> {

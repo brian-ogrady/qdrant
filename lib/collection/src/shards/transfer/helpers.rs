@@ -79,7 +79,7 @@ where
 ///
 /// For resharding transfers this also checks:
 /// 1. If the source and target shards are different
-/// 2. If the source and target shardsd share the same shard key
+/// 2. If the source and target shards share the same shard key
 ///
 /// If validation fails, return `BadRequest` error.
 pub fn validate_transfer(
@@ -91,7 +91,7 @@ pub fn validate_transfer(
     shards_key_mapping: &ShardKeyMapping,
 ) -> CollectionResult<()> {
     let Some(source_replicas) = source_replicas else {
-        return Err(CollectionError::service_error(format!(
+        return Err(CollectionError::bad_request(format!(
             "Shard {} does not exist",
             transfer.shard_id,
         )));
@@ -125,7 +125,38 @@ pub fn validate_transfer(
         )));
     }
 
-    if let Some(existing_transfer) = check_transfer_conflicts(transfer, current_transfers.iter()) {
+    // If transfer with this key already exist, there are two possible cases:
+    // - either we apply identical, but *conflicting* operation
+    // - or we re-apply *the same* operation after a crash
+    //
+    // We can distinguish between the two, because *last step* of `start_resharding`
+    // sets destination replica state to `Partial`.
+    //
+    // If destination replica *is* in `Partial` state, we should reject conflicting operation.
+    // If destination replica is *not* in `Partial` state, we should re-apply existing operation.
+    if get_transfer(&transfer.key(), current_transfers).is_some() {
+        // Resharding/filtered transfers have separate destination shard
+        let destination_replicas = destination_replicas.unwrap_or(source_replicas);
+
+        let is_applied = destination_replicas
+            .get(&transfer.to)
+            .is_some_and(|state| state.is_partial_or_recovery());
+
+        if is_applied {
+            return Err(CollectionError::bad_request(format!(
+                "Shard {} is already involved in transfer {} -> {}",
+                transfer.shard_id, transfer.from, transfer.to,
+            )));
+        }
+    }
+
+    // Exclude this key from conflict check, because we already checked for identical transfer
+    // conflict above
+    let other_transfers = current_transfers
+        .iter()
+        .filter(|other| transfer.key() != other.key());
+
+    if let Some(existing_transfer) = check_transfer_conflicts(transfer, other_transfers) {
         return Err(CollectionError::bad_request(format!(
             "Shard {} is already involved in transfer {} -> {}",
             transfer.shard_id, existing_transfer.from, existing_transfer.to,
@@ -134,7 +165,7 @@ pub fn validate_transfer(
 
     if transfer.method == Some(ShardTransferMethod::ReshardingStreamRecords) {
         let Some(destination_replicas) = destination_replicas else {
-            return Err(CollectionError::service_error(format!(
+            return Err(CollectionError::bad_request(format!(
                 "Destination shard {} does not exist",
                 transfer.shard_id,
             )));
@@ -176,7 +207,7 @@ pub fn validate_transfer(
         }
     } else if transfer.filter.is_some() {
         let Some(destination_replicas) = destination_replicas else {
-            return Err(CollectionError::service_error(format!(
+            return Err(CollectionError::bad_request(format!(
                 "Destination shard {} does not exist",
                 transfer.shard_id,
             )));

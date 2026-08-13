@@ -18,13 +18,14 @@ use shard::search::CoreSearchRequestBatch;
 use sparse::common::sparse_vector::SparseVector;
 
 use crate::collection::Collection;
-use crate::common::batching::batch_requests;
+use crate::common::batching::{batch_requests, empty_batch_results};
 use crate::common::fetch_vectors::{
     ReferencedVectors, convert_to_vectors, convert_to_vectors_owned,
     resolve_referenced_vectors_batch,
 };
 use crate::common::retrieve_request_trait::RetrieveRequest;
 use crate::operations::consistency_params::ReadConsistency;
+use crate::operations::routing::RoutingToken;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::{
     CollectionError, CollectionResult, CoreSearchRequest, RecommendRequestInternal, UsingVector,
@@ -144,11 +145,13 @@ pub fn avg_vector_for_recommendation<'a>(
     Ok(search_vector)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn recommend_by<F, Fut>(
     request: RecommendRequestInternal,
     collection: &Collection,
     collection_by_name: F,
     read_consistency: Option<ReadConsistency>,
+    routing_token: Option<RoutingToken>,
     shard_selector: ShardSelectorInternal,
     timeout: Option<Duration>,
     hw_measurement_acc: HwMeasurementAcc,
@@ -167,6 +170,7 @@ where
         collection,
         collection_by_name,
         read_consistency,
+        routing_token,
         timeout,
         hw_measurement_acc,
     )
@@ -247,6 +251,7 @@ pub async fn recommend_batch_by<F, Fut>(
     collection: &Collection,
     collection_by_name: F,
     read_consistency: Option<ReadConsistency>,
+    routing_token: Option<RoutingToken>,
     timeout: Option<Duration>,
     hw_measurement_acc: HwMeasurementAcc,
 ) -> CollectionResult<Vec<Vec<ScoredPoint>>>
@@ -258,7 +263,7 @@ where
 
     // shortcuts batch if all requests with limit=0
     if request_batch.iter().all(|(s, _)| s.limit == 0) {
-        return Ok(vec![]);
+        return Ok(empty_batch_results(request_batch.len()));
     }
 
     // Validate amount of examples
@@ -287,6 +292,7 @@ where
         collection,
         collection_by_name,
         read_consistency,
+        routing_token,
         timeout,
         hw_measurement_acc.clone(),
     )
@@ -322,6 +328,7 @@ where
             requests.push(collection.core_search_batch(
                 core_search_batch_request,
                 read_consistency,
+                routing_token,
                 shard_selector,
                 timeout,
                 hw_measurement_acc.clone(),

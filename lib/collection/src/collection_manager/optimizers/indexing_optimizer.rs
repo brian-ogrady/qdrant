@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 /// Looks for the segments, which require to be indexed.
 ///
 /// If segment is too large, but still does not have indexes - it is time to create some indexes.
@@ -34,8 +38,8 @@ mod tests {
     };
     use shard::operations::optimization::OptimizerThresholds;
     use shard::optimizers::segment_optimizer::SegmentOptimizer;
-    use shard::segment_holder::SegmentId;
     use shard::segment_holder::locked::LockedSegmentHolder;
+    use shard::segment_holder::{FlushMode, SegmentId};
     use shard::update::{process_field_index_operation, process_point_operation};
     use tempfile::Builder;
 
@@ -179,7 +183,7 @@ mod tests {
         let infos = locked_holder
             .read()
             .iter()
-            .map(|(_sid, segment)| segment.get().read().info())
+            .map(|(_sid, segment)| segment.get().read().info().unwrap())
             .collect_vec();
         let configs = locked_holder
             .read()
@@ -235,6 +239,7 @@ mod tests {
             vectors: VectorsConfig::Multi(BTreeMap::from([(
                 VECTOR_NAME.to_owned(),
                 VectorParams {
+                    memory: None,
                     size: NonZeroU64::new(DIM as u64).unwrap(),
                     distance: Distance::Dot,
                     hnsw_config: None,
@@ -287,7 +292,7 @@ mod tests {
             payload_storage_type: Default::default(),
         };
 
-        let mut segment = build_segment(
+        let (mut segment, _) = build_segment(
             segments_dir.path(),
             &segment_config,
             deferred_internal_id,
@@ -362,7 +367,7 @@ mod tests {
         let infos = locked_holder
             .read()
             .iter()
-            .map(|(_sid, segment)| segment.get().read().info())
+            .map(|(_sid, segment)| segment.get().read().info().unwrap())
             .collect_vec();
         assert!(
             infos
@@ -542,7 +547,7 @@ mod tests {
         let infos = locked_holder
             .read()
             .iter()
-            .map(|(_sid, segment)| segment.get().read().info())
+            .map(|(_sid, segment)| segment.get().read().info().unwrap())
             .collect_vec();
         let configs = locked_holder
             .read()
@@ -567,6 +572,14 @@ mod tests {
             on_disk_count, 1,
             "Testing that only largest segment is not Mmap"
         );
+
+        // Optimizations defer destroying their source segments to a post-flush action; the files
+        // are removed once a flush confirms the optimized data is durable (see
+        // `SegmentHolder::register_post_flush_action`). Flush to run the action before counting dirs.
+        locked_holder
+            .read()
+            .flush_all(FlushMode::Sync, true)
+            .expect("failed to flush segment holder");
 
         let segment_dirs = fs::read_dir(segments_dir.path()).unwrap().collect_vec();
         assert_eq!(
@@ -625,7 +638,7 @@ mod tests {
         let new_infos = locked_holder
             .read()
             .iter()
-            .map(|(_sid, segment)| segment.get().read().info())
+            .map(|(_sid, segment)| segment.get().read().info().unwrap())
             .collect_vec();
         let new_smallest_size = new_infos
             .iter()
@@ -653,7 +666,7 @@ mod tests {
         let new_infos2 = locked_holder
             .read()
             .iter()
-            .map(|(_sid, segment)| segment.get().read().info())
+            .map(|(_sid, segment)| segment.get().read().info().unwrap())
             .collect_vec();
 
         let mut has_empty = false;
@@ -816,6 +829,7 @@ mod tests {
         let locked_holder = LockedSegmentHolder::new(holder);
 
         let hnsw_config = HnswConfig {
+            memory: None,
             m: 16,
             ef_construct: 100,
             full_scan_threshold: 10,
@@ -1011,7 +1025,7 @@ mod tests {
         let segment_config = segment_optimizer_config.plain_segment_config();
 
         let hw_counter = HardwareCounterCell::new();
-        let mut segment = build_segment(
+        let (mut segment, _) = build_segment(
             segments_dir.path(),
             &segment_config,
             Some(deferred_internal_id),

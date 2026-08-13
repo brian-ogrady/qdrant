@@ -5,20 +5,19 @@
 use std::ops::Bound;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
+use blobstore::Blob;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use gridstore::Blob;
 use serde_json::Value;
 
-use super::{Encodable, NumericIndex};
+use super::{Encodable, NumericIndex, NumericIndexValue};
 use crate::common::operation_error::OperationResult;
+use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::index::field_index::numeric_point::{Numericable, Point};
-use crate::index::field_index::stored_point_to_values::StoredValue;
 use crate::index::field_index::{
     CardinalityEstimation, PayloadBlockCondition, PayloadFieldIndexRead,
 };
-use crate::index::query_optimization::optimized_filter::ConditionCheckerFn;
 use crate::types::{FieldCondition, PayloadKeyType, Range, RangeInterface};
 
 pub trait StreamRange<T> {
@@ -48,12 +47,11 @@ impl<T: Encodable + Numericable> Range<T> {
     }
 }
 
-impl<T: Encodable + Numericable + StoredValue + Send + Sync + Default, P> PayloadFieldIndexRead
-    for NumericIndex<T, P>
+impl<T: NumericIndexValue, P> PayloadFieldIndexRead for NumericIndex<T, P>
 where
     Vec<T>: Blob,
 {
-    fn count_indexed_points(&self) -> usize {
+    fn count_indexed_points(&self) -> OperationResult<usize> {
         self.inner.count_indexed_points()
     }
 
@@ -86,7 +84,7 @@ where
         &'a self,
         condition: &FieldCondition,
         hw_acc: HwMeasurementAcc,
-    ) -> Option<ConditionCheckerFn<'a>> {
+    ) -> OperationResult<Option<ConditionCheckerEnum<'a>>> {
         self.inner.condition_checker(condition, hw_acc)
     }
 

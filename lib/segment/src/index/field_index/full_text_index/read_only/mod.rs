@@ -1,9 +1,15 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use common::universal_io::UniversalRead;
 
-use super::mmap_text_index::MmapFullTextIndex;
 use super::mutable_text_index::read_only::ReadOnlyAppendableFullTextIndex;
+use super::on_disk_text_index::OnDiskFullTextIndex;
+use crate::index::field_index::full_text_index::immutable_text_index::ImmutableFullTextIndex;
 
 mod lifecycle;
+mod live_reload;
 mod read_ops;
 
 /// Read-only counterpart of [`FullTextIndex`][1], parameterised by a
@@ -33,8 +39,10 @@ mod read_ops;
 pub enum ReadOnlyFullTextIndex<S: UniversalRead> {
     /// Loads into RAM from appendable storage format
     Appendable(ReadOnlyAppendableFullTextIndex<S>),
+    /// Loads into RAM from immutable format
+    Immutable(ImmutableFullTextIndex<S>),
     /// Directly reads from storage in immutable format
-    Immutable(MmapFullTextIndex<S>),
+    OnDisk(OnDiskFullTextIndex<S>),
 }
 
 #[cfg(test)]
@@ -53,6 +61,7 @@ mod tests {
 
     fn test_config() -> TextIndexParams {
         TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -113,7 +122,7 @@ mod tests {
         // Trait dispatch on the parent enum forwards into the leaf:
         // every document was indexed (3 points), and `brown` matches the two
         // that contain it while `lazy` matches only the second.
-        assert_eq!(index.count_indexed_points(), payloads.len());
+        assert_eq!(index.count_indexed_points().unwrap(), payloads.len());
 
         let key = JsonPath::new("test");
         let brown = FieldCondition::new_match(key.clone(), Match::new_text("brown"));

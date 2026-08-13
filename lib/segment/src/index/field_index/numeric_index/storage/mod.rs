@@ -26,20 +26,23 @@ pub mod read_only;
 mod read_ops;
 mod trait_impls;
 
-use gridstore::Blob;
+use blobstore::Blob;
 
 use super::Encodable;
 use super::immutable_numeric_index::ImmutableNumericIndex;
 use super::mutable_numeric_index::MutableNumericIndex;
-use super::universal_numeric_index::UniversalNumericIndex;
+use super::on_disk_numeric_index::OnDiskNumericIndex;
 use crate::index::field_index::numeric_point::Numericable;
-use crate::index::field_index::stored_point_to_values::StoredValue;
+use crate::index::field_index::on_disk_point_to_values::StoredValue;
 
 pub enum NumericIndexInner<T: Encodable + Numericable + StoredValue + Send + Sync + Default>
 where
     Vec<T>: Blob,
 {
+    /// Loaded in RAM, use mutable storage format
     Mutable(MutableNumericIndex<T>),
+    /// Loaded in RAM, use immutable storage format
     Immutable(ImmutableNumericIndex<T>),
-    Mmap(UniversalNumericIndex<T>),
+    /// Served directly from storage (via mmap), use immutable format
+    OnDisk(OnDiskNumericIndex<T>),
 }

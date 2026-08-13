@@ -1,14 +1,14 @@
 use common::bitvec::BitVec;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use common::universal_io::{MmapFile, MmapFs};
+use common::universal_io::{MmapFile, MmapFs, Populate};
 use criterion::{Criterion, criterion_group, criterion_main};
-use rand::prelude::StdRng;
+use rand::prelude::SmallRng;
 use rand::{RngExt, SeedableRng};
 use segment::common::operation_error::OperationResult;
 use segment::index::field_index::numeric_index::NumericIndexRead;
 use segment::index::field_index::numeric_index::mutable_numeric_index::InMemoryNumericIndex;
-use segment::index::field_index::numeric_index::universal_numeric_index::UniversalNumericIndex;
+use segment::index::field_index::numeric_index::on_disk_numeric_index::OnDiskNumericIndex;
 use tempfile::Builder;
 
 mod prof;
@@ -16,7 +16,7 @@ mod prof;
 const NUM_POINTS: usize = 100000;
 const VALUES_PER_POINT: usize = 2;
 
-fn get_random_payloads(rng: &mut StdRng, num_points: usize) -> Vec<(PointOffsetType, f64)> {
+fn get_random_payloads(rng: &mut SmallRng, num_points: usize) -> Vec<(PointOffsetType, f64)> {
     let mut payloads = Vec::with_capacity(num_points);
     for i in 0..num_points {
         for _ in 0..VALUES_PER_POINT {
@@ -29,7 +29,7 @@ fn get_random_payloads(rng: &mut StdRng, num_points: usize) -> Vec<(PointOffsetT
 
 pub fn struct_numeric_check_values(c: &mut Criterion) {
     let seed = 42;
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = SmallRng::seed_from_u64(seed);
     let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
 
     let mut group = c.benchmark_group("numeric-check-values");
@@ -57,11 +57,11 @@ pub fn struct_numeric_check_values(c: &mut Criterion) {
         })
     });
 
-    let mmap_index = UniversalNumericIndex::<_, MmapFile>::build(
+    let mmap_index = OnDiskNumericIndex::<_, MmapFile>::build(
         &MmapFs,
         mutable_index,
         dir.path(),
-        false,
+        Populate::Blocking,
         &deleted_points,
     )
     .unwrap();

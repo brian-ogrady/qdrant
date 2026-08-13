@@ -1,13 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use segment::common::BYTES_IN_KB;
 use segment::data_types::modifier::Modifier;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use segment::types::{
-    Distance, HnswConfig, Indexes, MultiVectorConfig, PayloadStorageType, QuantizationConfig,
-    SegmentConfig, SparseVectorDataConfig, SparseVectorStorageType, VectorDataConfig,
-    VectorNameBuf, VectorStorageDatatype, VectorStorageType,
+    Distance, HnswConfig, Indexes, Memory, MultiVectorConfig, PayloadStorageType,
+    QuantizationConfig, SegmentConfig, SparseVectorDataConfig, SparseVectorStorageType,
+    VectorDataConfig, VectorNameBuf, VectorStorageDatatype, VectorStorageType,
 };
 
 pub const TEMP_SEGMENTS_PATH: &str = "temp_segments";
@@ -20,14 +22,60 @@ pub const DEFAULT_VACUUM_MIN_VECTOR_NUMBER: usize = 1000;
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenseVectorOptimizerConfig {
     pub on_disk: Option<bool>,
+    pub memory: Option<Memory>,
     pub hnsw_config: HnswConfig,
     pub quantization_config: Option<QuantizationConfig>,
+}
+
+impl DenseVectorOptimizerConfig {
+    /// Requested memory placement of the original vector storage, resolving the new `memory`
+    /// parameter against the deprecated `on_disk` flag. `None` if neither is configured.
+    pub fn memory_placement(&self) -> Option<Memory> {
+        Memory::resolve(self.memory, self.on_disk.map(Memory::from_on_disk))
+    }
 }
 
 /// Extra configuration for sparse vectors, applied on top of the plain config during optimization.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SparseVectorOptimizerConfig {
     pub on_disk: Option<bool>,
+    pub memory: Option<Memory>,
+}
+
+impl SparseVectorOptimizerConfig {
+    /// Requested memory placement of the sparse index, resolving the new `memory` parameter
+    /// against the deprecated `on_disk` flag. `None` if neither is configured.
+    pub fn memory_placement(&self) -> Option<Memory> {
+        Memory::resolve(self.memory, self.on_disk.map(Memory::from_on_disk_heap))
+    }
+}
+
+/// Live read of the vector names currently present in the collection schema.
+///
+/// Unlike the rest of [`SegmentOptimizerConfig`], which is a frozen snapshot taken when the
+/// optimizer was built, this reads the *current* schema each time it is called. Optimization needs
+/// the live view to tell a vector name that was deleted from the collection (and should be pruned
+/// when rebuilding old segments) from one that was just created but is not yet in this optimizer's
+/// frozen target (the CreateVectorName race, which must cancel instead). Wrapped in a newtype so
+/// `SegmentOptimizerConfig` can keep deriving `Debug`.
+#[derive(Clone)]
+pub struct LiveVectorNamesProvider(Arc<dyn Fn() -> HashSet<VectorNameBuf> + Send + Sync>);
+
+impl LiveVectorNamesProvider {
+    pub fn new(read: impl Fn() -> HashSet<VectorNameBuf> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(read))
+    }
+
+    pub fn get(&self) -> HashSet<VectorNameBuf> {
+        self.0()
+    }
+}
+
+impl fmt::Debug for LiveVectorNamesProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LiveVectorNamesProvider")
+            .finish_non_exhaustive()
+    }
 }
 
 /// This configuration contains all necessary information to build an optimized segment.
@@ -44,6 +92,9 @@ pub struct SegmentOptimizerConfig {
     /// Extra configuration for sparse vectors, which _might_ be applied during optimization,
     /// depending on the segment state.
     pub sparse_vector: HashMap<VectorNameBuf, SparseVectorOptimizerConfig>,
+    /// Live read of the collection's vector names, when wired in via
+    /// [`SegmentOptimizerConfig::with_live_vector_names`]. `None` if no live source is available.
+    pub live_vector_names: Option<LiveVectorNamesProvider>,
 }
 
 impl SegmentOptimizerConfig {
@@ -66,18 +117,24 @@ impl SegmentOptimizerConfig {
                 size,
                 distance,
                 on_disk,
+                memory,
                 hnsw_config,
                 quantization_config,
                 multivector_config,
                 datatype,
             } = input;
+            let plain_memory = Memory::resolve(
+                memory,
+                Some(Memory::from_on_disk(on_disk.unwrap_or_default())),
+            )
+            .unwrap_or(Memory::Cached);
             plain_dense_vector_config.insert(
                 name.clone(),
                 VectorDataConfig {
                     size,
                     distance,
                     index: Indexes::Plain {},
-                    storage_type: VectorStorageType::from_on_disk(on_disk.unwrap_or_default()),
+                    storage_type: VectorStorageType::appendable_from_memory(plain_memory),
                     quantization_config: QuantizationConfig::for_appendable_segment(
                         quantization_config.as_ref(),
                     ),
@@ -89,6 +146,7 @@ impl SegmentOptimizerConfig {
                 name,
                 DenseVectorOptimizerConfig {
                     on_disk,
+                    memory,
                     hnsw_config,
                     quantization_config,
                 },
@@ -99,6 +157,7 @@ impl SegmentOptimizerConfig {
         for (name, input) in sparse_vectors {
             let SparseVectorOptimizerInput {
                 on_disk,
+                memory,
                 full_scan_threshold,
                 index_datatype,
                 storage_type,
@@ -111,12 +170,13 @@ impl SegmentOptimizerConfig {
                         full_scan_threshold,
                         index_type: SparseIndexType::MutableRam,
                         datatype: index_datatype,
+                        memory,
                     },
                     storage_type,
                     modifier,
                 },
             );
-            sparse_vector.insert(name, SparseVectorOptimizerConfig { on_disk });
+            sparse_vector.insert(name, SparseVectorOptimizerConfig { on_disk, memory });
         }
 
         SegmentOptimizerConfig {
@@ -125,7 +185,22 @@ impl SegmentOptimizerConfig {
             plain_sparse_vector_config,
             dense_vector,
             sparse_vector,
+            live_vector_names: None,
         }
+    }
+
+    /// Attach a live read of the collection's vector names (see [`LiveVectorNamesProvider`]).
+    #[must_use]
+    pub fn with_live_vector_names(mut self, provider: LiveVectorNamesProvider) -> Self {
+        self.live_vector_names = Some(provider);
+        self
+    }
+
+    /// The collection's current vector names, if a live source was wired in.
+    pub fn live_vector_names(&self) -> Option<HashSet<VectorNameBuf>> {
+        self.live_vector_names
+            .as_ref()
+            .map(LiveVectorNamesProvider::get)
     }
 }
 
@@ -135,6 +210,7 @@ pub struct DenseVectorOptimizerInput {
     pub size: usize,
     pub distance: Distance,
     pub on_disk: Option<bool>,
+    pub memory: Option<Memory>,
     pub hnsw_config: HnswConfig,
     pub quantization_config: Option<QuantizationConfig>,
     pub multivector_config: Option<MultiVectorConfig>,
@@ -145,6 +221,7 @@ pub struct DenseVectorOptimizerInput {
 #[derive(Debug, Clone)]
 pub struct SparseVectorOptimizerInput {
     pub on_disk: Option<bool>,
+    pub memory: Option<Memory>,
     pub full_scan_threshold: Option<usize>,
     pub index_datatype: Option<VectorStorageDatatype>,
     pub storage_type: SparseVectorStorageType,
@@ -201,4 +278,32 @@ pub fn get_deferred_points_threshold_bytes(
     (prevent_unoptimized == Some(true))
         .then(|| indexing_threshold_kb.saturating_mul(BYTES_IN_KB))
         .and_then(NonZeroUsize::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[test]
+    fn live_vector_names_provider_reads_current_state() {
+        // The provider must re-read the live source on every call rather than snapshot it once,
+        // otherwise a vector deleted (or created) after optimizer construction would be missed and
+        // the merge would make the wrong cancel/prune decision.
+        let source = Arc::new(Mutex::new(HashSet::from(["a".to_owned(), "b".to_owned()])));
+        let provider = {
+            let source = source.clone();
+            LiveVectorNamesProvider::new(move || source.lock().unwrap().clone())
+        };
+
+        assert_eq!(
+            provider.get(),
+            HashSet::from(["a".to_owned(), "b".to_owned()])
+        );
+
+        // Delete "b" from the live source: the provider must reflect it on the next read.
+        source.lock().unwrap().remove("b");
+        assert_eq!(provider.get(), HashSet::from(["a".to_owned()]));
+    }
 }

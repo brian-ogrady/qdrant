@@ -8,6 +8,7 @@ use common::fs::atomic_save_json;
 use common::mmap::MmapFlusher;
 use common::typelevel::True;
 use common::types::PointOffsetType;
+use common::universal_io::{UioResult, UniversalReadFs, read_json_via};
 use fs_err as fs;
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +18,7 @@ use crate::encoded_vectors::{EncodedVectors, VectorParameters, validate_vector_p
 use crate::quantile::find_quantile_interval_per_coordinate_with_preprocess;
 use crate::turboquant::math::std_normal_cdf;
 use crate::turboquant::quantization::{ErrorCorrection, TurboQuantizer};
-use crate::turboquant::{EncodedQueryTQ, TQBits, TQMode};
+use crate::turboquant::{EncodedQueryTQ, TQBits, TQMode, TQRotation};
 
 pub struct EncodedVectorsTQ<TStorage: EncodedStorage> {
     encoded_vectors: TStorage,
@@ -35,6 +36,12 @@ pub struct Metadata {
     pub bits: TQBits,
     pub mode: TQMode,
     pub error_correction: Option<ErrorCorrectionMetadata>,
+    #[serde(default = "default_rotation")]
+    pub rotation: TQRotation,
+}
+
+fn default_rotation() -> TQRotation {
+    TQRotation::Padded
 }
 
 /// Initialize a new TurboQuantizer from metadata. Returns `Err` if the
@@ -52,6 +59,7 @@ pub fn new_turbo_quantizer_from_metadata(metadata: &Metadata) -> std::io::Result
         metadata.bits,
         metadata.mode,
         metadata.vector_parameters.distance_type,
+        metadata.rotation,
         error_correction,
     ))
 }
@@ -94,6 +102,10 @@ impl<TStorage: EncodedStorage> EncodedVectorsTQ<TStorage> {
         &self.encoded_vectors
     }
 
+    pub fn storage_mut(&mut self) -> &mut TStorage {
+        &mut self.encoded_vectors
+    }
+
     /// Encode vector data
     ///
     /// # Arguments
@@ -103,6 +115,10 @@ impl<TStorage: EncodedStorage> EncodedVectorsTQ<TStorage> {
     /// * `count` - number of vectors in `data` iterator
     /// * `bits` - bits for quantization
     /// * `mode` - quantization mode
+    /// * `rotation` - rotation applied to vectors and queries ([`TQRotation::Padded`]
+    ///   normally, [`TQRotation::Unpadded`] when re-quantizing a TQ-as-datatype source)
+    /// * `input_already_rotated` - if `true`, `data` is already in `rotation`'s
+    ///   space, so the encode pass skips rotating it (queries are still rotated)
     /// * `num_threads` - max threads to use for the TQ+ quantile pre-pass
     /// * `meta_path` - optional path to save metadata, if `None`, metadata will not be saved
     /// * `stopped` - Atomic bool that indicates if encoding should be stopped
@@ -114,11 +130,18 @@ impl<TStorage: EncodedStorage> EncodedVectorsTQ<TStorage> {
         count: usize,
         bits: TQBits,
         mode: TQMode,
+        rotation: TQRotation,
+        input_already_rotated: bool,
         num_threads: usize,
         meta_path: Option<&Path>,
         stopped: &AtomicBool,
     ) -> Result<Self, EncodingError> {
         debug_assert!(validate_vector_parameters(data.clone(), vector_parameters).is_ok());
+
+        // `rotation` is the space queries are rotated into and is persisted for
+        // scoring. When the input vectors are already in that space
+        // (`input_already_rotated`), the encode pass skips rotating them again.
+        let rotate_input = !input_already_rotated;
 
         // TQ+: first pass over `data` to fit per-coordinate shift/scale that
         // pulls the rotated, length-rescaled coordinates onto the Lloyd-Max
@@ -138,6 +161,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsTQ<TStorage> {
                     bits,
                     mode,
                     error_correction: None,
+                    rotation,
                 })
                 .map_err(|e| {
                     EncodingError::EncodingError(format!(
@@ -176,7 +200,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsTQ<TStorage> {
                     num_threads,
                     bits.sample_size(),
                     move |raw, scratch| {
-                        pre_quantizer_ref.preprocess_into(raw, scratch);
+                        pre_quantizer_ref.preprocess_into(raw, scratch, rotate_input);
                     },
                     stopped,
                 )?;
@@ -214,6 +238,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsTQ<TStorage> {
             vector_parameters: *vector_parameters,
             bits,
             mode,
+            rotation,
             error_correction: error_correction.as_ref().map(|ec| ErrorCorrectionMetadata {
                 shift: ec.shift.clone(),
                 scale: ec.scale.clone(),
@@ -232,8 +257,11 @@ impl<TStorage: EncodedStorage> EncodedVectorsTQ<TStorage> {
                 return Err(EncodingError::Stopped);
             }
 
-            let encoded_vector: Vec<u8> =
-                Self::encode_vector(vector.as_ref(), &quantizer, &mut buf);
+            let encoded_vector: Vec<u8> = if rotate_input {
+                quantizer.quantize(vector.as_ref(), &mut buf)
+            } else {
+                quantizer.quantize_prerotated(vector.as_ref(), &mut buf)
+            };
 
             storage_builder
                 .push_vector_data(&encoded_vector)
@@ -275,9 +303,12 @@ impl<TStorage: EncodedStorage> EncodedVectorsTQ<TStorage> {
         })
     }
 
-    pub fn load(encoded_vectors: TStorage, meta_path: &Path) -> std::io::Result<Self> {
-        let contents = fs::read_to_string(meta_path)?;
-        let metadata: Metadata = serde_json::from_str(&contents)?;
+    pub fn load<Fs: UniversalReadFs>(
+        fs: &Fs,
+        encoded_vectors: TStorage,
+        meta_path: &Path,
+    ) -> UioResult<Self> {
+        let metadata: Metadata = read_json_via(fs, meta_path)?;
 
         let quantizer = new_turbo_quantizer_from_metadata(&metadata)?;
 
@@ -311,7 +342,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsTQ<TStorage> {
     }
 
     pub fn layout(&self) -> Layout {
-        Layout::from_size_align(self.quantized_vector_size(), align_of::<f32>()).unwrap()
+        Layout::from_size_align(self.quantized_vector_size(), align_of::<u8>()).unwrap()
     }
 
     pub fn get_metadata(&self) -> &Metadata {
@@ -348,11 +379,12 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsTQ<TStorage> {
         self.quantizer.precompute_query(query)
     }
 
-    fn iter_batch(
+    fn for_each_batch(
         &self,
         offsets: &[PointOffsetType],
-    ) -> impl Iterator<Item = (usize, Cow<'_, [u8]>)> {
-        self.encoded_vectors.iter_batch(offsets)
+        callback: impl FnMut(usize, Cow<'_, [u8]>),
+    ) {
+        self.encoded_vectors.for_each_batch(offsets, callback)
     }
 
     fn score(

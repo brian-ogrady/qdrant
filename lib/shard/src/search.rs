@@ -1,6 +1,7 @@
 use common::types::ScoreType;
 #[cfg(feature = "api")]
 use itertools::Itertools as _;
+use segment::data_types::load_profile::LoadProfile;
 #[cfg(feature = "api")]
 use segment::data_types::vectors::NamedQuery;
 use segment::types::{Filter, SearchParams, WithPayloadInterface, WithVector};
@@ -32,6 +33,27 @@ pub struct CoreSearchRequest {
 }
 
 impl CoreSearchRequest {
+    /// Request-specific [`LoadProfile`] for opening a read-only shard to serve exactly
+    /// this search: only the queried vector's components and the filter's field indexes
+    /// keep their configured placement.
+    pub fn load_profile(&self) -> LoadProfile {
+        let Self {
+            query,
+            filter,
+            params: _,
+            limit: _,
+            offset: _,
+            with_payload,
+            with_vector: _,
+            score_threshold: _,
+        } = self;
+
+        // The `with_payload` default of a search is `false`.
+        let with_payload = with_payload.as_ref().is_some_and(|wp| wp.is_required());
+
+        LoadProfile::for_search(query.get_vector_name(), filter.as_ref(), with_payload)
+    }
+
     pub fn search_rate_cost(&self) -> usize {
         let mut cost = self.query.search_cost();
 
@@ -142,7 +164,7 @@ impl TryFrom<api::grpc::qdrant::CoreSearchPoints> for CoreSearchRequest {
         Ok(Self {
             query,
             filter: value.filter.map(|f| f.try_into()).transpose()?,
-            params: value.params.map(Into::into),
+            params: value.params.map(TryInto::try_into).transpose()?,
             limit: value.limit as usize,
             offset: value.offset.unwrap_or_default() as usize,
             with_payload: value.with_payload.map(|wp| wp.try_into()).transpose()?,
@@ -210,7 +232,7 @@ impl TryFrom<api::grpc::qdrant::SearchPoints> for CoreSearchRequest {
         Ok(Self {
             query: QueryEnum::Nearest(NamedQuery::from(vector_struct)),
             filter: filter.map(Filter::try_from).transpose()?,
-            params: params.map(SearchParams::from),
+            params: params.map(SearchParams::try_from).transpose()?,
             limit: limit as usize,
             offset: offset.map(|v| v as usize).unwrap_or_default(),
             with_payload: with_payload

@@ -4,7 +4,6 @@ use std::thread;
 
 use common::bitvec::{BitSliceExt as _, BitVec};
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::cow::BoxCow;
 #[cfg(target_os = "linux")]
 use common::cpu::linux_low_thread_priority;
 use common::progress_tracker::ProgressTracker;
@@ -25,6 +24,7 @@ use crate::common::BYTES_IN_KB;
 use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
 use crate::id_tracker::{IdTrackerEnum, IdTrackerRead};
 use crate::index::PayloadIndexRead;
+use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::index::field_index::PayloadBlockCondition;
 use crate::index::hnsw_index::HnswM;
 use crate::index::hnsw_index::build_condition_checker::BuildConditionChecker;
@@ -39,6 +39,7 @@ use crate::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
 use crate::index::hnsw_index::graph_layers_healer::GraphLayersHealer;
 use crate::index::hnsw_index::graph_links::{GraphLinksFormatParam, StorageGraphLinksVectors};
 use crate::index::hnsw_index::point_scorer::FilteredScorer;
+use crate::index::query_optimization::optimized_filter::OptimizedFilter;
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::index::visited_pool::{VisitedListHandle, VisitedPool};
 use crate::json_path::JsonPath;
@@ -139,7 +140,7 @@ impl HNSWIndex {
                             if payload_schema.enable_hnsw() {
                                 Some((progress_additional_links.subtask(subtask_name), field))
                             } else {
-                                debug!("enable_hnsw=false. Skip building additional index for field {}", &field);
+                                debug!("enable_hnsw=false. Skip building additional index for field {field}");
                                 None
                             }
                         })
@@ -433,7 +434,7 @@ impl HNSWIndex {
             for (index_pos, (field_progress, field)) in indexed_fields.into_iter().enumerate() {
                 field_progress.start();
 
-                debug!("building additional index for field {}", &field);
+                debug!("building additional index for field {field}");
 
                 let is_tenant = payload_index_ref.is_tenant(&field);
 
@@ -617,7 +618,7 @@ fn condition_points(
             &cardinality_estimation,
             &disposed_hw_counter,
             stopped,
-            DeferredBehavior::IncludeAll,
+            DeferredBehavior::WithDeferred,
         )?
         .filter(|&point_id| !deleted_bitslice.get_bit(point_id as usize).unwrap_or(false))
         .collect())
@@ -671,15 +672,16 @@ fn build_filtered_graph(
         // This hardware counter can be discarded, since it is only used for internal operations
         let internal_hardware_counter = HardwareCounterCell::disposable();
 
-        let block_condition_checker = BuildConditionChecker {
-            filter_list: block_filter_list,
-            current_point: block_point_id,
-        };
+        let block_condition_checker =
+            OptimizedFilter::from_checker(ConditionCheckerEnum::Build(BuildConditionChecker {
+                filter_list: block_filter_list,
+                current_point: block_point_id,
+            }));
         let points_scorer = FilteredScorer::new_internal(
             block_point_id,
             vector_storage,
             quantized_vectors.as_ref(),
-            Some(BoxCow::Borrowed(&block_condition_checker)),
+            Some(block_condition_checker),
             id_tracker.deleted_point_bitslice(),
             internal_hardware_counter,
         )?;

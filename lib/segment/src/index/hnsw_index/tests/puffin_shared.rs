@@ -618,7 +618,7 @@ fn read_bin_vectors(path: &Path, expected_count: usize, dim: usize) -> Option<Ve
 /// Sidecar contents the loader validates before returning vectors.
 /// `created` and `notes` are read for logging/diagnostics; the compiler can't
 /// see the print sites through serde so the fields warn as dead — allow.
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct RealDataSidecar {
     pub count: usize,
@@ -650,7 +650,7 @@ fn read_sidecar(path: &Path) -> Option<RealDataSidecar> {
 
 /// Loaded real-data pair, ready for a Phase 3 test run. v3.13 adds
 /// `body_source_indices` — for each `body[i]`, the parquet row it came from.
-#[allow(dead_code)] // `query_sidecar` reserved for future use / diagnostics
+#[expect(dead_code)] // `query_sidecar` reserved for future use / diagnostics
 pub(super) struct RealDataFixture {
     pub body: Vec<Vec<f32>>,
     pub queries: Vec<Vec<f32>>,
@@ -820,7 +820,7 @@ impl RealDataScaffold {
         FilteredScorer::new(
             query.into(),
             &self.storage,
-            None,
+            None::<&crate::vector_storage::quantized::quantized_vectors::QuantizedVectors>,
             None,
             &self.deleted,
             HardwareCounterCell::new(),
@@ -832,7 +832,7 @@ impl RealDataScaffold {
         FilteredScorer::new_internal(
             point_id,
             &self.storage,
-            None,
+            None::<&crate::vector_storage::quantized::quantized_vectors::QuantizedVectors>,
             None,
             &self.deleted,
             HardwareCounterCell::new(),
@@ -855,7 +855,7 @@ impl RealDataScaffold {
 // FilteredScorer signature — it is NOT touched during scoring.
 
 use crate::types::{
-    BinaryQuantizationConfig, BinaryQuantizationEncoding, QuantizationConfig,
+    BinaryQuantizationConfig, BinaryQuantizationEncoding, Memory, QuantizationConfig,
     TurboQuantBitSize, TurboQuantQuantizationConfig, TurboQuantization,
 };
 use crate::vector_storage::quantized::quantized_vectors::{
@@ -918,17 +918,27 @@ impl QuantVariant {
         }
     }
 
+    // `always_ram` is deprecated in favor of `memory` (1.19.0) but the config
+    // structs derive no `Default`, so the field must still be named. Upstream's
+    // own tests take a file-wide `allow(deprecated)`; scope it to this fn.
+    #[expect(deprecated)]
     pub(super) fn config(&self) -> QuantizationConfig {
         match self {
+            // `memory: Pinned` is what the deprecated `always_ram: true` now
+            // resolves to (see `legacy_always_ram_placement`): quantized
+            // vectors resident in RAM and never evicted, which is what these
+            // measurements assume.
             Self::Bq => BinaryQuantizationConfig {
-                always_ram: Some(true),
+                always_ram: None,
+                memory: Some(Memory::Pinned),
                 encoding: Some(BinaryQuantizationEncoding::OneBit),
                 query_encoding: None,
             }
             .into(),
             Self::Tq(bits) => QuantizationConfig::Turbo(TurboQuantization {
                 turbo: TurboQuantQuantizationConfig {
-                    always_ram: Some(true),
+                    always_ram: None,
+                    memory: Some(Memory::Pinned),
                     bits: Some(*bits),
                 },
             }),

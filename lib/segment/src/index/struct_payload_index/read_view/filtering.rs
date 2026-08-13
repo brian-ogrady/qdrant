@@ -1,5 +1,5 @@
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::types::PointOffsetType;
+use common::types::{DeferredBehavior, PointOffsetType};
 
 use super::StructPayloadIndexReadView;
 use crate::common::operation_error::OperationResult;
@@ -8,8 +8,8 @@ use crate::index::PayloadIndexRead;
 use crate::index::field_index::{
     CardinalityEstimation, FieldIndexRead, PrimaryCondition, ResolvedHasId,
 };
+use crate::index::query_optimization::optimized_filter::OptimizedFilter;
 use crate::index::query_optimization::payload_provider::PayloadProvider;
-use crate::index::struct_filter_context::StructFilterContext;
 use crate::json_path::JsonPath;
 use crate::payload_storage::PayloadStorageRead;
 use crate::types::{Condition, FieldCondition, Filter, IsEmptyCondition, IsNullCondition};
@@ -71,27 +71,30 @@ where
         }
     }
 
-    pub fn struct_filtered_context<'q>(
+    pub fn optimized_filter<'q>(
         &'q self,
         filter: &'q Filter,
+        deferred_behavior: DeferredBehavior,
         hw_counter: &HardwareCounterCell,
-    ) -> OperationResult<StructFilterContext<'q>> {
+    ) -> OperationResult<OptimizedFilter<'q>> {
         let payload_provider = PayloadProvider::new(self.payload.clone());
 
         let (optimized_filter, _) = self.optimize_filter(
             filter,
             payload_provider,
             self.available_point_count(),
+            deferred_behavior,
             hw_counter,
         )?;
 
-        Ok(StructFilterContext::new(optimized_filter))
+        Ok(optimized_filter)
     }
 
     pub(in crate::index) fn condition_cardinality(
         &self,
         condition: &Condition,
         nested_path: Option<&JsonPath>,
+        deferred_behavior: DeferredBehavior,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<CardinalityEstimation> {
         Ok(match condition {
@@ -117,10 +120,12 @@ where
             }
             Condition::HasId(has_id) => {
                 let point_ids = has_id.has_id.clone();
-                let resolved_point_offsets: Vec<PointOffsetType> = point_ids
-                    .iter()
-                    .filter_map(|external_id| self.id_tracker.internal_id(*external_id))
-                    .collect();
+                let mut resolved_point_offsets = Vec::with_capacity(point_ids.len());
+                self.id_tracker.resolve_external_ids(
+                    point_ids.iter().copied(),
+                    deferred_behavior,
+                    |_, offset| resolved_point_offsets.push(offset),
+                )?;
                 let num_ids = resolved_point_offsets.len();
                 CardinalityEstimation {
                     primary_clauses: vec![PrimaryCondition::Ids(ResolvedHasId {
@@ -146,6 +151,16 @@ where
             Condition::Field(field_condition) => self
                 .estimate_field_condition(field_condition, nested_path, hw_counter)?
                 .unwrap_or_else(|| CardinalityEstimation::unknown(self.available_point_count())),
+
+            Condition::Slice(slice_condition) => {
+                let available_points = self.available_point_count();
+                CardinalityEstimation {
+                    primary_clauses: vec![],
+                    min: 0,
+                    exp: available_points / slice_condition.slice.total.get() as usize,
+                    max: available_points,
+                }
+            }
 
             Condition::CustomIdChecker(cond) => {
                 cond.0.estimate_cardinality(self.available_point_count())

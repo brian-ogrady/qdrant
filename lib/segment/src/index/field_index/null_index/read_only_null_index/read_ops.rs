@@ -1,19 +1,21 @@
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
+use common::universal_io::UniversalRead;
 
 use super::super::read_ops::{self, NullIndexRead};
 use super::ReadOnlyNullIndex;
 use crate::common::flags::read_only_roaring_flags::ReadOnlyRoaringFlags;
 use crate::common::operation_error::OperationResult;
+use crate::index::UniversalReadExt;
+use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::index::field_index::{
     CardinalityEstimation, PayloadBlockCondition, PayloadFieldIndexRead,
 };
-use crate::index::query_optimization::optimized_filter::ConditionCheckerFn;
 use crate::types::{FieldCondition, PayloadKeyType};
 
-impl NullIndexRead for ReadOnlyNullIndex {
-    type Flags = ReadOnlyRoaringFlags;
+impl<S: UniversalRead> NullIndexRead for ReadOnlyNullIndex<S> {
+    type Flags = ReadOnlyRoaringFlags<S>;
 
     fn has_values_flags(&self) -> &Self::Flags {
         &self.storage.has_values_flags
@@ -32,9 +34,9 @@ impl NullIndexRead for ReadOnlyNullIndex {
     }
 }
 
-impl PayloadFieldIndexRead for ReadOnlyNullIndex {
-    fn count_indexed_points(&self) -> usize {
-        self.indexed_points_count()
+impl<S: UniversalReadExt> PayloadFieldIndexRead for ReadOnlyNullIndex<S> {
+    fn count_indexed_points(&self) -> OperationResult<usize> {
+        Ok(self.indexed_points_count())
     }
 
     fn filter<'a>(
@@ -42,7 +44,7 @@ impl PayloadFieldIndexRead for ReadOnlyNullIndex {
         condition: &'a FieldCondition,
         _hw_counter: &'a HardwareCounterCell,
     ) -> OperationResult<Option<Box<dyn Iterator<Item = PointOffsetType> + 'a>>> {
-        Ok(read_ops::filter(self, condition))
+        read_ops::filter(self, condition)
     }
 
     fn estimate_cardinality(
@@ -50,7 +52,7 @@ impl PayloadFieldIndexRead for ReadOnlyNullIndex {
         condition: &FieldCondition,
         _hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Option<CardinalityEstimation>> {
-        Ok(read_ops::estimate_cardinality(self, condition))
+        read_ops::estimate_cardinality(self, condition)
     }
 
     fn for_each_payload_block(
@@ -67,7 +69,7 @@ impl PayloadFieldIndexRead for ReadOnlyNullIndex {
         &'a self,
         condition: &FieldCondition,
         hw_acc: HwMeasurementAcc,
-    ) -> Option<ConditionCheckerFn<'a>> {
-        read_ops::condition_checker(self, condition, hw_acc)
+    ) -> OperationResult<Option<ConditionCheckerEnum<'a>>> {
+        Ok(read_ops::condition_checker(self, condition, hw_acc).map(S::condition_checker_null))
     }
 }

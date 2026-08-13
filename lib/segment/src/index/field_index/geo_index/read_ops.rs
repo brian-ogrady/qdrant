@@ -1,29 +1,30 @@
 //! Read operations shared by all geo index variants.
 //!
-//! The three concrete geo index types ([`MutableGeoMapIndex`],
-//! [`ImmutableGeoMapIndex`], [`StoredGeoMapIndex`]) — and the upcoming
-//! [`ReadOnlyGeoMapIndex`] — all expose the same read API on top of the same
-//! geohash-bucket layout. The [`GeoMapIndexRead`] trait captures that layout
+//! The three concrete geo index types ([`MutableGeoIndex`],
+//! [`ImmutableGeoIndex`], [`OnDiskGeoIndex`]) — and the upcoming
+//! [`ReadOnlyGeoIndex`] — all expose the same read API on top of the same
+//! geohash-bucket layout. The [`GeoIndexRead`] trait captures that layout
 //! via per-variant accessors; query / cardinality / payload-block logic lives
-//! as free functions over `&impl GeoMapIndexRead`, matching the
+//! as free functions over `&impl GeoIndexRead`, matching the
 //! [`NullIndexRead`] / [`BoolIndexRead`] pattern.
 //!
-//! [`MutableGeoMapIndex`]: super::mutable_geo_index::MutableGeoMapIndex
-//! [`ImmutableGeoMapIndex`]: super::immutable_geo_index::ImmutableGeoMapIndex
-//! [`StoredGeoMapIndex`]: super::mmap_geo_index::StoredGeoMapIndex
-//! [`ReadOnlyGeoMapIndex`]: super::read_only_geo_index::ReadOnlyGeoMapIndex
+//! [`MutableGeoIndex`]: super::mutable_geo_index::MutableGeoIndex
+//! [`ImmutableGeoIndex`]: super::immutable_geo_index::ImmutableGeoIndex
+//! [`OnDiskGeoIndex`]: super::mmap_geo_index::OnDiskGeoIndex
+//! [`ReadOnlyGeoIndex`]: super::read_only_geo_index::ReadOnlyGeoIndex
 //! [`NullIndexRead`]: super::super::null_index::NullIndexRead
 //! [`BoolIndexRead`]: super::super::bool_index::BoolIndexRead
 
 use std::cmp::{max, min};
 use std::path::PathBuf;
 
-use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::condition_checker::{CheckItem, ConditionChecker, Partitioner, Rest, Select};
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
+use common::universal_io::UserData;
 
 use super::GEO_QUERY_MAX_REGION;
-use crate::common::operation_error::OperationResult;
+use crate::common::operation_error::{OperationError, OperationResult};
 use crate::index::field_index::geo_hash::{
     GeoHash, circle_hashes, common_hash_prefix, geo_hash_to_box, polygon_hashes,
     polygon_hashes_estimation, rectangle_hashes,
@@ -31,9 +32,8 @@ use crate::index::field_index::geo_hash::{
 use crate::index::field_index::stat_tools::estimate_multi_value_selection_cardinality;
 use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition, PrimaryCondition};
 use crate::index::payload_config::StorageType;
-use crate::index::query_optimization::optimized_filter::ConditionCheckerFn;
 use crate::telemetry::PayloadIndexTelemetry;
-use crate::types::{FieldCondition, GeoPoint, PayloadKeyType};
+use crate::types::{CheckGeoPoint, FieldCondition, GeoPoint, PayloadKeyType};
 
 /// Shared read-only surface over the geo index variants.
 ///
@@ -41,7 +41,7 @@ use crate::types::{FieldCondition, GeoPoint, PayloadKeyType};
 /// retrieval, iteration over hash regions); every higher-level read operation
 /// (`match_cardinality`, `large_hashes`, telemetry, populate / clear_cache /
 /// files) is a default impl derived from those.
-pub trait GeoMapIndexRead {
+pub trait GeoIndexRead {
     fn points_count(&self) -> usize;
 
     fn points_values_count(&self) -> usize;
@@ -66,7 +66,27 @@ pub trait GeoMapIndexRead {
         idx: PointOffsetType,
         hw_counter: &HardwareCounterCell,
         check_fn: &dyn Fn(&GeoPoint) -> bool,
-    ) -> bool;
+    ) -> OperationResult<bool>;
+
+    /// Batched counterpart of [`Self::check_values_any`].
+    fn for_each_matching_value<I, F, M, U>(
+        &self,
+        items: I,
+        hw_counter: &HardwareCounterCell,
+        check_fn: F,
+        mut on_match: M,
+    ) -> OperationResult<()>
+    where
+        U: UserData,
+        I: Iterator<Item = (U, PointOffsetType)>,
+        F: Fn(&GeoPoint) -> bool,
+        M: FnMut(U, bool),
+    {
+        for (tag, idx) in items {
+            on_match(tag, self.check_values_any(idx, hw_counter, &check_fn)?);
+        }
+        Ok(())
+    }
 
     fn values_count(&self, idx: PointOffsetType) -> usize;
 
@@ -110,7 +130,7 @@ pub trait GeoMapIndexRead {
     }
 
     /// Cardinality estimation for a set of geo-hash regions. Mirrors the
-    /// previous inherent method on `GeoMapIndex`; depends only on the trait's
+    /// previous inherent method on `GeoIndex`; depends only on the trait's
     /// required accessors so every variant gets the same estimation logic.
     fn match_cardinality(
         &self,
@@ -199,7 +219,7 @@ pub trait GeoMapIndexRead {
     }
 }
 
-pub(super) fn filter<'a, G: GeoMapIndexRead + ?Sized>(
+pub(super) fn filter<'a, G: GeoIndexRead + ?Sized>(
     geo: &'a G,
     condition: &FieldCondition,
     hw_counter: &'a HardwareCounterCell,
@@ -212,6 +232,7 @@ pub(super) fn filter<'a, G: GeoMapIndexRead + ?Sized>(
                 geo.check_values_any(point, hw_counter, &|geo_point| {
                     geo_condition_copy.check_point(geo_point)
                 })
+                .unwrap_or(false) // TODO(uio): handle errors
             },
         ))));
     }
@@ -224,6 +245,7 @@ pub(super) fn filter<'a, G: GeoMapIndexRead + ?Sized>(
                 geo.check_values_any(point, hw_counter, &|geo_point| {
                     geo_condition_copy.check_point(geo_point)
                 })
+                .unwrap_or(false) // TODO(uio): handle errors
             },
         ))));
     }
@@ -236,6 +258,7 @@ pub(super) fn filter<'a, G: GeoMapIndexRead + ?Sized>(
                 geo.check_values_any(point, hw_counter, &|geo_point| {
                     geo_condition_copy.check_point(geo_point)
                 })
+                .unwrap_or(false) // TODO(uio): handle errors
             },
         ))));
     }
@@ -243,7 +266,7 @@ pub(super) fn filter<'a, G: GeoMapIndexRead + ?Sized>(
     Ok(None)
 }
 
-pub(super) fn estimate_cardinality<G: GeoMapIndexRead + ?Sized>(
+pub(super) fn estimate_cardinality<G: GeoIndexRead + ?Sized>(
     geo: &G,
     condition: &FieldCondition,
     hw_counter: &HardwareCounterCell,
@@ -277,13 +300,19 @@ pub(super) fn estimate_cardinality<G: GeoMapIndexRead + ?Sized>(
 
         for interior in &interior_hashes {
             let interior_estimation = geo.match_cardinality(interior, hw_counter)?;
-            exterior_estimation.min = max(0, exterior_estimation.min - interior_estimation.max);
+            exterior_estimation.min = exterior_estimation
+                .min
+                .saturating_sub(interior_estimation.max);
             exterior_estimation.max = max(
                 exterior_estimation.min,
-                exterior_estimation.max - interior_estimation.min,
+                exterior_estimation
+                    .max
+                    .saturating_sub(interior_estimation.min),
             );
             exterior_estimation.exp = max(
-                exterior_estimation.exp - interior_estimation.exp,
+                exterior_estimation
+                    .exp
+                    .saturating_sub(interior_estimation.exp),
                 exterior_estimation.min,
             );
         }
@@ -297,7 +326,7 @@ pub(super) fn estimate_cardinality<G: GeoMapIndexRead + ?Sized>(
     Ok(None)
 }
 
-pub(super) fn for_each_payload_block<G: GeoMapIndexRead + ?Sized>(
+pub(super) fn for_each_payload_block<G: GeoIndexRead + ?Sized>(
     geo: &G,
     threshold: usize,
     key: PayloadKeyType,
@@ -315,48 +344,49 @@ pub(super) fn for_each_payload_block<G: GeoMapIndexRead + ?Sized>(
         })
 }
 
-pub(super) fn condition_checker<'a, G: GeoMapIndexRead + ?Sized>(
+pub struct GeoConditionChecker<'a, G: ?Sized, F> {
     geo: &'a G,
-    condition: &FieldCondition,
-    hw_acc: HwMeasurementAcc,
-) -> Option<ConditionCheckerFn<'a>> {
-    // Destructure explicitly (no `..`) so a new field added to
-    // `FieldCondition` forces this method to be revisited.
-    let FieldCondition {
-        key: _,
-        r#match: _,
-        range: _,
-        geo_radius,
-        geo_bounding_box,
-        geo_polygon,
-        values_count: _,
-        is_empty: _,
-        is_null: _,
-    } = condition;
+    hw_counter: HardwareCounterCell,
+    filter: F,
+}
 
-    let hw_counter = hw_acc.get_counter_cell();
+impl<'a, G: ?Sized, F> GeoConditionChecker<'a, G, F> {
+    pub(super) fn new(geo: &'a G, hw_counter: HardwareCounterCell, filter: F) -> Self {
+        Self {
+            geo,
+            hw_counter,
+            filter,
+        }
+    }
+}
 
-    if let Some(geo_radius) = *geo_radius {
-        return Some(Box::new(move |point_id: PointOffsetType| {
-            geo.check_values_any(point_id, &hw_counter, &|value| {
-                geo_radius.check_point(value)
+impl<G, P> ConditionChecker for GeoConditionChecker<'_, G, P>
+where
+    G: GeoIndexRead + ?Sized,
+    P: CheckGeoPoint,
+{
+    type Error = OperationError;
+
+    fn check(&self, point_id: PointOffsetType) -> OperationResult<bool> {
+        self.geo
+            .check_values_any(point_id, &self.hw_counter, &|value| {
+                self.filter.check_point(value)
             })
-        }));
     }
-    if let Some(geo_bounding_box) = *geo_bounding_box {
-        return Some(Box::new(move |point_id: PointOffsetType| {
-            geo.check_values_any(point_id, &hw_counter, &|value| {
-                geo_bounding_box.check_point(value)
-            })
-        }));
+
+    fn check_batched<K: CheckItem>(
+        &self,
+        ids: &mut [K],
+        select: Select,
+        _rest: Rest,
+    ) -> OperationResult<usize> {
+        let p = Partitioner::new(ids);
+        self.geo.for_each_matching_value(
+            p.iter().map(|item| (item, item.point_id())),
+            &self.hw_counter,
+            |value| self.filter.check_point(value),
+            |item, matched| p.write(item, matched == select.is_match()),
+        )?;
+        Ok(p.finish())
     }
-    if let Some(geo_polygon) = geo_polygon.as_ref() {
-        let polygon_wrapper = geo_polygon.convert();
-        return Some(Box::new(move |point_id: PointOffsetType| {
-            geo.check_values_any(point_id, &hw_counter, &|value| {
-                polygon_wrapper.check_point(value)
-            })
-        }));
-    }
-    None
 }

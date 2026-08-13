@@ -9,6 +9,8 @@ on:
         default: false
         required: true
 
+permissions:
+  contents: read
 
 jobs:
   edge-rust-check:
@@ -28,7 +30,7 @@ jobs:
 
     steps:
       - name: Checkout Qdrant
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -41,7 +43,7 @@ jobs:
         uses: ./.github/actions/setup-just
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - name: Install ast-grep
         run: uv tool install ast-grep-cli
@@ -55,6 +57,10 @@ jobs:
 
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: edge
+          # edge-test (edge-test.yml) is the broadest build in this group and owns saving the cache
+          save-if: "false"
 
       - name: Prepare data files (for testing examples)
         if: steps.setup-qdrant.conclusion == 'success'
@@ -85,13 +91,13 @@ jobs:
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - name: Install ast-grep
         run: uv tool install ast-grep-cli
 
       - name: Checkout Qdrant
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Amalgamate
         run: uv run lib/edge/publish/amalgamate.py

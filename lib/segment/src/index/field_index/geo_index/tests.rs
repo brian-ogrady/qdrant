@@ -5,7 +5,7 @@ use common::bitvec::BitVec;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use common::universal_io::{MmapFile, MmapFs};
+use common::universal_io::MmapFile;
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use rand::SeedableRng;
@@ -14,13 +14,14 @@ use rstest::rstest;
 use serde_json::json;
 use tempfile::{Builder, TempDir};
 
-use super::builders::{GeoMapIndexGridstoreBuilder, GeoMapIndexMmapBuilder};
-use super::immutable_geo_index::ImmutableGeoMapIndex;
-use super::mmap_geo_index::StoredGeoMapIndex;
-use super::read_ops::GeoMapIndexRead;
-use super::{GEO_QUERY_MAX_REGION, GeoMapIndex};
+use super::builders::{GeoIndexGridstoreBuilder, GeoIndexMmapBuilder};
+use super::on_disk_geo_index::OnDiskGeoIndex;
+use super::read_ops::GeoIndexRead;
+use super::{GEO_QUERY_MAX_REGION, GeoIndex};
 use crate::fixtures::payload_fixtures::random_geo_payload;
-use crate::index::field_index::geo_hash::{GeoHash, circle_hashes, polygon_hashes};
+use crate::index::field_index::geo_hash::{
+    GeoHash, circle_hashes, encode_max_precision, polygon_hashes,
+};
 use crate::index::field_index::{
     CardinalityEstimation, FieldIndexBuilderTrait, PayloadFieldIndex, PayloadFieldIndexRead,
     ValueIndexer,
@@ -28,7 +29,8 @@ use crate::index::field_index::{
 use crate::json_path::JsonPath;
 use crate::types::test_utils::build_polygon;
 use crate::types::{
-    FieldCondition, GeoBoundingBox, GeoLineString, GeoPoint, GeoPolygon, GeoRadius,
+    CheckGeoPoint, FieldCondition, GeoBoundingBox, GeoLineString, GeoPoint, GeoPolygon, GeoRadius,
+    Memory,
 };
 
 /// Generous default size for the deleted-points bitslice used in tests.
@@ -56,15 +58,16 @@ type Database = ();
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum IndexType {
-    MutableGridstore,
-    Mmap,
-    RamMmap,
+    Mutable,
+    OnDisk,
+    Immutable,
 }
 
+#[expect(clippy::large_enum_variant)]
 enum IndexBuilder {
-    MutableGridstore(GeoMapIndexGridstoreBuilder),
-    Mmap(GeoMapIndexMmapBuilder),
-    RamMmap(GeoMapIndexMmapBuilder),
+    MutableGridstore(GeoIndexGridstoreBuilder),
+    Mmap(GeoIndexMmapBuilder),
+    Immutable(GeoIndexMmapBuilder),
 }
 
 impl IndexBuilder {
@@ -77,23 +80,15 @@ impl IndexBuilder {
         match self {
             IndexBuilder::MutableGridstore(builder) => builder.add_point(id, payload, hw_counter),
             IndexBuilder::Mmap(builder) => builder.add_point(id, payload, hw_counter),
-            IndexBuilder::RamMmap(builder) => builder.add_point(id, payload, hw_counter),
+            IndexBuilder::Immutable(builder) => builder.add_point(id, payload, hw_counter),
         }
     }
 
-    fn finalize(self) -> crate::common::operation_error::OperationResult<GeoMapIndex> {
+    fn finalize(self) -> crate::common::operation_error::OperationResult<GeoIndex> {
         match self {
             IndexBuilder::MutableGridstore(builder) => builder.finalize(),
             IndexBuilder::Mmap(builder) => builder.finalize(),
-            IndexBuilder::RamMmap(builder) => {
-                let GeoMapIndex::Storage(index) = builder.finalize()? else {
-                    panic!("expected mmap index");
-                };
-
-                let index =
-                    GeoMapIndex::Immutable(ImmutableGeoMapIndex::open_mmap(*index).unwrap());
-                Ok(index)
-            }
+            IndexBuilder::Immutable(builder) => builder.finalize(),
         }
     }
 }
@@ -120,6 +115,37 @@ fn condition_for_geo_box(key: &str, geo_bounding_box: GeoBoundingBox) -> FieldCo
     FieldCondition::new_geo_bounding_box(JsonPath::new(key), geo_bounding_box)
 }
 
+/// Run a filter query and return the matching point offsets, sorted.
+fn filtered_points(index: &GeoIndex, condition: &FieldCondition) -> Vec<PointOffsetType> {
+    let hw_acc = HwMeasurementAcc::new();
+    let hw_counter = hw_acc.get_counter_cell();
+    let mut points: Vec<PointOffsetType> = index
+        .filter(condition, &hw_counter)
+        .unwrap()
+        .unwrap()
+        .collect();
+    points.sort_unstable();
+    points
+}
+
+/// Assert that both the geo-radius query and its polygon approximation
+/// estimate exactly `expected` matches.
+fn assert_radius_cardinality(index: &GeoIndex, center: GeoPoint, meters: f64, expected: usize) {
+    let radius = GeoRadius {
+        center,
+        radius: OrderedFloat(meters),
+    };
+    let polygon = radius_to_polygon(&radius);
+    let hw = HardwareCounterCell::new();
+    let check = |cond: FieldCondition| {
+        let c = index.estimate_cardinality(&cond, &hw).unwrap().unwrap();
+        assert_eq!((c.min, c.exp, c.max), (expected, expected, expected));
+    };
+
+    check(condition_for_geo_radius("test", radius));
+    check(condition_for_geo_polygon("test", polygon));
+}
+
 #[cfg(feature = "testing")]
 fn create_builder(index_type: IndexType) -> (IndexBuilder, TempDir, Database) {
     let temp_dir = Builder::new().prefix("test_dir").tempdir().unwrap();
@@ -127,15 +153,15 @@ fn create_builder(index_type: IndexType) -> (IndexBuilder, TempDir, Database) {
     let db = ();
 
     let mut builder = match index_type {
-        IndexType::MutableGridstore => IndexBuilder::MutableGridstore(
-            GeoMapIndex::builder_gridstore(temp_dir.path().to_path_buf()),
-        ),
-        IndexType::Mmap => IndexBuilder::Mmap(GeoMapIndex::builder_mmap(
+        IndexType::Mutable => IndexBuilder::MutableGridstore(GeoIndex::builder_gridstore(
+            temp_dir.path().to_path_buf(),
+        )),
+        IndexType::OnDisk => IndexBuilder::Mmap(GeoIndex::builder_mmap(
             temp_dir.path(),
             true,
             &empty_deleted(),
         )),
-        IndexType::RamMmap => IndexBuilder::RamMmap(GeoMapIndex::builder_mmap(
+        IndexType::Immutable => IndexBuilder::Immutable(GeoIndex::builder_mmap(
             temp_dir.path(),
             false,
             &empty_deleted(),
@@ -144,7 +170,7 @@ fn create_builder(index_type: IndexType) -> (IndexBuilder, TempDir, Database) {
     match &mut builder {
         IndexBuilder::MutableGridstore(builder) => builder.init().unwrap(),
         IndexBuilder::Mmap(builder) => builder.init().unwrap(),
-        IndexBuilder::RamMmap(builder) => builder.init().unwrap(),
+        IndexBuilder::Immutable(builder) => builder.init().unwrap(),
     }
     (builder, temp_dir, db)
 }
@@ -153,7 +179,7 @@ fn build_random_index(
     num_points: usize,
     num_geo_values: usize,
     index_type: IndexType,
-) -> (GeoMapIndex, TempDir, Database) {
+) -> (GeoIndex, TempDir, Database) {
     let mut rnd = StdRng::seed_from_u64(42);
     let (mut builder, temp_dir, db) = create_builder(index_type);
 
@@ -173,6 +199,18 @@ fn build_random_index(
     assert_eq!(index.points_count(), num_points);
     assert_eq!(index.points_values_count(), num_points * num_geo_values);
     (index, temp_dir, db)
+}
+
+/// Reopen a persisted index from disk. Mmap indices don't persist runtime
+/// deletions, so the deletion bitslice must be re-supplied on reload.
+fn reload_index(index_type: IndexType, temp_dir: &TempDir, deleted: &BitVec) -> GeoIndex {
+    match index_type {
+        IndexType::Mutable => GeoIndex::new_mutable(temp_dir.path().to_path_buf(), true),
+        IndexType::OnDisk => GeoIndex::new_immutable(temp_dir.path(), Memory::Cold, deleted),
+        IndexType::Immutable => GeoIndex::new_immutable(temp_dir.path(), Memory::Pinned, deleted),
+    }
+    .unwrap()
+    .unwrap()
 }
 
 const EARTH_RADIUS_METERS: f64 = 6371.0 * 1000.;
@@ -215,36 +253,70 @@ fn radius_to_polygon(circle: &GeoRadius) -> GeoPolygon {
     ])
 }
 
+/// Regression: a geo-polygon whose interior ring matches more points than its
+/// exterior ring must not underflow the cardinality estimate. `estimate_cardinality`
+/// subtracted `usize`s wrapped in a no-op `max(0, ..)`, so when an interior estimate
+/// exceeded the exterior estimate the subtraction underflowed (debug panic / release
+/// wrap to ~usize::MAX, corrupting query planning).
 #[rstest]
-#[case(IndexType::MutableGridstore)]
-#[case(IndexType::Mmap)]
-#[case(IndexType::RamMmap)]
+#[case(IndexType::Mutable)]
+#[case(IndexType::OnDisk)]
+#[case(IndexType::Immutable)]
+fn test_polygon_interior_exceeds_exterior_cardinality(#[case] index_type: IndexType) {
+    let (mut builder, _temp_dir, _db) = create_builder(index_type);
+
+    // A single indexed point in New York.
+    builder
+        .add_point(0, &[&json!([NYC])], &HardwareCounterCell::new())
+        .unwrap();
+    let index = builder.finalize().unwrap();
+
+    // Exterior ring over Europe (does not contain the point); interior ring around
+    // New York (contains the point). The interior cardinality estimate therefore
+    // exceeds the exterior one, which previously underflowed `exterior.min - interior.max`.
+    let polygon = GeoPolygon {
+        exterior: GeoLineString {
+            points: vec![
+                GeoPoint::new_unchecked(2.0, 51.0),
+                GeoPoint::new_unchecked(2.0, 60.0),
+                GeoPoint::new_unchecked(20.0, 60.0),
+                GeoPoint::new_unchecked(20.0, 51.0),
+                GeoPoint::new_unchecked(2.0, 51.0),
+            ],
+        },
+        interiors: Some(vec![GeoLineString {
+            points: vec![
+                GeoPoint::new_unchecked(-74.5, 40.0),
+                GeoPoint::new_unchecked(-74.5, 41.5),
+                GeoPoint::new_unchecked(-73.0, 41.5),
+                GeoPoint::new_unchecked(-73.0, 40.0),
+                GeoPoint::new_unchecked(-74.5, 40.0),
+            ],
+        }]),
+    };
+
+    let hw_counter = HardwareCounterCell::new();
+    let card = index
+        .estimate_cardinality(&condition_for_geo_polygon("test", polygon), &hw_counter)
+        .unwrap()
+        .unwrap();
+
+    // No underflow: a self-consistent estimate bounded by the single indexed point.
+    assert!(card.min <= card.exp, "min {} > exp {}", card.min, card.exp);
+    assert!(card.exp <= card.max, "exp {} > max {}", card.exp, card.max);
+    assert!(
+        card.max <= index.points_count(),
+        "max {} exceeds total points {}",
+        card.max,
+        index.points_count(),
+    );
+}
+
+#[rstest]
+#[case(IndexType::Mutable)]
+#[case(IndexType::OnDisk)]
+#[case(IndexType::Immutable)]
 fn test_polygon_with_exclusion(#[case] index_type: IndexType) {
-    fn check_cardinality_match(
-        hashes: Vec<GeoHash>,
-        field_condition: FieldCondition,
-        index_type: IndexType,
-    ) {
-        let (field_index, _, _) = build_random_index(500, 20, index_type);
-        let exact_points_for_hashes = field_index.iterator(hashes).unwrap().collect_vec();
-        let real_cardinality = exact_points_for_hashes.len();
-
-        let hw_counter = HardwareCounterCell::new();
-        let card = field_index
-            .estimate_cardinality(&field_condition, &hw_counter)
-            .unwrap();
-        let card = card.unwrap();
-
-        eprintln!("real_cardinality = {real_cardinality:#?}");
-        eprintln!("card = {card:#?}");
-
-        assert!(card.min <= real_cardinality);
-        assert!(card.max >= real_cardinality);
-
-        assert!(card.exp >= card.min);
-        assert!(card.exp <= card.max);
-    }
-
     let europe = GeoLineString {
         points: vec![
             GeoPoint::new_unchecked(19.415558242000287, 69.18533258102943),
@@ -290,36 +362,10 @@ fn test_polygon_with_exclusion(#[case] index_type: IndexType) {
 }
 
 #[rstest]
-#[case(IndexType::MutableGridstore)]
-#[case(IndexType::Mmap)]
-#[case(IndexType::RamMmap)]
+#[case(IndexType::Mutable)]
+#[case(IndexType::OnDisk)]
+#[case(IndexType::Immutable)]
 fn match_cardinality(#[case] index_type: IndexType) {
-    fn check_cardinality_match(
-        hashes: Vec<GeoHash>,
-        field_condition: FieldCondition,
-        index_type: IndexType,
-    ) {
-        let (field_index, _, _) = build_random_index(500, 20, index_type);
-        let exact_points_for_hashes = field_index.iterator(hashes).unwrap().collect_vec();
-        let real_cardinality = exact_points_for_hashes.len();
-
-        let hw_counter = HardwareCounterCell::new();
-
-        let card = field_index
-            .estimate_cardinality(&field_condition, &hw_counter)
-            .unwrap();
-        let card = card.unwrap();
-
-        eprintln!("real_cardinality = {real_cardinality:#?}");
-        eprintln!("card = {card:#?}");
-
-        assert!(card.min <= real_cardinality);
-        assert!(card.max >= real_cardinality);
-
-        assert!(card.exp >= card.min);
-        assert!(card.exp <= card.max);
-    }
-
     let r_meters = 500_000.0;
     let geo_radius = GeoRadius {
         center: NYC,
@@ -341,10 +387,36 @@ fn match_cardinality(#[case] index_type: IndexType) {
     );
 }
 
+/// Assert the estimated cardinality brackets the exact hash-iterator count.
+fn check_cardinality_match(
+    hashes: Vec<GeoHash>,
+    field_condition: FieldCondition,
+    index_type: IndexType,
+) {
+    let (field_index, _, _) = build_random_index(500, 20, index_type);
+    let exact_points_for_hashes = field_index.iterator(hashes).unwrap().collect_vec();
+    let real_cardinality = exact_points_for_hashes.len();
+
+    let hw_counter = HardwareCounterCell::new();
+    let card = field_index
+        .estimate_cardinality(&field_condition, &hw_counter)
+        .unwrap();
+    let card = card.unwrap();
+
+    eprintln!("real_cardinality = {real_cardinality:#?}");
+    eprintln!("card = {card:#?}");
+
+    assert!(card.min <= real_cardinality);
+    assert!(card.max >= real_cardinality);
+
+    assert!(card.exp >= card.min);
+    assert!(card.exp <= card.max);
+}
+
 #[rstest]
-#[case(IndexType::MutableGridstore)]
-#[case(IndexType::Mmap)]
-#[case(IndexType::RamMmap)]
+#[case(IndexType::Mutable)]
+#[case(IndexType::OnDisk)]
+#[case(IndexType::Immutable)]
 fn geo_indexed_filtering(#[case] index_type: IndexType) {
     fn check_geo_indexed_filtering<F>(
         field_condition: FieldCondition,
@@ -356,9 +428,13 @@ fn geo_indexed_filtering(#[case] index_type: IndexType) {
         let (field_index, _, _) = build_random_index(1000, 5, index_type);
 
         let hw_counter = HardwareCounterCell::new();
-        let mut matched_points = (0..field_index.count_indexed_points() as PointOffsetType)
+        let mut matched_points = (0..field_index.count_indexed_points().unwrap()
+            as PointOffsetType)
             .filter_map(|idx| {
-                if field_index.check_values_any(idx, &hw_counter, &check_fn.clone()) {
+                if field_index
+                    .check_values_any(idx, &hw_counter, &check_fn.clone())
+                    .unwrap()
+                {
                     Some(idx as PointOffsetType)
                 } else {
                     None
@@ -368,16 +444,9 @@ fn geo_indexed_filtering(#[case] index_type: IndexType) {
 
         assert!(!matched_points.is_empty());
 
-        let hw_acc = HwMeasurementAcc::new();
-        let hw_counter = hw_acc.get_counter_cell();
-        let mut indexed_matched_points = field_index
-            .filter(&field_condition, &hw_counter)
-            .unwrap()
-            .unwrap()
-            .collect_vec();
+        let indexed_matched_points = filtered_points(&field_index, &field_condition);
 
         matched_points.sort_unstable();
-        indexed_matched_points.sort_unstable();
 
         assert_eq!(matched_points, indexed_matched_points);
     }
@@ -408,9 +477,9 @@ fn geo_indexed_filtering(#[case] index_type: IndexType) {
 }
 
 #[rstest]
-#[case(IndexType::MutableGridstore)]
-#[case(IndexType::Mmap)]
-#[case(IndexType::RamMmap)]
+#[case(IndexType::Mutable)]
+#[case(IndexType::OnDisk)]
+#[case(IndexType::Immutable)]
 fn test_payload_blocks(#[case] index_type: IndexType) {
     let (field_index, _, _) = build_random_index(1000, 5, index_type);
     let hw_counter = HardwareCounterCell::new();
@@ -434,195 +503,59 @@ fn test_payload_blocks(#[case] index_type: IndexType) {
         })
         .unwrap();
     blocks.iter().for_each(|block| {
-        let hw_acc = HwMeasurementAcc::new();
-        let hw_counter = hw_acc.get_counter_cell();
-        let block_points = field_index
-            .filter(&block.condition, &hw_counter)
-            .unwrap()
-            .unwrap()
-            .collect_vec();
+        let block_points = filtered_points(&field_index, &block.condition);
         assert_eq!(block_points.len(), block.cardinality);
     });
 }
 
 #[rstest]
-#[case(IndexType::MutableGridstore)]
-#[case(IndexType::Mmap)]
-#[case(IndexType::RamMmap)]
+#[case(IndexType::Mutable)]
+#[case(IndexType::OnDisk)]
+#[case(IndexType::Immutable)]
 fn match_cardinality_point_with_multi_far_geo_payload(#[case] index_type: IndexType) {
     let (mut builder, _, _) = create_builder(index_type);
 
     let r_meters = 100.0;
-    let geo_values = json!([
-        {
-            "lon": BERLIN.lon,
-            "lat": BERLIN.lat
-        },
-        {
-            "lon": NYC.lon,
-            "lat": NYC.lat
-        }
-    ]);
+    let geo_values = json!([BERLIN, NYC]);
     let hw_counter = HardwareCounterCell::new();
     builder.add_point(1, &[&geo_values], &hw_counter).unwrap();
     let index = builder.finalize().unwrap();
 
-    let hw_counter = HardwareCounterCell::new();
-
-    let nyc_geo_radius = GeoRadius {
-        center: NYC,
-        radius: OrderedFloat(r_meters),
-    };
-    let field_condition = condition_for_geo_radius("test", nyc_geo_radius);
-    let card = index
-        .estimate_cardinality(&field_condition, &hw_counter)
-        .unwrap();
-    let card = card.unwrap();
-    assert_eq!(card.min, 1);
-    assert_eq!(card.max, 1);
-    assert_eq!(card.exp, 1);
-
-    let field_condition = condition_for_geo_polygon("test", radius_to_polygon(&nyc_geo_radius));
-    let card = index
-        .estimate_cardinality(&field_condition, &hw_counter)
-        .unwrap();
-    let card = card.unwrap();
-    assert_eq!(card.min, 1);
-    assert_eq!(card.max, 1);
-    assert_eq!(card.exp, 1);
-
-    let berlin_geo_radius = GeoRadius {
-        center: BERLIN,
-        radius: OrderedFloat(r_meters),
-    };
-    let field_condition = condition_for_geo_radius("test", berlin_geo_radius);
-    let card = index
-        .estimate_cardinality(&field_condition, &hw_counter)
-        .unwrap();
-    let card = card.unwrap();
-    assert_eq!(card.min, 1);
-    assert_eq!(card.max, 1);
-    assert_eq!(card.exp, 1);
-
-    let field_condition = condition_for_geo_polygon("test", radius_to_polygon(&berlin_geo_radius));
-    let card = index
-        .estimate_cardinality(&field_condition, &hw_counter)
-        .unwrap();
-    let card = card.unwrap();
-    assert_eq!(card.min, 1);
-    assert_eq!(card.max, 1);
-    assert_eq!(card.exp, 1);
-
-    let tokyo_geo_radius = GeoRadius {
-        center: TOKYO,
-        radius: OrderedFloat(r_meters),
-    };
-    let field_condition = condition_for_geo_radius("test", tokyo_geo_radius);
-    let card = index
-        .estimate_cardinality(&field_condition, &hw_counter)
-        .unwrap();
-    let card = card.unwrap();
-    assert_eq!(card.min, 0);
-    assert_eq!(card.max, 0);
-    assert_eq!(card.exp, 0);
-
-    let field_condition = condition_for_geo_polygon("test", radius_to_polygon(&tokyo_geo_radius));
-    let card = index
-        .estimate_cardinality(&field_condition, &hw_counter)
-        .unwrap();
-    let card = card.unwrap();
-    assert_eq!(card.min, 0);
-    assert_eq!(card.max, 0);
-    assert_eq!(card.exp, 0);
+    assert_radius_cardinality(&index, NYC, r_meters, 1);
+    assert_radius_cardinality(&index, BERLIN, r_meters, 1);
+    assert_radius_cardinality(&index, TOKYO, r_meters, 0);
 }
 
 #[rstest]
-#[case(IndexType::MutableGridstore)]
-#[case(IndexType::Mmap)]
-#[case(IndexType::RamMmap)]
+#[case(IndexType::Mutable)]
+#[case(IndexType::OnDisk)]
+#[case(IndexType::Immutable)]
 fn match_cardinality_point_with_multi_close_geo_payload(#[case] index_type: IndexType) {
     let (mut builder, _, _) = create_builder(index_type);
-    let geo_values = json!([
-        {
-            "lon": BERLIN.lon,
-            "lat": BERLIN.lat
-        },
-        {
-            "lon": POTSDAM.lon,
-            "lat": POTSDAM.lat
-        }
-    ]);
+    let geo_values = json!([BERLIN, POTSDAM]);
     let hw_counter = HardwareCounterCell::new();
     builder.add_point(1, &[&geo_values], &hw_counter).unwrap();
     let index = builder.finalize().unwrap();
 
-    let hw_counter = HardwareCounterCell::new();
-
-    let berlin_geo_radius = GeoRadius {
-        center: BERLIN,
-        radius: OrderedFloat(50_000.0),
-    };
-    let field_condition = condition_for_geo_radius("test", berlin_geo_radius);
-    let card = index
-        .estimate_cardinality(&field_condition, &hw_counter)
-        .unwrap();
-    let card = card.unwrap();
-    assert_eq!(card.min, 1);
-    assert_eq!(card.max, 1);
-    assert_eq!(card.exp, 1);
-
-    let field_condition = condition_for_geo_polygon("test", radius_to_polygon(&berlin_geo_radius));
-    let card = index
-        .estimate_cardinality(&field_condition, &hw_counter)
-        .unwrap();
-    let card = card.unwrap();
-    assert_eq!(card.min, 1);
-    assert_eq!(card.max, 1);
-    assert_eq!(card.exp, 1);
+    assert_radius_cardinality(&index, BERLIN, 50_000.0, 1);
 }
 
 #[rstest]
-#[case(IndexType::MutableGridstore)]
-#[case(IndexType::Mmap)]
-#[case(IndexType::RamMmap)]
+#[case(IndexType::Mutable)]
+#[case(IndexType::OnDisk)]
+#[case(IndexType::Immutable)]
 fn load_from_disk(#[case] index_type: IndexType) {
     let temp_dir = {
         let (mut builder, temp_dir, _) = create_builder(index_type);
 
-        let geo_values = json!([
-            {
-                "lon": BERLIN.lon,
-                "lat": BERLIN.lat
-            },
-            {
-                "lon": POTSDAM.lon,
-                "lat": POTSDAM.lat
-            }
-        ]);
+        let geo_values = json!([BERLIN, POTSDAM]);
         let hw_counter = HardwareCounterCell::new();
         builder.add_point(1, &[&geo_values], &hw_counter).unwrap();
         builder.finalize().unwrap();
         temp_dir
     };
 
-    let new_index = match index_type {
-        IndexType::MutableGridstore => {
-            GeoMapIndex::new_gridstore(temp_dir.path().to_path_buf(), true)
-                .unwrap()
-                .unwrap()
-        }
-        IndexType::Mmap => GeoMapIndex::new_mmap(temp_dir.path(), false, &empty_deleted())
-            .unwrap()
-            .unwrap(),
-        IndexType::RamMmap => GeoMapIndex::Immutable(
-            ImmutableGeoMapIndex::open_mmap(
-                StoredGeoMapIndex::open(&MmapFs, temp_dir.path(), false, &empty_deleted())
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap(),
-        ),
-    };
+    let new_index = reload_index(index_type, &temp_dir, &empty_deleted());
 
     let berlin_geo_radius = GeoRadius {
         center: BERLIN,
@@ -630,44 +563,23 @@ fn load_from_disk(#[case] index_type: IndexType) {
     };
 
     let field_condition = condition_for_geo_radius("test", berlin_geo_radius);
-    let hw_acc = HwMeasurementAcc::new();
-    let hw_counter = hw_acc.get_counter_cell();
-    let point_offsets = new_index
-        .filter(&field_condition, &hw_counter)
-        .unwrap()
-        .unwrap()
-        .collect_vec();
+    let point_offsets = filtered_points(&new_index, &field_condition);
     assert_eq!(point_offsets, vec![1]);
 
     let field_condition = condition_for_geo_polygon("test", radius_to_polygon(&berlin_geo_radius));
-    let hw_acc = HwMeasurementAcc::new();
-    let hw_counter = hw_acc.get_counter_cell();
-    let point_offsets = new_index
-        .filter(&field_condition, &hw_counter)
-        .unwrap()
-        .unwrap()
-        .collect_vec();
+    let point_offsets = filtered_points(&new_index, &field_condition);
     assert_eq!(point_offsets, vec![1]);
 }
 
 #[rstest]
-#[case(IndexType::MutableGridstore)]
-#[case(IndexType::Mmap)]
-#[case(IndexType::RamMmap)]
+#[case(IndexType::Mutable)]
+#[case(IndexType::OnDisk)]
+#[case(IndexType::Immutable)]
 fn same_geo_index_between_points_test(#[case] index_type: IndexType) {
     let temp_dir = {
         let (mut builder, temp_dir, _) = create_builder(index_type);
 
-        let geo_values = json!([
-            {
-                "lon": BERLIN.lon,
-                "lat": BERLIN.lat
-            },
-            {
-                "lon": POTSDAM.lon,
-                "lat": POTSDAM.lat
-            }
-        ]);
+        let geo_values = json!([BERLIN, POTSDAM]);
         let hw_counter = HardwareCounterCell::new();
         let payload = [&geo_values];
         builder.add_point(1, &payload, &hw_counter).unwrap();
@@ -678,41 +590,68 @@ fn same_geo_index_between_points_test(#[case] index_type: IndexType) {
         index.flusher()().unwrap();
 
         assert_eq!(index.points_count(), 1);
-        if index_type != IndexType::Mmap {
+        if index_type != IndexType::OnDisk {
             assert_eq!(index.points_values_count(), 2);
         }
         drop(index);
         temp_dir
     };
 
-    let new_index = match index_type {
-        IndexType::MutableGridstore => {
-            GeoMapIndex::new_gridstore(temp_dir.path().to_path_buf(), true)
-                .unwrap()
-                .unwrap()
-        }
-        IndexType::Mmap => GeoMapIndex::new_mmap(temp_dir.path(), false, &deleted_with(&[1]))
-            .unwrap()
-            .unwrap(),
-        IndexType::RamMmap => GeoMapIndex::Immutable(
-            ImmutableGeoMapIndex::open_mmap(
-                StoredGeoMapIndex::open(&MmapFs, temp_dir.path(), false, &deleted_with(&[1]))
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap(),
-        ),
-    };
+    let new_index = reload_index(index_type, &temp_dir, &deleted_with(&[1]));
     assert_eq!(new_index.points_count(), 1);
-    if index_type != IndexType::Mmap {
+    if index_type != IndexType::OnDisk {
         assert_eq!(new_index.points_values_count(), 2);
     }
 }
 
 #[rstest]
-#[case(IndexType::MutableGridstore)]
-#[case(IndexType::Mmap)]
-#[case(IndexType::RamMmap)]
+#[case(IndexType::Mutable)]
+#[case(IndexType::OnDisk)]
+#[case(IndexType::Immutable)]
+fn same_geo_index_between_points_with_dups_test(#[case] index_type: IndexType) {
+    let temp_dir = {
+        let (mut builder, temp_dir, _) = create_builder(index_type);
+
+        let geo_values = json!([BERLIN, BERLIN, POTSDAM]); // Berlin twice
+        let hw_counter = HardwareCounterCell::new();
+        let payload = [&geo_values];
+        builder.add_point(1, &payload, &hw_counter).unwrap();
+        builder.add_point(2, &payload, &hw_counter).unwrap();
+        let mut index = builder.finalize().unwrap();
+
+        index.remove_point(1).unwrap();
+        index.flusher()().unwrap();
+
+        assert_eq!(index.points_count(), 1);
+        if index_type != IndexType::OnDisk {
+            assert_eq!(index.points_values_count(), 3);
+        }
+        drop(index);
+        temp_dir
+    };
+
+    let new_index = reload_index(index_type, &temp_dir, &deleted_with(&[1]));
+    assert_eq!(new_index.points_count(), 1);
+    if index_type != IndexType::OnDisk {
+        assert_eq!(new_index.points_values_count(), 3);
+
+        let hw_counter = HardwareCounterCell::disposable();
+        let berlin_hash = encode_max_precision(BERLIN.lon.0, BERLIN.lat.0).unwrap();
+        assert_eq!(
+            new_index.values_of_hash(berlin_hash, &hw_counter).unwrap(),
+            2
+        );
+        assert_eq!(
+            new_index.points_of_hash(berlin_hash, &hw_counter).unwrap(),
+            1
+        );
+    }
+}
+
+#[rstest]
+#[case(IndexType::Mutable)]
+#[case(IndexType::OnDisk)]
+#[case(IndexType::Immutable)]
 fn test_empty_index_cardinality(#[case] index_type: IndexType) {
     let polygon = GeoPolygon {
         exterior: GeoLineString {
@@ -786,35 +725,20 @@ fn test_empty_index_cardinality(#[case] index_type: IndexType) {
 }
 
 #[rstest]
-#[case(IndexType::MutableGridstore)]
-#[case(IndexType::Mmap)]
-#[case(IndexType::RamMmap)]
+#[case(IndexType::Mutable)]
+#[case(IndexType::OnDisk)]
+#[case(IndexType::Immutable)]
 fn query_across_antimeridian(#[case] index_type: IndexType) {
     let (mut builder, _, _) = create_builder(index_type);
-    let geo_values = json!([
-        {
-            "lon": BERLIN.lon,
-            "lat": BERLIN.lat
-        }
-    ]);
+    let geo_values = json!([BERLIN]);
     let hw_counter = HardwareCounterCell::new();
 
     builder.add_point(1, &[&geo_values], &hw_counter).unwrap();
 
-    let geo_values = json!([
-        {
-            "lon": LOS_ANGELES.lon,
-            "lat": LOS_ANGELES.lat
-        }
-    ]);
+    let geo_values = json!([LOS_ANGELES]);
     builder.add_point(2, &[&geo_values], &hw_counter).unwrap();
 
-    let geo_values = json!([
-        {
-            "lon": TOKYO.lon,
-            "lat": TOKYO.lat
-        }
-    ]);
+    let geo_values = json!([TOKYO]);
     builder.add_point(3, &[&geo_values], &hw_counter).unwrap();
 
     let new_index = builder.finalize().unwrap();
@@ -827,33 +751,24 @@ fn query_across_antimeridian(#[case] index_type: IndexType) {
     };
 
     let field_condition = condition_for_geo_box("test", bounding_box);
-    let hw_acc = HwMeasurementAcc::new();
-    let hw_counter = hw_acc.get_counter_cell();
-    let point_offsets = new_index
-        .filter(&field_condition, &hw_counter)
-        .unwrap()
-        .unwrap()
-        .collect_vec();
+    let point_offsets = filtered_points(&new_index, &field_condition);
     assert_eq!(point_offsets, vec![2]);
 }
 
 /// Removing a point with duplicate geo values in a multi-value geo field
 /// must not produce spurious "no points for hash X was found" warnings.
 #[rstest]
-#[case(IndexType::MutableGridstore)]
+#[case(IndexType::Mutable)]
 fn test_remove_point_with_duplicate_geo_values(#[case] index_type: IndexType) {
     let (mut builder, _temp_dir, _db) = create_builder(index_type);
     let hw_counter = HardwareCounterCell::new();
 
-    let duplicate_geo = json!([
-        {"lon": BERLIN.lon, "lat": BERLIN.lat},
-        {"lon": BERLIN.lon, "lat": BERLIN.lat}
-    ]);
+    let duplicate_geo = json!([BERLIN, BERLIN]);
     builder
         .add_point(0, &[&duplicate_geo], &hw_counter)
         .unwrap();
 
-    let single_geo = json!({"lon": NYC.lon, "lat": NYC.lat});
+    let single_geo = json!(NYC);
     builder.add_point(1, &[&single_geo], &hw_counter).unwrap();
 
     let mut index = builder.finalize().unwrap();
@@ -871,13 +786,7 @@ fn test_remove_point_with_duplicate_geo_values(#[case] index_type: IndexType) {
         radius: OrderedFloat(100.0),
     };
     let field_condition = condition_for_geo_radius("test", geo_radius);
-    let hw_acc = HwMeasurementAcc::new();
-    let hw_counter = hw_acc.get_counter_cell();
-    let results = index
-        .filter(&field_condition, &hw_counter)
-        .unwrap()
-        .unwrap()
-        .collect_vec();
+    let results = filtered_points(&index, &field_condition);
     assert_eq!(results, vec![1]);
 
     index.remove_point(1).unwrap();
@@ -892,15 +801,11 @@ fn test_remove_point_with_duplicate_geo_values(#[case] index_type: IndexType) {
 /// must be reversed on removal. Otherwise `values_per_hash` drifts upward permanently.
 #[test]
 fn test_values_per_hash_drift_on_duplicate_geo_removal() {
-    let (mut builder, _temp_dir, _db) = create_builder(IndexType::MutableGridstore);
+    let (mut builder, _temp_dir, _db) = create_builder(IndexType::Mutable);
     let hw_counter = HardwareCounterCell::new();
 
     // Point 0 has 3 identical geo values (same geohash produced 3 times).
-    let triple_duplicate = json!([
-        {"lon": BERLIN.lon, "lat": BERLIN.lat},
-        {"lon": BERLIN.lon, "lat": BERLIN.lat},
-        {"lon": BERLIN.lon, "lat": BERLIN.lat}
-    ]);
+    let triple_duplicate = json!([BERLIN, BERLIN, BERLIN]);
     builder
         .add_point(0, &[&triple_duplicate], &hw_counter)
         .unwrap();
@@ -948,19 +853,19 @@ fn test_values_per_hash_drift_on_duplicate_geo_removal() {
 /// Simulate the user's scenario: frequently adding and removing points
 /// with geo payloads.
 #[rstest]
-#[case(IndexType::MutableGridstore)]
+#[case(IndexType::Mutable)]
 fn test_frequent_add_remove_geo_points(#[case] index_type: IndexType) {
     let (mut builder, _temp_dir, _db) = create_builder(index_type);
     let hw_counter = HardwareCounterCell::new();
 
-    let berlin_geo = json!({"lon": BERLIN.lon, "lat": BERLIN.lat});
+    let berlin_geo = json!(BERLIN);
     builder.add_point(0, &[&berlin_geo], &hw_counter).unwrap();
 
     let mut index = builder.finalize().unwrap();
     assert_eq!(index.points_count(), 1);
 
     for i in 1u32..20 {
-        let geo = json!({"lon": NYC.lon, "lat": NYC.lat});
+        let geo = json!(NYC);
         index.add_point(i, &[&geo], &hw_counter).unwrap();
         assert_eq!(index.points_count(), 2);
 
@@ -968,7 +873,7 @@ fn test_frequent_add_remove_geo_points(#[case] index_type: IndexType) {
         assert_eq!(index.points_count(), 1);
     }
 
-    let tokyo_geo = json!({"lon": TOKYO.lon, "lat": TOKYO.lat});
+    let tokyo_geo = json!(TOKYO);
     index.add_point(0, &[&tokyo_geo], &hw_counter).unwrap();
     assert_eq!(index.points_count(), 1);
     assert_eq!(index.points_values_count(), 1);
@@ -978,13 +883,7 @@ fn test_frequent_add_remove_geo_points(#[case] index_type: IndexType) {
         radius: OrderedFloat(100.0),
     };
     let field_condition = condition_for_geo_radius("test", geo_radius);
-    let hw_acc = HwMeasurementAcc::new();
-    let hw_counter = hw_acc.get_counter_cell();
-    let results = index
-        .filter(&field_condition, &hw_counter)
-        .unwrap()
-        .unwrap()
-        .collect_vec();
+    let results = filtered_points(&index, &field_condition);
     assert_eq!(results, vec![0]);
 
     index.remove_point(0).unwrap();
@@ -993,8 +892,8 @@ fn test_frequent_add_remove_geo_points(#[case] index_type: IndexType) {
 }
 
 #[rstest]
-#[case(&[IndexType::MutableGridstore, IndexType::Mmap, IndexType::RamMmap], false)]
-#[case(&[IndexType::MutableGridstore, IndexType::RamMmap], true)]
+#[case(&[IndexType::Mutable, IndexType::OnDisk, IndexType::Immutable], false)]
+#[case(&[IndexType::Mutable, IndexType::Immutable], true)]
 fn test_congruence(#[case] types: &[IndexType], #[case] deleted: bool) {
     const POINT_COUNT: usize = 500;
 
@@ -1100,19 +999,19 @@ fn test_congruence(#[case] types: &[IndexType], #[case] deleted: bool) {
     }
 }
 
-/// Cross-check that [`StoredGeoMapIndex::all_points`] produces the same
+/// Cross-check that [`OnDiskGeoIndex::all_points`] produces the same
 /// point set as the mutable and immutable index implementations.
 #[test]
 fn test_all_points_congruence() {
     const POINT_COUNT: usize = 500;
 
     let (mut mutable_index, _mutable_tmp, _) =
-        build_random_index(POINT_COUNT, 20, IndexType::MutableGridstore);
+        build_random_index(POINT_COUNT, 20, IndexType::Mutable);
     let (mut immutable_index, _immutable_tmp, _) =
-        build_random_index(POINT_COUNT, 20, IndexType::RamMmap);
-    let (mut mmap_index, _mmap_tmp, _) = build_random_index(POINT_COUNT, 20, IndexType::Mmap);
+        build_random_index(POINT_COUNT, 20, IndexType::Immutable);
+    let (mut mmap_index, _mmap_tmp, _) = build_random_index(POINT_COUNT, 20, IndexType::OnDisk);
 
-    let GeoMapIndex::Storage(storage_index) = &mmap_index else {
+    let GeoIndex::OnDisk(storage_index) = &mmap_index else {
         panic!("expected Mmap variant to build into Storage");
     };
 
@@ -1171,9 +1070,9 @@ fn test_all_points_congruence() {
         ("global_large_region", global_hashes),
     ];
 
-    let assert_all_points_match = |mutable_index: &GeoMapIndex,
-                                   immutable_index: &GeoMapIndex,
-                                   storage_index: &StoredGeoMapIndex<MmapFile>,
+    let assert_all_points_match = |mutable_index: &GeoIndex,
+                                   immutable_index: &GeoIndex,
+                                   storage_index: &OnDiskGeoIndex<MmapFile>,
                                    cases: &[(&str, Vec<GeoHash>)],
                                    phase: &str| {
         for (name, hashes) in cases {
@@ -1216,7 +1115,7 @@ fn test_all_points_congruence() {
         mmap_index.remove_point(id).unwrap();
     }
 
-    let GeoMapIndex::Storage(storage_index) = &mmap_index else {
+    let GeoIndex::OnDisk(storage_index) = &mmap_index else {
         panic!("expected Mmap variant to build into Storage");
     };
 
@@ -1232,19 +1131,19 @@ fn test_all_points_congruence() {
 /// Reload contract: runtime deletions are not persisted by the mmap geo
 /// index. Callers must re-supply the deletion bitslice on reload.
 #[rstest]
-#[case(IndexType::MutableGridstore)]
-#[case(IndexType::Mmap)]
-#[case(IndexType::RamMmap)]
+#[case(IndexType::Mutable)]
+#[case(IndexType::OnDisk)]
+#[case(IndexType::Immutable)]
 fn test_geo_index_reload(#[case] index_type: IndexType) {
     let temp_dir = {
         let (mut builder, temp_dir, _) = create_builder(index_type);
 
         let hw_counter = HardwareCounterCell::new();
 
-        let berlin = json!({ "lon": BERLIN.lon, "lat": BERLIN.lat });
-        let potsdam = json!({ "lon": POTSDAM.lon, "lat": POTSDAM.lat });
-        let tokyo = json!({ "lon": TOKYO.lon, "lat": TOKYO.lat });
-        let nyc = json!({ "lon": NYC.lon, "lat": NYC.lat });
+        let berlin = json!(BERLIN);
+        let potsdam = json!(POTSDAM);
+        let tokyo = json!(TOKYO);
+        let nyc = json!(NYC);
 
         builder.add_point(1, &[&berlin], &hw_counter).unwrap();
         builder.add_point(2, &[&berlin], &hw_counter).unwrap();
@@ -1265,25 +1164,7 @@ fn test_geo_index_reload(#[case] index_type: IndexType) {
         temp_dir
     };
 
-    let deleted = deleted_with(&[2, 3, 6]);
-    let new_index = match index_type {
-        IndexType::MutableGridstore => {
-            GeoMapIndex::new_gridstore(temp_dir.path().to_path_buf(), true)
-                .unwrap()
-                .unwrap()
-        }
-        IndexType::Mmap => GeoMapIndex::new_mmap(temp_dir.path(), false, &deleted)
-            .unwrap()
-            .unwrap(),
-        IndexType::RamMmap => GeoMapIndex::Immutable(
-            ImmutableGeoMapIndex::open_mmap(
-                StoredGeoMapIndex::open(&MmapFs, temp_dir.path(), false, &deleted)
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap(),
-        ),
-    };
+    let new_index = reload_index(index_type, &temp_dir, &deleted_with(&[2, 3, 6]));
 
     assert_eq!(new_index.points_count(), 4);
 
@@ -1292,14 +1173,7 @@ fn test_geo_index_reload(#[case] index_type: IndexType) {
         radius: OrderedFloat(50_000.0),
     };
     let field_condition = condition_for_geo_radius("test", berlin_radius);
-    let hw_acc = HwMeasurementAcc::new();
-    let hw_counter = hw_acc.get_counter_cell();
-    let mut hits: Vec<PointOffsetType> = new_index
-        .filter(&field_condition, &hw_counter)
-        .unwrap()
-        .unwrap()
-        .collect();
-    hits.sort();
+    let hits = filtered_points(&new_index, &field_condition);
     assert_eq!(hits, vec![1, 4]);
 
     let tokyo_radius = GeoRadius {
@@ -1307,14 +1181,7 @@ fn test_geo_index_reload(#[case] index_type: IndexType) {
         radius: OrderedFloat(50_000.0),
     };
     let field_condition = condition_for_geo_radius("test", tokyo_radius);
-    let hw_acc = HwMeasurementAcc::new();
-    let hw_counter = hw_acc.get_counter_cell();
-    let mut hits: Vec<PointOffsetType> = new_index
-        .filter(&field_condition, &hw_counter)
-        .unwrap()
-        .unwrap()
-        .collect();
-    hits.sort();
+    let hits = filtered_points(&new_index, &field_condition);
     assert_eq!(hits, vec![5]);
 
     let nyc_radius = GeoRadius {
@@ -1322,14 +1189,7 @@ fn test_geo_index_reload(#[case] index_type: IndexType) {
         radius: OrderedFloat(50_000.0),
     };
     let field_condition = condition_for_geo_radius("test", nyc_radius);
-    let hw_acc = HwMeasurementAcc::new();
-    let hw_counter = hw_acc.get_counter_cell();
-    let mut hits: Vec<PointOffsetType> = new_index
-        .filter(&field_condition, &hw_counter)
-        .unwrap()
-        .unwrap()
-        .collect();
-    hits.sort();
+    let hits = filtered_points(&new_index, &field_condition);
     assert_eq!(hits, vec![7]);
 }
 
@@ -1337,15 +1197,15 @@ fn test_geo_index_reload(#[case] index_type: IndexType) {
 /// bitslice shorter than `point_to_values.len()`, missing entries must
 /// default to live, not deleted.
 #[rstest]
-#[case(IndexType::Mmap)]
-#[case(IndexType::RamMmap)]
+#[case(IndexType::OnDisk)]
+#[case(IndexType::Immutable)]
 fn test_geo_index_reload_short_deleted_bitslice(#[case] index_type: IndexType) {
     let temp_dir = {
         let (mut builder, temp_dir, _) = create_builder(index_type);
 
         let hw_counter = HardwareCounterCell::new();
 
-        let berlin = json!({ "lon": BERLIN.lon, "lat": BERLIN.lat });
+        let berlin = json!(BERLIN);
 
         builder.add_point(1, &[&berlin], &hw_counter).unwrap();
         builder.add_point(2, &[&berlin], &hw_counter).unwrap();
@@ -1358,33 +1218,166 @@ fn test_geo_index_reload_short_deleted_bitslice(#[case] index_type: IndexType) {
 
     let mut short_deleted = BitVec::repeat(false, 2);
     short_deleted.set(1, true);
-    let new_index = match index_type {
-        IndexType::Mmap => GeoMapIndex::new_mmap(temp_dir.path(), false, &short_deleted)
-            .unwrap()
-            .unwrap(),
-        IndexType::RamMmap => GeoMapIndex::Immutable(
-            ImmutableGeoMapIndex::open_mmap(
-                StoredGeoMapIndex::open(&MmapFs, temp_dir.path(), false, &short_deleted)
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap(),
-        ),
-        IndexType::MutableGridstore => unreachable!(),
-    };
+    let new_index = reload_index(index_type, &temp_dir, &short_deleted);
 
     let berlin_radius = GeoRadius {
         center: BERLIN,
         radius: OrderedFloat(50_000.0),
     };
     let field_condition = condition_for_geo_radius("test", berlin_radius);
-    let hw_acc = HwMeasurementAcc::new();
-    let hw_counter = hw_acc.get_counter_cell();
-    let mut hits: Vec<PointOffsetType> = new_index
-        .filter(&field_condition, &hw_counter)
-        .unwrap()
-        .unwrap()
-        .collect();
-    hits.sort();
+    let hits = filtered_points(&new_index, &field_condition);
     assert_eq!(hits, vec![2, 4]);
+}
+
+/// The optional block-index sidecars over `counts_per_hash` and `points_map`
+/// must be pure accelerators: cardinality estimates and filter results must
+/// be identical with the sidecars present and after deleting them (which
+/// falls back to plain binary search over the storage).
+#[test]
+fn test_block_index_fallback_equivalence() {
+    fn collect_results(
+        index: &GeoIndex,
+        conditions: &[FieldCondition],
+    ) -> Vec<(usize, usize, usize, Vec<PointOffsetType>)> {
+        let hw_counter = HardwareCounterCell::new();
+        conditions
+            .iter()
+            .map(|condition| {
+                let estimation = index
+                    .estimate_cardinality(condition, &hw_counter)
+                    .unwrap()
+                    .unwrap();
+                let points = filtered_points(index, condition);
+                (estimation.min, estimation.exp, estimation.max, points)
+            })
+            .collect()
+    }
+
+    let (index, temp_dir, _db) = build_random_index(2000, 5, IndexType::OnDisk);
+    drop(index);
+
+    let counts_sidecar = temp_dir
+        .path()
+        .join(super::on_disk_geo_index::COUNTS_PER_HASH_BLOCK_INDEX);
+    let points_map_sidecar = temp_dir
+        .path()
+        .join(super::on_disk_geo_index::POINTS_MAP_BLOCK_INDEX);
+    assert!(counts_sidecar.exists());
+    assert!(points_map_sidecar.exists());
+
+    // Radius queries around random centers (the payload fixture spreads
+    // points across the whole globe) plus the named cities, with radii from
+    // tight to continent-scale.
+    let mut rnd = StdRng::seed_from_u64(7);
+    let mut conditions = Vec::new();
+    for i in 0..50 {
+        let center = GeoPoint::new_unchecked(
+            rand::RngExt::random_range(&mut rnd, LON_RANGE),
+            rand::RngExt::random_range(&mut rnd, LAT_RANGE),
+        );
+        let radius_meters = 1_000.0 * 10_f64.powi(i % 4);
+        conditions.push(condition_for_geo_radius(
+            "test",
+            GeoRadius {
+                center,
+                radius: OrderedFloat(radius_meters),
+            },
+        ));
+    }
+    for city in [NYC, BERLIN, POTSDAM, TOKYO, LOS_ANGELES] {
+        conditions.push(condition_for_geo_radius(
+            "test",
+            GeoRadius {
+                center: city,
+                radius: OrderedFloat(500_000.0),
+            },
+        ));
+    }
+
+    let deleted = empty_deleted();
+
+    let with_block_index = reload_index(IndexType::OnDisk, &temp_dir, &deleted);
+    let with_results = collect_results(&with_block_index, &conditions);
+    drop(with_block_index);
+
+    fs_err::remove_file(&counts_sidecar).unwrap();
+    fs_err::remove_file(&points_map_sidecar).unwrap();
+    let without_block_index = reload_index(IndexType::OnDisk, &temp_dir, &deleted);
+    let without_results = collect_results(&without_block_index, &conditions);
+
+    assert_eq!(with_results, without_results);
+    // Sanity: the query mix actually matches points.
+    assert!(
+        with_results
+            .iter()
+            .any(|(_, _, _, points)| !points.is_empty())
+    );
+}
+
+/// The block-index sidecars must be covered by `preopen`: after
+/// `schedule_prefetch`, `open` must be served from the prefetch pool without
+/// touching the filesystem again. Conversely, absent sidecars (old segment)
+/// must not fail `preopen` and must open in fallback mode.
+#[test]
+fn test_block_index_preopen() {
+    use common::universal_io::{
+        CachedFs, CachedReadFs as _, Populate, ReadOnly, UniversalRead, UniversalReadFileOps as _,
+    };
+
+    type Storage = ReadOnly<MmapFile>;
+    type RoFs = <Storage as UniversalRead>::Fs;
+
+    let (index, temp_dir, _db) = build_random_index(2000, 5, IndexType::OnDisk);
+    drop(index);
+    let counts_sidecar = temp_dir
+        .path()
+        .join(super::on_disk_geo_index::COUNTS_PER_HASH_BLOCK_INDEX);
+    let points_map_sidecar = temp_dir
+        .path()
+        .join(super::on_disk_geo_index::POINTS_MAP_BLOCK_INDEX);
+    let deleted = empty_deleted();
+
+    // Same order as the segment open path: snapshot, then preopen, then open.
+    let fs = RoFs::from_context(Default::default()).unwrap();
+    let mut cached_fs = CachedFs::new(fs.clone(), temp_dir.path()).unwrap();
+    cached_fs.cache_file_info().unwrap();
+    assert!(
+        OnDiskGeoIndex::<Storage>::preopen(&cached_fs, temp_dir.path(), Populate::PreferBackground)
+            .unwrap()
+    );
+
+    // The sidecar reads of `open` must now come from the prefetch pool.
+    fs_err::remove_file(&counts_sidecar).unwrap();
+    fs_err::remove_file(&points_map_sidecar).unwrap();
+
+    let index = OnDiskGeoIndex::<Storage>::open(
+        &cached_fs,
+        temp_dir.path(),
+        Populate::PreferBackground,
+        &deleted,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(index.storage.counts_per_hash_block_index.is_some());
+    assert!(index.storage.points_map_block_index.is_some());
+    drop(index);
+
+    // Absent sidecars (segment built before they were introduced): `preopen`
+    // must not fail on the missing files and `open` must fall back.
+    let mut cached_fs = CachedFs::new(fs, temp_dir.path()).unwrap();
+    cached_fs.cache_file_info().unwrap();
+    assert!(
+        OnDiskGeoIndex::<Storage>::preopen(&cached_fs, temp_dir.path(), Populate::PreferBackground)
+            .unwrap()
+    );
+    let index = OnDiskGeoIndex::<Storage>::open(
+        &cached_fs,
+        temp_dir.path(),
+        Populate::PreferBackground,
+        &deleted,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(index.storage.counts_per_hash_block_index.is_none());
+    assert!(index.storage.points_map_block_index.is_none());
 }

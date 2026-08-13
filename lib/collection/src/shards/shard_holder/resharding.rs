@@ -411,7 +411,7 @@ impl ShardHolder {
                         // Internal operation, no performance tracking needed
                         HwMeasurementAcc::disposable(),
                         true,
-                        DeferredBehavior::IncludeAll,
+                        DeferredBehavior::WithDeferred,
                     )
                     .await?;
             }
@@ -673,6 +673,16 @@ impl OperationsByMode {
                 PointOperations::SyncPoints(op) => {
                     vec![CollectionUpdateOperations::PointOperation(
                         PointOperations::SyncPoints(op),
+                    )]
+                }
+                PointOperations::UpsertPointsRaw(points) => {
+                    vec![CollectionUpdateOperations::PointOperation(
+                        PointOperations::UpsertPointsRaw(points),
+                    )]
+                }
+                PointOperations::SyncPointsRaw(op) => {
+                    vec![CollectionUpdateOperations::PointOperation(
+                        PointOperations::SyncPointsRaw(op),
                     )]
                 }
             },

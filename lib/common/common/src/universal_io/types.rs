@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::ops::Range;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
@@ -6,6 +7,7 @@ use serde::de::DeserializeOwned;
 use super::UniversalIoError;
 use super::traits::UniversalReadFs;
 use crate::mmap::{Advice, AdviceSetting};
+use crate::universal_io::{UniversalRead, UserData};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum UniversalKind {
@@ -16,9 +18,42 @@ pub enum UniversalKind {
     S3,
     Gcs,
     Azure,
+    /// Direct gRPC connection to a Qdrant peer's `StorageRead` service
+    /// (see the `uio-grpc-client` / `io_bridge_uio_grpc` crates).
+    UioGrpc,
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+impl UniversalKind {
+    /// Whether data backed by this kind is fully resident in RAM or mapped into
+    /// the address space (mmap), as opposed to being fetched on demand from disk
+    /// or a remote object store.
+    pub fn is_in_ram_or_mmap(self) -> bool {
+        match self {
+            UniversalKind::Mmap | UniversalKind::SimpleDiskCache => true,
+            UniversalKind::IoUring
+            | UniversalKind::DiskCache
+            | UniversalKind::S3
+            | UniversalKind::Gcs
+            | UniversalKind::Azure
+            | UniversalKind::UioGrpc => false,
+        }
+    }
+
+    pub fn can_be_async(self) -> bool {
+        match self {
+            UniversalKind::Mmap => false,
+            UniversalKind::IoUring
+            | UniversalKind::DiskCache
+            | UniversalKind::SimpleDiskCache
+            | UniversalKind::S3
+            | UniversalKind::Gcs
+            | UniversalKind::Azure
+            | UniversalKind::UioGrpc => true,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Populate {
     /// Let backend choose
     #[default]
@@ -29,6 +64,11 @@ pub enum Populate {
     Blocking,
     /// Populate, but prefer to do it in the background
     PreferBackground,
+    /// Populate only the given range.
+    ///
+    /// Backends that cannot populate a sub-range treat this like
+    /// [`Populate::No`].
+    Partial(ReadRange),
 }
 
 impl From<bool> for Populate {
@@ -37,6 +77,26 @@ impl From<bool> for Populate {
             Populate::Blocking
         } else {
             Populate::No
+        }
+    }
+}
+
+impl Populate {
+    pub fn to_bool<S: UniversalRead>(self) -> bool {
+        match self {
+            Populate::Auto => S::populate_auto(),
+            Populate::No | Populate::Partial(_) => false,
+            Populate::Blocking | Populate::PreferBackground => true,
+        }
+    }
+
+    /// Default a non-populate (`Auto`/`No`) to partially populating `range`.
+    pub fn or_partial(self, range: Range<u64>) -> Populate {
+        match self {
+            Populate::Auto | Populate::No => {
+                Populate::Partial(ReadRange::new(range.start, range.end - range.start))
+            }
+            Populate::Blocking | Populate::PreferBackground | Populate::Partial(_) => self,
         }
     }
 }
@@ -71,7 +131,7 @@ impl OpenOptions {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ReadRange {
     /// Start position in bytes from the beginning of the file/storage.
     pub byte_offset: u64,
@@ -140,19 +200,38 @@ impl ReadRange {
     }
 }
 
+pub struct ReadBytesItem<U: UserData> {
+    pub user_data: U,
+    pub range: Range<u64>,
+    pub align: usize,
+}
+
+/// A single file matched by [`UniversalReadFileOps::list_files`]: its path
+/// and size in bytes.
+///
+/// [`UniversalReadFileOps::list_files`]: super::UniversalReadFileOps::list_files
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ListedFile {
+    pub path: std::path::PathBuf,
+    pub size: u64,
+    /// Last modification time, when the backend exposes one (local
+    /// filesystems, object stores); `None` otherwise.
+    pub last_modified: Option<std::time::SystemTime>,
+}
+
 pub type ByteOffset = u64;
 
 pub type FileIndex = usize;
 
-pub type Flusher = Box<dyn FnOnce() -> Result<()> + Send>;
+pub type Flusher = Box<dyn FnOnce() -> UioResult<()> + Send>;
 
-pub type Result<T, E = UniversalIoError> = std::result::Result<T, E>;
+pub type UioResult<T> = Result<T, UniversalIoError>;
 
 pub fn read_whole_via<Fs, T>(
     fs: &Fs,
     path: impl AsRef<Path>,
-    callback: impl FnOnce(Cow<'_, [u8]>) -> Result<T, UniversalIoError>,
-) -> Result<T, UniversalIoError>
+    callback: impl FnOnce(Cow<'_, [u8]>) -> UioResult<T>,
+) -> UioResult<T>
 where
     Fs: UniversalReadFs,
 {
@@ -177,7 +256,7 @@ where
 ///
 /// Uses a single logical read when the backend overrides
 /// [`UniversalRead::read_whole`](super::UniversalRead::read_whole).
-pub fn read_json_via<Fs, T>(fs: &Fs, path: impl AsRef<Path>) -> Result<T>
+pub fn read_json_via<Fs, T>(fs: &Fs, path: impl AsRef<Path>) -> UioResult<T>
 where
     Fs: UniversalReadFs,
     T: DeserializeOwned,
@@ -191,7 +270,7 @@ where
 ///
 /// Uses a single logical read when the backend overrides
 /// [`UniversalRead::read_whole`](super::UniversalRead::read_whole).
-pub fn read_bin_via<Fs, T>(fs: &Fs, path: impl AsRef<Path>) -> Result<T>
+pub fn read_bin_via<Fs, T>(fs: &Fs, path: impl AsRef<Path>) -> UioResult<T>
 where
     Fs: UniversalReadFs,
     T: DeserializeOwned,

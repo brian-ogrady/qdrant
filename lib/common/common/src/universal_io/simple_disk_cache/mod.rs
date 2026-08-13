@@ -13,23 +13,26 @@ pub use config::DiskCacheConfig;
 pub use file::DiskCache;
 pub use fs::{DiskCacheFs, DiskCacheFsContext};
 
-use crate::universal_io::{UniversalRead, UniversalReadFs};
+use crate::mmap::AdviceSetting;
+use crate::universal_io::{OpenOptions, Populate, UniversalRead, UniversalReadFs};
 
 /// Trait bundle for remote backends that can be cached by [`DiskCache`].
 pub trait DiskCacheRemote:
     UniversalRead<
         Fs: Clone + Send + Sync + UniversalReadFs<OpenExtra: Clone + Send + Sync>,
-        OwnedReadPipeline<()>: Send,
-    > + Clone
+        ReadPipeline<'static, ()>: Send,
+        ReadPipeline<'static, Range<u32>>: Send,
+    > + 'static
 {
 }
 
 impl<R> DiskCacheRemote for R
 where
-    R: UniversalRead + Clone,
+    R: UniversalRead + 'static,
     R::Fs: Clone + Send + Sync,
     <R::Fs as UniversalReadFs>::OpenExtra: Clone + Send + Sync,
-    R::OwnedReadPipeline<()>: Send,
+    R::ReadPipeline<'static, ()>: Send,
+    R::ReadPipeline<'static, Range<u32>>: Send,
 {
 }
 
@@ -40,6 +43,13 @@ where
 /// filesystem block sizes (usually 4 KiB).
 const BLOCK_SIZE: usize = 16 * 1024; // 16kB
 
+const REMOTE_OPEN_OPTIONS: OpenOptions = OpenOptions {
+    writeable: false,
+    populate: Populate::No,
+    need_sequential: false,
+    advice: AdviceSetting::Global,
+};
+
 fn to_block_range(byte_range: Range<u64>) -> Range<u32> {
     let start = (byte_range.start / BLOCK_SIZE as u64) as u32;
     if byte_range.start >= byte_range.end {
@@ -48,4 +58,29 @@ fn to_block_range(byte_range: Range<u64>) -> Range<u32> {
     }
     let end = byte_range.end.div_ceil(BLOCK_SIZE as u64) as u32;
     start..end
+}
+
+/// Expand a requested `byte_range` to the block-aligned region that must be
+/// fetched from the remote to cover it, clamped to the file's `len` (EOF).
+///
+/// Returns the covering block range together with its EOF-clamped byte range,
+/// or `None` when `byte_range` is empty.
+fn block_aligned_fetch(byte_range: Range<u64>, file_len: u64) -> Option<(Range<u32>, Range<u64>)> {
+    let blocks_range = to_block_range(byte_range);
+    if blocks_range.is_empty() {
+        return None;
+    }
+
+    // BLOCK_SIZE aligned, clamped to EOF.
+    let byte_offset = u64::from(blocks_range.start) * BLOCK_SIZE as u64;
+    let fetch_length = blocks_range.len() as u64 * BLOCK_SIZE as u64;
+    let max_length = file_len.saturating_sub(byte_offset);
+    let blocks_byte_range = byte_offset..byte_offset + max_length.min(fetch_length);
+
+    // The first block already starts past EOF: nothing valid to fetch.
+    if blocks_byte_range.is_empty() {
+        return None;
+    }
+
+    Some((blocks_range, blocks_byte_range))
 }

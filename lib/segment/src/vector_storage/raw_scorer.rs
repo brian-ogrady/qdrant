@@ -1,6 +1,7 @@
 use std::sync::atomic::AtomicBool;
 
 use common::bitvec::{BitSlice, BitSliceExt as _};
+use common::condition_checker::{CheckItem, ConditionChecker, Rest, Select, default_check_batched};
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::{PointOffsetType, ScoreType};
 use sparse::common::sparse_vector::SparseVector;
@@ -12,7 +13,9 @@ use super::query_scorer::custom_query_scorer::CustomQueryScorer;
 use super::query_scorer::multi_custom_query_scorer::MultiCustomQueryScorer;
 use super::query_scorer::sparse_custom_query_scorer::SparseCustomQueryScorer;
 use super::query_scorer::{QueryScorerBytes, QueryScorerBytesImpl};
-use super::{DenseVectorStorage, MultiVectorStorage, SparseVectorStorage, VectorStorageEnum};
+use super::{
+    DenseVectorStorageRead, MultiVectorStorageRead, SparseVectorStorageRead, VectorStorageEnum,
+};
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{
@@ -26,7 +29,12 @@ use crate::vector_storage::query_scorer::QueryScorer;
 use crate::vector_storage::query_scorer::metric_query_scorer::MetricQueryScorer;
 use crate::vector_storage::query_scorer::multi_metric_query_scorer::MultiMetricQueryScorer;
 use crate::vector_storage::query_scorer::sparse_metric_query_scorer::SparseMetricQueryScorer;
+use crate::vector_storage::query_scorer::turbo_custom_query_scorer::TurboCustomQueryScorer;
+use crate::vector_storage::query_scorer::turbo_multi_custom_query_scorer::TurboMultiCustomQueryScorer;
+use crate::vector_storage::query_scorer::turbo_multi_query_scorer::TurboMultiQueryScorer;
+use crate::vector_storage::query_scorer::turbo_query_scorer::TurboQueryScorer;
 use crate::vector_storage::sparse::volatile_sparse_vector_storage::VolatileSparseVectorStorage;
+use crate::vector_storage::{TurboMultiScoring, TurboScoring};
 
 pub trait RawScorer {
     fn score_points(&self, points: &[PointOffsetType], scores: &mut [ScoreType]);
@@ -75,6 +83,12 @@ pub fn new_raw_scorer<'a>(
         VectorStorageEnum::DenseAppendableMemmap(vs) => raw_scorer_impl(query, vs.as_ref(), hc),
         VectorStorageEnum::DenseAppendableMemmapByte(vs) => raw_scorer_impl(query, vs.as_ref(), hc),
         VectorStorageEnum::DenseAppendableMemmapHalf(vs) => raw_scorer_impl(query, vs.as_ref(), hc),
+        VectorStorageEnum::DenseTurboMemmap(vs) => raw_turbo_scorer_impl(query, vs.as_ref(), hc),
+        #[cfg(target_os = "linux")]
+        VectorStorageEnum::DenseTurboUring(vs) => raw_turbo_scorer_impl(query, vs.as_ref(), hc),
+        VectorStorageEnum::DenseTurboAppendableMemmap(vs) => {
+            raw_turbo_scorer_impl(query, vs.as_ref(), hc)
+        }
         VectorStorageEnum::SparseVolatile(vs) => raw_sparse_scorer_volatile(query, vs, hc),
         VectorStorageEnum::SparseMmap(vs) => raw_sparse_scorer_impl(query, vs, hc),
         VectorStorageEnum::MultiDenseVolatile(vs) => raw_multi_scorer_impl(query, vs, hc),
@@ -91,8 +105,35 @@ pub fn new_raw_scorer<'a>(
         VectorStorageEnum::MultiDenseAppendableMemmapHalf(vs) => {
             raw_multi_scorer_impl(query, vs.as_ref(), hc)
         }
+        VectorStorageEnum::MultiDenseTurbo(vs) => {
+            raw_turbo_multi_scorer_impl(query, vs.as_ref(), hc)
+        }
         VectorStorageEnum::EmptyDense(vs) => raw_scorer_impl(query, vs, hc),
         VectorStorageEnum::EmptySparse(vs) => raw_sparse_scorer_impl(query, vs, hc),
+    }
+}
+
+/// Build a [`RawScorer`] for a query against this vector storage.
+///
+/// Implemented for the storage enums so scoring code can be generic over
+/// read-write ([`VectorStorageEnum`]) and read-only
+/// ([`VectorStorageReadEnum`](crate::vector_storage::read_only::VectorStorageReadEnum))
+/// backends.
+pub trait RawScorerBuilder {
+    fn build_raw_scorer<'a>(
+        &'a self,
+        query: QueryVector,
+        hardware_counter: HardwareCounterCell,
+    ) -> OperationResult<Box<dyn RawScorer + 'a>>;
+}
+
+impl RawScorerBuilder for VectorStorageEnum {
+    fn build_raw_scorer<'a>(
+        &'a self,
+        query: QueryVector,
+        hardware_counter: HardwareCounterCell,
+    ) -> OperationResult<Box<dyn RawScorer + 'a>> {
+        new_raw_scorer(query, self, hardware_counter)
     }
 }
 
@@ -118,7 +159,7 @@ pub fn raw_sparse_scorer_volatile<'a>(
     raw_scorer_from_query_scorer(query_scorer)
 }
 
-pub fn raw_sparse_scorer_impl<'a, TVectorStorage: SparseVectorStorage>(
+pub fn raw_sparse_scorer_impl<'a, TVectorStorage: SparseVectorStorageRead>(
     query: QueryVector,
     vector_storage: &'a TVectorStorage,
     hardware_counter: HardwareCounterCell,
@@ -187,7 +228,7 @@ pub fn new_raw_scorer_for_test<'a>(
 pub fn raw_scorer_impl<
     'a,
     TElement: PrimitiveVectorElement,
-    TVectorStorage: DenseVectorStorage<TElement>,
+    TVectorStorage: DenseVectorStorageRead<TElement>,
 >(
     query: QueryVector,
     vector_storage: &'a TVectorStorage,
@@ -227,7 +268,7 @@ fn new_scorer_with_metric<
     'a,
     TElement: PrimitiveVectorElement,
     TMetric: Metric<TElement> + 'a,
-    TVectorStorage: DenseVectorStorage<TElement>,
+    TVectorStorage: DenseVectorStorageRead<TElement>,
 >(
     query: QueryVector,
     vector_storage: &'a TVectorStorage,
@@ -291,6 +332,116 @@ fn new_scorer_with_metric<
     }
 }
 
+pub fn raw_turbo_scorer_impl<'a, TStorage: TurboScoring>(
+    query: QueryVector,
+    vector_storage: &'a TStorage,
+    hardware_counter: HardwareCounterCell,
+) -> OperationResult<Box<dyn RawScorer + 'a>> {
+    match query {
+        QueryVector::Nearest(vector) => raw_scorer_from_query_scorer(TurboQueryScorer::new(
+            vector.try_into()?,
+            vector_storage,
+            hardware_counter,
+        )),
+        QueryVector::RecommendBestScore(reco_query) => {
+            let reco_query: RecoQuery<DenseVector> = reco_query.transform_into()?;
+            let query_scorer = TurboCustomQueryScorer::new(
+                RecoBestScoreQuery::from(reco_query),
+                vector_storage,
+                hardware_counter,
+            );
+            raw_scorer_from_query_scorer(query_scorer)
+        }
+        QueryVector::RecommendSumScores(reco_query) => {
+            let reco_query: RecoQuery<DenseVector> = reco_query.transform_into()?;
+            let query_scorer = TurboCustomQueryScorer::new(
+                RecoSumScoresQuery::from(reco_query),
+                vector_storage,
+                hardware_counter,
+            );
+            raw_scorer_from_query_scorer(query_scorer)
+        }
+        QueryVector::Discover(discover_query) => {
+            let discover_query: DiscoverQuery<DenseVector> = discover_query.transform_into()?;
+            let query_scorer =
+                TurboCustomQueryScorer::new(discover_query, vector_storage, hardware_counter);
+            raw_scorer_from_query_scorer(query_scorer)
+        }
+        QueryVector::Context(context_query) => {
+            let context_query: ContextQuery<DenseVector> = context_query.transform_into()?;
+            let query_scorer =
+                TurboCustomQueryScorer::new(context_query, vector_storage, hardware_counter);
+            raw_scorer_from_query_scorer(query_scorer)
+        }
+        QueryVector::FeedbackNaive(feedback_query) => {
+            let feedback_query: NaiveFeedbackQuery<DenseVector> =
+                feedback_query.transform_into()?;
+            let query_scorer = TurboCustomQueryScorer::new(
+                feedback_query.into_query(),
+                vector_storage,
+                hardware_counter,
+            );
+            raw_scorer_from_query_scorer(query_scorer)
+        }
+    }
+}
+
+pub fn raw_turbo_multi_scorer_impl<'a, TStorage: TurboMultiScoring>(
+    query: QueryVector,
+    vector_storage: &'a TStorage,
+    hardware_counter: HardwareCounterCell,
+) -> OperationResult<Box<dyn RawScorer + 'a>> {
+    match query {
+        QueryVector::Nearest(vector) => {
+            let query_scorer =
+                TurboMultiQueryScorer::new(&vector.try_into()?, vector_storage, hardware_counter);
+            raw_scorer_from_query_scorer(query_scorer)
+        }
+        QueryVector::RecommendBestScore(reco_query) => {
+            let reco_query: RecoQuery<MultiDenseVectorInternal> = reco_query.transform_into()?;
+            let query_scorer = TurboMultiCustomQueryScorer::new(
+                RecoBestScoreQuery::from(reco_query),
+                vector_storage,
+                hardware_counter,
+            );
+            raw_scorer_from_query_scorer(query_scorer)
+        }
+        QueryVector::RecommendSumScores(reco_query) => {
+            let reco_query: RecoQuery<MultiDenseVectorInternal> = reco_query.transform_into()?;
+            let query_scorer = TurboMultiCustomQueryScorer::new(
+                RecoSumScoresQuery::from(reco_query),
+                vector_storage,
+                hardware_counter,
+            );
+            raw_scorer_from_query_scorer(query_scorer)
+        }
+        QueryVector::Discover(discover_query) => {
+            let discover_query: DiscoverQuery<MultiDenseVectorInternal> =
+                discover_query.transform_into()?;
+            let query_scorer =
+                TurboMultiCustomQueryScorer::new(discover_query, vector_storage, hardware_counter);
+            raw_scorer_from_query_scorer(query_scorer)
+        }
+        QueryVector::Context(context_query) => {
+            let context_query: ContextQuery<MultiDenseVectorInternal> =
+                context_query.transform_into()?;
+            let query_scorer =
+                TurboMultiCustomQueryScorer::new(context_query, vector_storage, hardware_counter);
+            raw_scorer_from_query_scorer(query_scorer)
+        }
+        QueryVector::FeedbackNaive(feedback_query) => {
+            let feedback_query: NaiveFeedbackQuery<MultiDenseVectorInternal> =
+                feedback_query.transform_into()?;
+            let query_scorer = TurboMultiCustomQueryScorer::new(
+                feedback_query.into_query(),
+                vector_storage,
+                hardware_counter,
+            );
+            raw_scorer_from_query_scorer(query_scorer)
+        }
+    }
+}
+
 pub fn raw_scorer_from_query_scorer<'a>(
     query_scorer: impl QueryScorer + 'a,
 ) -> OperationResult<Box<dyn RawScorer + 'a>> {
@@ -300,7 +451,7 @@ pub fn raw_scorer_from_query_scorer<'a>(
 pub fn raw_multi_scorer_impl<
     'a,
     TElement: PrimitiveVectorElement,
-    TVectorStorage: MultiVectorStorage<TElement>,
+    TVectorStorage: MultiVectorStorageRead<TElement>,
 >(
     query: QueryVector,
     vector_storage: &'a TVectorStorage,
@@ -340,7 +491,7 @@ fn new_multi_scorer_with_metric<
     'a,
     TElement: PrimitiveVectorElement,
     TMetric: Metric<TElement> + 'a,
-    TVectorStorage: MultiVectorStorage<TElement>,
+    TVectorStorage: MultiVectorStorageRead<TElement>,
 >(
     query: QueryVector,
     vector_storage: &'a TVectorStorage,
@@ -425,16 +576,36 @@ impl<TQueryScorer: QueryScorer> RawScorer for RawScorerImpl<TQueryScorer> {
     }
 }
 
-#[inline]
-pub fn check_deleted_condition(
-    point: PointOffsetType,
-    vec_deleted: &BitSlice,
-    point_deleted: &BitSlice,
-) -> bool {
-    // Deleted points propagate to vectors; check vector deletion for possible early return
-    // Default to not deleted if our deleted flags failed grow
-    !vec_deleted.get_bit(point as usize).unwrap_or(false)
-        // Additionally check point deletion for integrity if delete propagation to vector failed
-        // Default to deleted if the point mapping was removed from the ID tracker
-        && !point_deleted.get_bit(point as usize).unwrap_or(true)
+/// A [`ConditionChecker`] matching points that not deleted.
+pub struct NotDeletedChecker<'a> {
+    /// [`BitSlice`] defining flags for deleted points (and thus their vectors).
+    ///
+    /// Point deleted flags should be explicitly present as `false`
+    /// for each existing point in the segment.
+    /// If there are no flags for some points, they are considered deleted.
+    pub point_deleted: &'a BitSlice,
+
+    /// [`BitSlice`] defining flags for deleted vectors in this segment.
+    pub vec_deleted: &'a BitSlice,
+}
+
+impl ConditionChecker for NotDeletedChecker<'_> {
+    type Error = OperationError;
+
+    #[inline]
+    fn check(&self, point: PointOffsetType) -> OperationResult<bool> {
+        // Deleted points propagate to vectors; check vector deletion for possible early return
+        // Default to not deleted if our deleted flags failed grow
+        Ok(!self.vec_deleted.get_bit(point as usize).unwrap_or(false)
+            // Additionally check point deletion for integrity if delete propagation to vector failed
+            // Default to deleted if the point mapping was removed from the ID tracker
+            && !self.point_deleted.get_bit(point as usize).unwrap_or(true))
+    }
+
+    fn check_batched<K>(&self, ids: &mut [K], select: Select, rest: Rest) -> OperationResult<usize>
+    where
+        K: CheckItem,
+    {
+        default_check_batched(ids, select, rest, |id| self.check(id))
+    }
 }

@@ -29,7 +29,13 @@ ConditionType = Union[
     "Filter",
 ]
 MatchType = Union[
-    "MatchValue", "MatchText", "MatchTextAny", "MatchPhrase", "MatchAny", "MatchExcept"
+    "MatchValue",
+    "MatchText",
+    "MatchTextAny",
+    "MatchPhrase",
+    "MatchPrefix",
+    "MatchAny",
+    "MatchExcept",
 ]
 RangeType = Union["RangeFloat", "RangeDateTime"]
 QuantizationConfigType = Union[
@@ -248,13 +254,21 @@ class EdgeConfig:
             Union["EdgeVectorParams", Dict[str, "EdgeVectorParams"]]
         ] = None,
         sparse_vectors: Optional[Dict[str, "EdgeSparseVectorParams"]] = None,
-        on_disk_payload: bool = True,
+        on_disk_payload: Optional[bool] = None,
         hnsw_config: Optional["HnswIndexConfig"] = None,
         quantization_config: Optional[QuantizationConfigType] = None,
         optimizers: Optional["EdgeOptimizersConfig"] = None,
+        max_search_threads: Optional[int] = None,
+        search_pool_core: Optional[int] = None,
     ) -> None:
         """
         Create an EdgeConfig.
+
+        Parameters left as None are "not specified": when loading an existing shard each
+        one resolves through provided -> persisted -> derived from segments -> default,
+        so an unspecified parameter keeps the shard as it is. vectors and sparse_vectors
+        define the stored data: if provided they are validated for compatibility against
+        the existing segments, if omitted they are inherited from the shard.
 
         Args:
             vectors: Dense vector configuration. Can be a single EdgeVectorParams for
@@ -262,9 +276,16 @@ class EdgeConfig:
                      Optional if sparse_vectors is provided (sparse-only config).
             sparse_vectors: Optional sparse vector configurations.
             on_disk_payload: If True, store payload on disk (mmap); otherwise in RAM.
+                             None keeps the shard's current value (defaults to on-disk).
             hnsw_config: Optional global HNSW config (used when building HNSW index).
             quantization_config: Optional global quantization config.
             optimizers: Optional optimizer settings.
+            max_search_threads: Number of threads in the shard's search thread pool, which
+                                runs per-segment reads in parallel and loads segments in
+                                parallel. None (the default) derives the count from the number
+                                of CPUs, matching the core search runtime.
+            search_pool_core: Pin every search pool thread to this CPU core (best-effort),
+                              bounding search compute to one core. None = OS scheduling.
         """
         ...
 
@@ -279,13 +300,13 @@ class EdgeConfig:
         ...
 
     @property
-    def on_disk_payload(self) -> bool:
-        """Whether payload is stored on disk."""
+    def on_disk_payload(self) -> Optional[bool]:
+        """Whether payload is stored on disk, or None if not specified."""
         ...
 
     @property
-    def hnsw_config(self) -> "HnswIndexConfig":
-        """Global HNSW config."""
+    def hnsw_config(self) -> Optional["HnswIndexConfig"]:
+        """Global HNSW config, or None if not specified."""
         ...
 
     @property
@@ -294,8 +315,18 @@ class EdgeConfig:
         ...
 
     @property
-    def optimizers(self) -> "EdgeOptimizersConfig":
-        """Optimizer settings."""
+    def optimizers(self) -> Optional["EdgeOptimizersConfig"]:
+        """Optimizer settings, or None if not specified."""
+        ...
+
+    @property
+    def max_search_threads(self) -> Optional[int]:
+        """Number of threads in the search thread pool, or None for the CPU-derived default."""
+        ...
+
+    @property
+    def search_pool_core(self) -> Optional[int]:
+        """CPU core the search pool is pinned to, or None for OS scheduling."""
         ...
 
 class EdgeVectorParams:
@@ -1090,6 +1121,7 @@ class KeywordIndexParams:
         is_tenant: Optional[bool] = None,
         on_disk: Optional[bool] = None,
         enable_hnsw: Optional[bool] = None,
+        prefix: Optional[bool] = None,
     ) -> None:
         """
         Create KeywordIndexParams.
@@ -1098,6 +1130,7 @@ class KeywordIndexParams:
             is_tenant: Whether this field is used for tenant separation.
             on_disk: Whether to store index on disk.
             enable_hnsw: Whether to enable HNSW index for this field.
+            prefix: Whether to enable prefix matching for this field.
         """
         ...
 
@@ -1114,6 +1147,11 @@ class KeywordIndexParams:
     @property
     def enable_hnsw(self) -> Optional[bool]:
         """Whether to enable HNSW index."""
+        ...
+
+    @property
+    def prefix(self) -> Optional[bool]:
+        """Whether prefix matching is enabled."""
         ...
 
 class IntegerIndexParams:
@@ -1475,7 +1513,7 @@ class StopwordsSet:
         """Custom stopwords."""
         ...
 
-StemmingAlgorithm = Union["SnowballParams"]
+StemmingAlgorithm = Union["SnowballParams", "DisabledStemmer"]
 
 class SnowballParams:
     """Snowball stemming algorithm parameters."""
@@ -1492,6 +1530,18 @@ class SnowballParams:
     @property
     def language(self) -> "SnowballLanguage":
         """Snowball language."""
+        ...
+
+class DisabledStemmer:
+    """
+    Explicitly disable stemming, overriding the language default.
+
+    Use together with an empty stopword set for language-neutral text
+    processing, instead of the deprecated ``language="none"`` hack.
+    """
+
+    def __init__(self) -> None:
+        """Create a DisabledStemmer."""
         ...
 
 class SnowballLanguage(Enum):
@@ -1883,6 +1933,7 @@ class SearchParams:
         quantization: Optional["QuantizationSearchParams"] = None,
         indexed_only: bool = False,
         acorn: Optional["AcornSearchParams"] = None,
+        idf: Optional["IdfParams"] = None,
     ) -> None:
         """
         Create SearchParams.
@@ -1893,6 +1944,7 @@ class SearchParams:
             quantization: Quantization search parameters.
             indexed_only: Whether to search only indexed vectors.
             acorn: Acorn search parameters.
+            idf: Population sparse IDF statistics are computed over.
         """
         ...
 
@@ -1919,6 +1971,36 @@ class SearchParams:
     @property
     def acorn(self) -> Optional["AcornSearchParams"]:
         """Acorn parameters."""
+        ...
+
+    @property
+    def idf(self) -> Optional["IdfParams"]:
+        """IDF scope parameters."""
+        ...
+
+class IdfParams:
+    """Population over which sparse vector IDF statistics are computed - the IDF corpus.
+
+    Only applicable to sparse vectors with the IDF modifier enabled.
+    """
+
+    def __init__(
+        self,
+        corpus: Optional["Filter"] = None,
+    ) -> None:
+        """
+        Create IdfParams.
+
+        Args:
+            corpus: Filter defining the corpus: IDF statistics are computed over
+                the points matching this filter. If None, statistics are
+                collection-wide (global).
+        """
+        ...
+
+    @property
+    def corpus(self) -> Optional["Filter"]:
+        """Corpus filter, None for global statistics."""
         ...
 
 class QuantizationSearchParams:
@@ -2744,6 +2826,23 @@ class MatchPhrase:
     @property
     def phrase(self) -> str:
         """Phrase."""
+        ...
+
+class MatchPrefix:
+    """Match keyword values starting with the given prefix."""
+
+    def __init__(self, prefix: str) -> None:
+        """
+        Create a MatchPrefix.
+
+        Args:
+            prefix: Prefix to match.
+        """
+        ...
+
+    @property
+    def prefix(self) -> str:
+        """Prefix."""
         ...
 
 class MatchAny:

@@ -151,13 +151,14 @@ pub struct MinShould {
     #[validate(nested)]
     pub conditions: ::prost::alloc::vec::Vec<Condition>,
     #[prost(uint64, tag = "2")]
+    #[validate(range(min = 1, message = "min_count must be greater than 0"))]
     pub min_count: u64,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Condition {
-    #[prost(oneof = "condition::ConditionOneOf", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "condition::ConditionOneOf", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
     #[validate(nested)]
     pub condition_one_of: ::core::option::Option<condition::ConditionOneOf>,
 }
@@ -180,6 +181,8 @@ pub mod condition {
         Nested(super::NestedCondition),
         #[prost(message, tag = "7")]
         HasVector(super::HasVectorCondition),
+        #[prost(message, tag = "8")]
+        Slice(super::SliceCondition),
     }
 }
 #[derive(serde::Serialize)]
@@ -205,6 +208,16 @@ pub struct HasIdCondition {
 pub struct HasVectorCondition {
     #[prost(string, tag = "1")]
     pub has_vector: ::prost::alloc::string::String,
+}
+#[derive(serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SliceCondition {
+    /// Total number of disjoint deterministic slices the id space is split into, must be >= 1
+    #[prost(uint32, tag = "1")]
+    pub total: u32,
+    /// Which slice to select, must be less than `total`
+    #[prost(uint32, tag = "2")]
+    pub index: u32,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -254,7 +267,7 @@ pub struct FieldCondition {
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Match {
-    #[prost(oneof = "r#match::MatchValue", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
+    #[prost(oneof = "r#match::MatchValue", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
     pub match_value: ::core::option::Option<r#match::MatchValue>,
 }
 /// Nested message and enum types in `Match`.
@@ -292,6 +305,9 @@ pub mod r#match {
         /// Match any word in the text
         #[prost(string, tag = "10")]
         TextAny(::prost::alloc::string::String),
+        /// Match keywords starting with the given prefix
+        #[prost(string, tag = "11")]
+        Prefix(::prost::alloc::string::String),
     }
 }
 #[derive(serde::Serialize)]
@@ -335,31 +351,38 @@ pub struct DatetimeRange {
     #[validate(custom(function = "crate::grpc::validate::validate_timestamp"))]
     pub lte: ::core::option::Option<::prost_wkt_types::Timestamp>,
 }
+#[derive(validator::Validate)]
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct GeoBoundingBox {
     /// north-west corner
     #[prost(message, optional, tag = "1")]
+    #[validate(nested)]
     pub top_left: ::core::option::Option<GeoPoint>,
     /// south-east corner
     #[prost(message, optional, tag = "2")]
+    #[validate(nested)]
     pub bottom_right: ::core::option::Option<GeoPoint>,
 }
+#[derive(validator::Validate)]
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct GeoRadius {
     /// Center of the circle
     #[prost(message, optional, tag = "1")]
+    #[validate(nested)]
     pub center: ::core::option::Option<GeoPoint>,
     /// In meters
     #[prost(float, tag = "2")]
     pub radius: f32,
 }
+#[derive(validator::Validate)]
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GeoLineString {
     /// Ordered sequence of GeoPoints representing the line
     #[prost(message, repeated, tag = "1")]
+    #[validate(nested)]
     pub points: ::prost::alloc::vec::Vec<GeoPoint>,
 }
 /// For a valid GeoPolygon, both the exterior and interior GeoLineStrings must
@@ -372,13 +395,15 @@ pub struct GeoPolygon {
     /// The exterior line bounds the surface
     #[prost(message, optional, tag = "1")]
     #[validate(
-        custom(function = "crate::grpc::validate::validate_geo_polygon_exterior")
+        custom(function = "crate::grpc::validate::validate_geo_polygon_exterior"),
+        nested
     )]
     pub exterior: ::core::option::Option<GeoLineString>,
     /// Interior lines (if present) bound holes within the surface
     #[prost(message, repeated, tag = "2")]
     #[validate(
-        custom(function = "crate::grpc::validate::validate_geo_polygon_interiors")
+        custom(function = "crate::grpc::validate::validate_geo_polygon_interiors"),
+        nested
     )]
     pub interiors: ::prost::alloc::vec::Vec<GeoLineString>,
 }
@@ -415,8 +440,10 @@ pub struct VectorParams {
     #[prost(message, optional, tag = "4")]
     #[validate(nested)]
     pub quantization_config: ::core::option::Option<QuantizationConfig>,
+    /// Deprecated: use `memory` instead.
     /// If true - serve vectors from disk.
     /// If set to false, the vectors will be loaded in RAM.
+    #[deprecated]
     #[prost(bool, optional, tag = "5")]
     pub on_disk: ::core::option::Option<bool>,
     /// Data type of the vectors
@@ -425,6 +452,11 @@ pub struct VectorParams {
     /// Configuration for multi-vector search
     #[prost(message, optional, tag = "7")]
     pub multivector_config: ::core::option::Option<MultiVectorConfig>,
+    /// Memory placement of the original vector storage.
+    /// Overrides the deprecated `on_disk` flag if both are set.
+    /// `Pinned` is not supported for dense vector storage.
+    #[prost(enumeration = "Memory", optional, tag = "8")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -439,10 +471,17 @@ pub struct VectorParamsDiff {
     #[prost(message, optional, tag = "2")]
     #[validate(nested)]
     pub quantization_config: ::core::option::Option<QuantizationConfigDiff>,
+    /// Deprecated: use `memory` instead.
     /// If true - serve vectors from disk.
     /// If set to false, the vectors will be loaded in RAM.
+    #[deprecated]
     #[prost(bool, optional, tag = "3")]
     pub on_disk: ::core::option::Option<bool>,
+    /// Memory placement of the original vector storage.
+    /// Overrides the deprecated `on_disk` flag if both are set.
+    /// `Pinned` is not supported for dense vector storage.
+    #[prost(enumeration = "Memory", optional, tag = "4")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -686,7 +725,9 @@ pub struct HnswConfigDiff {
     /// On small CPUs, less threads are used.
     #[prost(uint64, optional, tag = "4")]
     pub max_indexing_threads: ::core::option::Option<u64>,
+    /// Deprecated: use `memory` instead.
     /// Store HNSW index on disk. If set to false, the index will be stored in RAM.
+    #[deprecated]
     #[prost(bool, optional, tag = "5")]
     pub on_disk: ::core::option::Option<bool>,
     /// Number of additional payload-aware links per node in the index graph.
@@ -699,6 +740,10 @@ pub struct HnswConfigDiff {
     /// Requires quantized vectors to be enabled. Multi-vectors are not supported.
     #[prost(bool, optional, tag = "7")]
     pub inline_storage: ::core::option::Option<bool>,
+    /// Memory placement of the HNSW graph.
+    /// Overrides the deprecated `on_disk` flag if both are set.
+    #[prost(enumeration = "Memory", optional, tag = "8")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -708,13 +753,19 @@ pub struct SparseIndexConfig {
     /// Note: this is number of vectors, not KiloBytes.
     #[prost(uint64, optional, tag = "1")]
     pub full_scan_threshold: ::core::option::Option<u64>,
+    /// Deprecated: use `memory` instead.
     /// Store inverted index on disk. If set to false, the index will be stored in RAM.
+    #[deprecated]
     #[prost(bool, optional, tag = "2")]
     pub on_disk: ::core::option::Option<bool>,
     /// Datatype used to store weights in the index.
     #[prost(enumeration = "Datatype", optional, tag = "3")]
     #[validate(custom(function = "crate::grpc::validate::validate_sparse_datatype"))]
     pub datatype: ::core::option::Option<i32>,
+    /// Memory placement of the index.
+    /// Overrides the deprecated `on_disk` flag if both are set.
+    #[prost(enumeration = "Memory", optional, tag = "4")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -825,9 +876,15 @@ pub struct ScalarQuantization {
     #[prost(float, optional, tag = "2")]
     #[validate(range(min = 0.5, max = 1.0))]
     pub quantile: ::core::option::Option<f32>,
+    /// Deprecated: use `memory` instead.
     /// If true - quantized vectors always will be stored in RAM, ignoring the config of main storage
+    #[deprecated]
     #[prost(bool, optional, tag = "3")]
     pub always_ram: ::core::option::Option<bool>,
+    /// Memory placement of quantized vectors.
+    /// Overrides the deprecated `always_ram` flag if both are set.
+    #[prost(enumeration = "Memory", optional, tag = "4")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -836,9 +893,15 @@ pub struct ProductQuantization {
     /// Compression ratio
     #[prost(enumeration = "CompressionRatio", tag = "1")]
     pub compression: i32,
+    /// Deprecated: use `memory` instead.
     /// If true - quantized vectors always will be stored in RAM, ignoring the config of main storage
+    #[deprecated]
     #[prost(bool, optional, tag = "2")]
     pub always_ram: ::core::option::Option<bool>,
+    /// Memory placement of quantized vectors.
+    /// Overrides the deprecated `always_ram` flag if both are set.
+    #[prost(enumeration = "Memory", optional, tag = "3")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -902,7 +965,9 @@ pub mod binary_quantization_query_encoding {
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BinaryQuantization {
+    /// Deprecated: use `memory` instead.
     /// If true - quantized vectors always will be stored in RAM, ignoring the config of main storage
+    #[deprecated]
     #[prost(bool, optional, tag = "1")]
     pub always_ram: ::core::option::Option<bool>,
     /// Binary quantization encoding method
@@ -913,15 +978,25 @@ pub struct BinaryQuantization {
     /// It can increase the accuracy of search at the cost of performance.
     #[prost(message, optional, tag = "3")]
     pub query_encoding: ::core::option::Option<BinaryQuantizationQueryEncoding>,
+    /// Memory placement of quantized vectors.
+    /// Overrides the deprecated `always_ram` flag if both are set.
+    #[prost(enumeration = "Memory", optional, tag = "4")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TurboQuantization {
+    /// Deprecated: use `memory` instead.
+    #[deprecated]
     #[prost(bool, optional, tag = "1")]
     pub always_ram: ::core::option::Option<bool>,
     #[prost(enumeration = "TurboQuantBitSize", optional, tag = "2")]
     pub bits: ::core::option::Option<i32>,
+    /// Memory placement of quantized vectors.
+    /// Overrides the deprecated `always_ram` flag if both are set.
+    #[prost(enumeration = "Memory", optional, tag = "3")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -1046,16 +1121,13 @@ pub struct StrictModeConfig {
     /// Max number of payload indexes in a collection
     #[prost(uint64, optional, tag = "19")]
     pub max_payload_index_count: ::core::option::Option<u64>,
+    /// Deprecated: memory is node-wide, use the global quota config instead. Removal planned for 1.21.
     /// Reject memory-consuming update operations when process resident memory exceeds this percentage of total RAM (cgroup-aware, 1-100).
     /// Delete-style operations are still allowed so memory can be freed.
+    #[deprecated]
     #[prost(uint32, optional, tag = "21")]
     #[validate(range(min = 1, max = 100))]
     pub max_resident_memory_percent: ::core::option::Option<u32>,
-    /// Reject disk-consuming update operations when the filesystem hosting Qdrant storage exceeds this percentage of total capacity (1-100).
-    /// Free space is sampled with a small TTL cache so the gate may take a few seconds to react. Delete-style operations are still allowed so disk can be freed.
-    #[prost(uint32, optional, tag = "22")]
-    #[validate(range(min = 1, max = 100))]
-    pub max_disk_usage_percent: ::core::option::Option<u32>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -1097,6 +1169,16 @@ pub struct StrictModeMultivector {
     #[validate(range(min = 1))]
     pub max_vectors: ::core::option::Option<u64>,
 }
+/// Params of the payload storage
+#[derive(serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PayloadStorageParams {
+    /// Memory placement of the payload storage.
+    /// Overrides the deprecated `on_disk_payload` flag if both are set.
+    /// `Pinned` is not supported for payload storage.
+    #[prost(enumeration = "Memory", optional, tag = "1")]
+    pub memory: ::core::option::Option<i32>,
+}
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1125,7 +1207,9 @@ pub struct CreateCollection {
     #[prost(uint32, optional, tag = "7")]
     #[validate(range(min = 1))]
     pub shard_number: ::core::option::Option<u32>,
+    /// Deprecated: use `payload.memory` instead.
     /// If true - point's payload will not be stored in memory
+    #[deprecated]
     #[prost(bool, optional, tag = "8")]
     pub on_disk_payload: ::core::option::Option<bool>,
     /// Wait timeout for operation commit in seconds, if not specified - default
@@ -1161,6 +1245,9 @@ pub struct CreateCollection {
     /// Arbitrary JSON metadata for the collection
     #[prost(map = "string, message", tag = "18")]
     pub metadata: ::std::collections::HashMap<::prost::alloc::string::String, Value>,
+    /// Configuration of the payload storage
+    #[prost(message, optional, tag = "19")]
+    pub payload: ::core::option::Option<PayloadStorageParams>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -1246,7 +1333,9 @@ pub struct CollectionParams {
     /// Number of shards in collection
     #[prost(uint32, tag = "3")]
     pub shard_number: u32,
+    /// Deprecated: use `payload.memory` instead.
     /// If true - point's payload will not be stored in memory
+    #[deprecated]
     #[prost(bool, tag = "4")]
     pub on_disk_payload: bool,
     /// Configuration for vectors
@@ -1271,6 +1360,9 @@ pub struct CollectionParams {
     /// Define number of milliseconds to wait before attempting to read from another replica.
     #[prost(uint64, optional, tag = "11")]
     pub read_fan_out_delay_ms: ::core::option::Option<u64>,
+    /// Configuration of the payload storage
+    #[prost(message, optional, tag = "12")]
+    pub payload: ::core::option::Option<PayloadStorageParams>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -1284,7 +1376,9 @@ pub struct CollectionParamsDiff {
     #[prost(uint32, optional, tag = "2")]
     #[validate(range(min = 1))]
     pub write_consistency_factor: ::core::option::Option<u32>,
+    /// Deprecated: use `payload.memory` instead.
     /// If true - point's payload will not be stored in memory
+    #[deprecated]
     #[prost(bool, optional, tag = "3")]
     pub on_disk_payload: ::core::option::Option<bool>,
     /// Fan-out every read request to these many additional remote nodes (and return first available response)
@@ -1293,6 +1387,9 @@ pub struct CollectionParamsDiff {
     /// Define number of milliseconds to wait before attempting to read from another replica.
     #[prost(uint64, optional, tag = "5")]
     pub read_fan_out_delay_ms: ::core::option::Option<u64>,
+    /// Update params of the payload storage
+    #[prost(message, optional, tag = "6")]
+    pub payload: ::core::option::Option<PayloadStorageParams>,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1325,7 +1422,9 @@ pub struct KeywordIndexParams {
     /// If true - used for tenant optimization.
     #[prost(bool, optional, tag = "1")]
     pub is_tenant: ::core::option::Option<bool>,
+    /// Deprecated: use `memory` instead.
     /// If true - store index on disk.
+    #[deprecated]
     #[prost(bool, optional, tag = "2")]
     pub on_disk: ::core::option::Option<bool>,
     /// Enable HNSW graph building for this payload field.
@@ -1333,7 +1432,19 @@ pub struct KeywordIndexParams {
     /// Default: true.
     #[prost(bool, optional, tag = "3")]
     pub enable_hnsw: ::core::option::Option<bool>,
+    /// If set, enable prefix matching (`match: { "prefix": ... }`) on this field.
+    #[prost(message, optional, tag = "4")]
+    pub prefix: ::core::option::Option<KeywordPrefixParams>,
+    /// Memory placement of the index.
+    /// Overrides the deprecated `on_disk` flag if both are set.
+    #[prost(enumeration = "Memory", optional, tag = "5")]
+    pub memory: ::core::option::Option<i32>,
 }
+/// Prefix matching options for the keyword index. Has no options yet:
+/// presence of this message enables prefix matching.
+#[derive(serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct KeywordPrefixParams {}
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct IntegerIndexParams {
@@ -1348,7 +1459,9 @@ pub struct IntegerIndexParams {
     /// Default is false.
     #[prost(bool, optional, tag = "3")]
     pub is_principal: ::core::option::Option<bool>,
+    /// Deprecated: use `memory` instead.
     /// If true - store index on disk. Default is false.
+    #[deprecated]
     #[prost(bool, optional, tag = "4")]
     pub on_disk: ::core::option::Option<bool>,
     /// Enable HNSW graph building for this payload field.
@@ -1356,11 +1469,17 @@ pub struct IntegerIndexParams {
     /// Default: true.
     #[prost(bool, optional, tag = "5")]
     pub enable_hnsw: ::core::option::Option<bool>,
+    /// Memory placement of the index.
+    /// Overrides the deprecated `on_disk` flag if both are set.
+    #[prost(enumeration = "Memory", optional, tag = "6")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FloatIndexParams {
+    /// Deprecated: use `memory` instead.
     /// If true - store index on disk.
+    #[deprecated]
     #[prost(bool, optional, tag = "1")]
     pub on_disk: ::core::option::Option<bool>,
     /// If true - use this key to organize storage of the collection data.
@@ -1372,11 +1491,17 @@ pub struct FloatIndexParams {
     /// Default: true.
     #[prost(bool, optional, tag = "3")]
     pub enable_hnsw: ::core::option::Option<bool>,
+    /// Memory placement of the index.
+    /// Overrides the deprecated `on_disk` flag if both are set.
+    #[prost(enumeration = "Memory", optional, tag = "4")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GeoIndexParams {
+    /// Deprecated: use `memory` instead.
     /// If true - store index on disk.
+    #[deprecated]
     #[prost(bool, optional, tag = "1")]
     pub on_disk: ::core::option::Option<bool>,
     /// Enable HNSW graph building for this payload field.
@@ -1384,6 +1509,10 @@ pub struct GeoIndexParams {
     /// Default: true.
     #[prost(bool, optional, tag = "2")]
     pub enable_hnsw: ::core::option::Option<bool>,
+    /// Memory placement of the index.
+    /// Overrides the deprecated `on_disk` flag if both are set.
+    #[prost(enumeration = "Memory", optional, tag = "3")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1410,7 +1539,9 @@ pub struct TextIndexParams {
     /// Maximal token length
     #[prost(uint64, optional, tag = "4")]
     pub max_token_len: ::core::option::Option<u64>,
+    /// Deprecated: use `memory` instead.
     /// If true - store index on disk.
+    #[deprecated]
     #[prost(bool, optional, tag = "5")]
     pub on_disk: ::core::option::Option<bool>,
     /// Stopwords for the text index
@@ -1431,11 +1562,15 @@ pub struct TextIndexParams {
     /// Default: true.
     #[prost(bool, optional, tag = "10")]
     pub enable_hnsw: ::core::option::Option<bool>,
+    /// Memory placement of the index.
+    /// Overrides the deprecated `on_disk` flag if both are set.
+    #[prost(enumeration = "Memory", optional, tag = "11")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StemmingAlgorithm {
-    #[prost(oneof = "stemming_algorithm::StemmingParams", tags = "1")]
+    #[prost(oneof = "stemming_algorithm::StemmingParams", tags = "1, 2")]
     pub stemming_params: ::core::option::Option<stemming_algorithm::StemmingParams>,
 }
 /// Nested message and enum types in `StemmingAlgorithm`.
@@ -1446,6 +1581,9 @@ pub mod stemming_algorithm {
         /// Parameters for snowball stemming
         #[prost(message, tag = "1")]
         Snowball(super::SnowballParams),
+        /// Explicitly disable stemming (overrides the language default)
+        #[prost(message, tag = "2")]
+        Disabled(super::DisabledStemmer),
     }
 }
 #[derive(serde::Serialize)]
@@ -1455,10 +1593,16 @@ pub struct SnowballParams {
     #[prost(string, tag = "1")]
     pub language: ::prost::alloc::string::String,
 }
+/// Marker selecting the "no stemming" algorithm.
+#[derive(serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DisabledStemmer {}
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BoolIndexParams {
+    /// Deprecated: use `memory` instead.
     /// If true - store index on disk.
+    #[deprecated]
     #[prost(bool, optional, tag = "1")]
     pub on_disk: ::core::option::Option<bool>,
     /// Enable HNSW graph building for this payload field.
@@ -1466,11 +1610,17 @@ pub struct BoolIndexParams {
     /// Default: true.
     #[prost(bool, optional, tag = "2")]
     pub enable_hnsw: ::core::option::Option<bool>,
+    /// Memory placement of the index.
+    /// Overrides the deprecated `on_disk` flag if both are set.
+    #[prost(enumeration = "Memory", optional, tag = "3")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DatetimeIndexParams {
+    /// Deprecated: use `memory` instead.
     /// If true - store index on disk.
+    #[deprecated]
     #[prost(bool, optional, tag = "1")]
     pub on_disk: ::core::option::Option<bool>,
     /// If true - use this key to organize storage of the collection data.
@@ -1482,6 +1632,10 @@ pub struct DatetimeIndexParams {
     /// Default: true.
     #[prost(bool, optional, tag = "3")]
     pub enable_hnsw: ::core::option::Option<bool>,
+    /// Memory placement of the index.
+    /// Overrides the deprecated `on_disk` flag if both are set.
+    #[prost(enumeration = "Memory", optional, tag = "4")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1489,7 +1643,9 @@ pub struct UuidIndexParams {
     /// If true - used for tenant optimization.
     #[prost(bool, optional, tag = "1")]
     pub is_tenant: ::core::option::Option<bool>,
+    /// Deprecated: use `memory` instead.
     /// If true - store index on disk.
+    #[deprecated]
     #[prost(bool, optional, tag = "2")]
     pub on_disk: ::core::option::Option<bool>,
     /// Enable HNSW graph building for this payload field.
@@ -1497,6 +1653,10 @@ pub struct UuidIndexParams {
     /// Default: true.
     #[prost(bool, optional, tag = "3")]
     pub enable_hnsw: ::core::option::Option<bool>,
+    /// Memory placement of the index.
+    /// Overrides the deprecated `on_disk` flag if both are set.
+    #[prost(enumeration = "Memory", optional, tag = "4")]
+    pub memory: ::core::option::Option<i32>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -1800,6 +1960,9 @@ pub struct CollectionClusterInfoResponse {
     /// Resharding operations
     #[prost(message, repeated, tag = "6")]
     pub resharding_operations: ::prost::alloc::vec::Vec<ReshardingInfo>,
+    /// Time spent to process
+    #[prost(double, tag = "7")]
+    pub time: f64,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1952,10 +2115,13 @@ pub mod update_collection_cluster_setup_request {
     }
 }
 #[derive(serde::Serialize)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct UpdateCollectionClusterSetupResponse {
     #[prost(bool, tag = "1")]
     pub result: bool,
+    /// Time spent to process
+    #[prost(double, tag = "2")]
+    pub time: f64,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1994,16 +2160,22 @@ pub struct ListShardKeysRequest {
     pub collection_name: ::prost::alloc::string::String,
 }
 #[derive(serde::Serialize)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct CreateShardKeyResponse {
     #[prost(bool, tag = "1")]
     pub result: bool,
+    /// Time spent to process
+    #[prost(double, tag = "2")]
+    pub time: f64,
 }
 #[derive(serde::Serialize)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct DeleteShardKeyResponse {
     #[prost(bool, tag = "1")]
     pub result: bool,
+    /// Time spent to process
+    #[prost(double, tag = "2")]
+    pub time: f64,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2052,6 +2224,45 @@ impl Datatype {
             "Uint8" => Some(Self::Uint8),
             "Float16" => Some(Self::Float16),
             "Turbo4" => Some(Self::Turbo4),
+            _ => None,
+        }
+    }
+}
+/// Memory placement of a component's data.
+/// Data is always persisted on disk regardless of this setting;
+/// it only controls how the data is held in RAM.
+#[derive(serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Memory {
+    Unknown = 0,
+    /// Data is not pre-loaded from disk to RAM; cached with usage.
+    Cold = 1,
+    /// Data is pre-loaded into disk-cache RAM on start, but may be evicted under memory pressure.
+    Cached = 2,
+    /// Data is loaded in RAM and never evicted.
+    Pinned = 3,
+}
+impl Memory {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unknown => "MemoryUnknown",
+            Self::Cold => "Cold",
+            Self::Cached => "Cached",
+            Self::Pinned => "Pinned",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MemoryUnknown" => Some(Self::Unknown),
+            "Cold" => Some(Self::Cold),
+            "Cached" => Some(Self::Cached),
+            "Pinned" => Some(Self::Pinned),
             _ => None,
         }
     }
@@ -5639,13 +5850,26 @@ pub struct AcornSearchParams {
     #[validate(range(min = 0.0, max = 1.0))]
     pub max_selectivity: ::core::option::Option<f64>,
 }
+/// Population over which sparse vector IDF statistics are computed for scoring - the IDF corpus.
+/// Only applicable to sparse vectors with the IDF modifier enabled.
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IdfParams {
+    /// Filter defining the corpus: IDF statistics are computed over the points matching this filter.
+    /// If unset, statistics are collection-wide (global) - same as omitting `idf` entirely.
+    #[prost(message, optional, tag = "1")]
+    #[validate(nested)]
+    pub corpus: ::core::option::Option<Filter>,
+}
+#[derive(validator::Validate)]
+#[derive(serde::Serialize)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SearchParams {
     /// Params relevant to HNSW index. Size of the beam in a beam-search.
     /// Larger the value - more accurate the result, more time required for search.
     #[prost(uint64, optional, tag = "1")]
+    #[validate(range(min = 1))]
     pub hnsw_ef: ::core::option::Option<u64>,
     /// Search without approximation. If set to true, search may run long but with exact results.
     #[prost(bool, optional, tag = "2")]
@@ -5663,6 +5887,11 @@ pub struct SearchParams {
     #[prost(message, optional, tag = "5")]
     #[validate(nested)]
     pub acorn: ::core::option::Option<AcornSearchParams>,
+    /// Which population sparse vector IDF statistics are computed over.
+    /// If unset, statistics are collection-wide (global).
+    #[prost(message, optional, tag = "6")]
+    #[validate(nested)]
+    pub idf: ::core::option::Option<IdfParams>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -8220,6 +8449,9 @@ pub mod points_client {
         }
         /// Retrieve closest points based on vector similarity and given filtering
         /// conditions
+        ///
+        /// Deprecated: use `Query` instead.
+        #[deprecated]
         pub async fn search(
             &mut self,
             request: impl tonic::IntoRequest<super::SearchPoints>,
@@ -8240,6 +8472,9 @@ pub mod points_client {
         }
         /// Retrieve closest points based on vector similarity and given filtering
         /// conditions
+        ///
+        /// Deprecated: use `QueryBatch` instead.
+        #[deprecated]
         pub async fn search_batch(
             &mut self,
             request: impl tonic::IntoRequest<super::SearchBatchPoints>,
@@ -8265,6 +8500,9 @@ pub mod points_client {
         }
         /// Retrieve closest points based on vector similarity and given filtering
         /// conditions, grouped by a given field
+        ///
+        /// Deprecated: use `QueryGroups` instead.
+        #[deprecated]
         pub async fn search_groups(
             &mut self,
             request: impl tonic::IntoRequest<super::SearchPointGroups>,
@@ -8310,6 +8548,9 @@ pub mod points_client {
         }
         /// Look for the points which are closer to stored positive examples and at
         /// the same time further to negative examples.
+        ///
+        /// Deprecated: use `Query` with a `recommend` query instead.
+        #[deprecated]
         pub async fn recommend(
             &mut self,
             request: impl tonic::IntoRequest<super::RecommendPoints>,
@@ -8333,6 +8574,9 @@ pub mod points_client {
         }
         /// Look for the points which are closer to stored positive examples and at
         /// the same time further to negative examples.
+        ///
+        /// Deprecated: use `QueryBatch` with `recommend` queries instead.
+        #[deprecated]
         pub async fn recommend_batch(
             &mut self,
             request: impl tonic::IntoRequest<super::RecommendBatchPoints>,
@@ -8359,6 +8603,9 @@ pub mod points_client {
         }
         /// Look for the points which are closer to stored positive examples and at
         /// the same time further to negative examples, grouped by a given field
+        ///
+        /// Deprecated: use `QueryGroups` with a `recommend` query instead.
+        #[deprecated]
         pub async fn recommend_groups(
             &mut self,
             request: impl tonic::IntoRequest<super::RecommendPointGroups>,
@@ -8402,6 +8649,9 @@ pub mod points_client {
         /// distance to the target. The context part of the score for each pair is
         /// calculated +1 if the point is closer to a positive than to a negative part
         /// of a pair, and -1 otherwise.
+        ///
+        /// Deprecated: use `Query` with a `discover` or `context` query instead.
+        #[deprecated]
         pub async fn discover(
             &mut self,
             request: impl tonic::IntoRequest<super::DiscoverPoints>,
@@ -8424,6 +8674,9 @@ pub mod points_client {
             self.inner.unary(req, path, codec).await
         }
         /// Batch request points based on { positive, negative } pairs of examples, and/or a target
+        ///
+        /// Deprecated: use `QueryBatch` with `discover` or `context` queries instead.
+        #[deprecated]
         pub async fn discover_batch(
             &mut self,
             request: impl tonic::IntoRequest<super::DiscoverBatchPoints>,
@@ -8752,12 +9005,16 @@ pub mod points_server {
         >;
         /// Retrieve closest points based on vector similarity and given filtering
         /// conditions
+        ///
+        /// Deprecated: use `Query` instead.
         async fn search(
             &self,
             request: tonic::Request<super::SearchPoints>,
         ) -> std::result::Result<tonic::Response<super::SearchResponse>, tonic::Status>;
         /// Retrieve closest points based on vector similarity and given filtering
         /// conditions
+        ///
+        /// Deprecated: use `QueryBatch` instead.
         async fn search_batch(
             &self,
             request: tonic::Request<super::SearchBatchPoints>,
@@ -8767,6 +9024,8 @@ pub mod points_server {
         >;
         /// Retrieve closest points based on vector similarity and given filtering
         /// conditions, grouped by a given field
+        ///
+        /// Deprecated: use `QueryGroups` instead.
         async fn search_groups(
             &self,
             request: tonic::Request<super::SearchPointGroups>,
@@ -8781,6 +9040,8 @@ pub mod points_server {
         ) -> std::result::Result<tonic::Response<super::ScrollResponse>, tonic::Status>;
         /// Look for the points which are closer to stored positive examples and at
         /// the same time further to negative examples.
+        ///
+        /// Deprecated: use `Query` with a `recommend` query instead.
         async fn recommend(
             &self,
             request: tonic::Request<super::RecommendPoints>,
@@ -8790,6 +9051,8 @@ pub mod points_server {
         >;
         /// Look for the points which are closer to stored positive examples and at
         /// the same time further to negative examples.
+        ///
+        /// Deprecated: use `QueryBatch` with `recommend` queries instead.
         async fn recommend_batch(
             &self,
             request: tonic::Request<super::RecommendBatchPoints>,
@@ -8799,6 +9062,8 @@ pub mod points_server {
         >;
         /// Look for the points which are closer to stored positive examples and at
         /// the same time further to negative examples, grouped by a given field
+        ///
+        /// Deprecated: use `QueryGroups` with a `recommend` query instead.
         async fn recommend_groups(
             &self,
             request: tonic::Request<super::RecommendPointGroups>,
@@ -8825,6 +9090,8 @@ pub mod points_server {
         /// distance to the target. The context part of the score for each pair is
         /// calculated +1 if the point is closer to a positive than to a negative part
         /// of a pair, and -1 otherwise.
+        ///
+        /// Deprecated: use `Query` with a `discover` or `context` query instead.
         async fn discover(
             &self,
             request: tonic::Request<super::DiscoverPoints>,
@@ -8833,6 +9100,8 @@ pub mod points_server {
             tonic::Status,
         >;
         /// Batch request points based on { positive, negative } pairs of examples, and/or a target
+        ///
+        /// Deprecated: use `QueryBatch` with `discover` or `context` queries instead.
         async fn discover_batch(
             &self,
             request: tonic::Request<super::DiscoverBatchPoints>,
@@ -10337,6 +10606,32 @@ pub mod points_server {
     }
 }
 #[derive(serde::Serialize)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PointStructRaw {
+    #[prost(message, optional, tag = "1")]
+    pub id: ::core::option::Option<PointId>,
+    #[prost(map = "string, bytes", tag = "2")]
+    pub vectors: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::vec::Vec<u8>,
+    >,
+    #[prost(map = "string, message", tag = "3")]
+    pub payload: ::std::collections::HashMap<::prost::alloc::string::String, Value>,
+    /// Byte-encoded payload blob.
+    #[prost(message, optional, tag = "4")]
+    pub raw_payload: ::core::option::Option<RawPayload>,
+}
+/// The whole payload object of a point as a single encoded blob.
+#[derive(serde::Serialize)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RawPayload {
+    /// The encoded payload object, see `encoding` for the format.
+    #[prost(bytes = "vec", tag = "1")]
+    pub payload_bytes: ::prost::alloc::vec::Vec<u8>,
+    #[prost(enumeration = "RawPayloadEncoding", tag = "2")]
+    pub encoding: i32,
+}
+#[derive(serde::Serialize)]
 #[derive(validator::Validate)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SyncPoints {
@@ -10363,6 +10658,9 @@ pub struct SyncPoints {
     /// Timeout for the request in seconds
     #[prost(uint64, optional, tag = "7")]
     pub timeout: ::core::option::Option<u64>,
+    /// Points with storage-native (raw bytes) vectors
+    #[prost(message, repeated, tag = "8")]
+    pub raw_points: ::prost::alloc::vec::Vec<PointStructRaw>,
 }
 #[derive(serde::Serialize)]
 #[derive(validator::Validate)]
@@ -10395,6 +10693,9 @@ pub struct UpsertPointsInternal {
     /// When absent, falls back to `wait` (backward compatible with older nodes).
     #[prost(enumeration = "WaitUntil", optional, tag = "4")]
     pub wait_override: ::core::option::Option<i32>,
+    /// Points with storage-native (raw bytes) vectors
+    #[prost(message, repeated, tag = "5")]
+    pub raw_points: ::prost::alloc::vec::Vec<PointStructRaw>,
 }
 #[derive(serde::Serialize)]
 #[derive(validator::Validate)]
@@ -11145,6 +11446,33 @@ pub struct FacetResponseInternal {
     pub time: f64,
     #[prost(message, optional, tag = "3")]
     pub usage: ::core::option::Option<HardwareUsage>,
+}
+/// Encoding of `RawPayload.payload_bytes`.
+#[derive(serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RawPayloadEncoding {
+    /// serde_json encoding of the whole payload object, uncompressed,
+    /// exactly as stored in gridstore.
+    JsonBytes = 0,
+}
+impl RawPayloadEncoding {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::JsonBytes => "JsonBytes",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "JsonBytes" => Some(Self::JsonBytes),
+            _ => None,
+        }
+    }
 }
 /// Controls how an update operation waits for completion.
 /// When present, fully overrides the `wait` boolean from the wrapped public message.
@@ -13409,6 +13737,35 @@ impl StateRole {
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetQuotaUsageRequest {}
+#[derive(serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetQuotaUsageResponse {
+    #[prost(message, optional, tag = "1")]
+    pub result: ::core::option::Option<QuotaUsage>,
+    /// Time spent to process
+    #[prost(double, tag = "2")]
+    pub time: f64,
+}
+/// Utilization of the quota-managed resources on the peer that answered.
+#[derive(serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct QuotaUsage {
+    /// Resident memory as a percentage of the memory available to the process,
+    /// absent when the platform does not expose the stat.
+    #[prost(uint32, optional, tag = "1")]
+    pub resident_memory_percent: ::core::option::Option<u32>,
+    /// Used space of the storage filesystem as a percentage of its capacity,
+    /// absent when it cannot be read.
+    #[prost(uint32, optional, tag = "2")]
+    pub disk_usage_percent: ::core::option::Option<u32>,
+    /// Whether this peer is at or over one of the limits it enforces, and so is
+    /// currently refusing updates. Always false while the quota is disabled.
+    #[prost(bool, tag = "3")]
+    pub exceeded: bool,
+}
+#[derive(serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetConsensusCommitRequest {}
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -13659,6 +14016,31 @@ pub mod qdrant_internal_client {
                 .insert(GrpcMethod::new("qdrant.QdrantInternal", "GetAuditLog"));
             self.inner.unary(req, path, codec).await
         }
+        /// Get how much of its resource quota this peer is using
+        pub async fn get_quota_usage(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetQuotaUsageRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetQuotaUsageResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/qdrant.QdrantInternal/GetQuotaUsage",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("qdrant.QdrantInternal", "GetQuotaUsage"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -13704,6 +14086,14 @@ pub mod qdrant_internal_server {
             request: tonic::Request<super::GetAuditLogRequest>,
         ) -> std::result::Result<
             tonic::Response<super::GetAuditLogResponse>,
+            tonic::Status,
+        >;
+        /// Get how much of its resource quota this peer is using
+        async fn get_quota_usage(
+            &self,
+            request: tonic::Request<super::GetQuotaUsageRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetQuotaUsageResponse>,
             tonic::Status,
         >;
     }
@@ -13953,6 +14343,52 @@ pub mod qdrant_internal_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetAuditLogSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/qdrant.QdrantInternal/GetQuotaUsage" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetQuotaUsageSvc<T: QdrantInternal>(pub Arc<T>);
+                    impl<
+                        T: QdrantInternal,
+                    > tonic::server::UnaryService<super::GetQuotaUsageRequest>
+                    for GetQuotaUsageSvc<T> {
+                        type Response = super::GetQuotaUsageResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetQuotaUsageRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as QdrantInternal>::get_quota_usage(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetQuotaUsageSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -16065,9 +16501,20 @@ pub struct FileExistsResponse {
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListFilesEntry {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub size: u64,
+    /// Last modification time, when the underlying storage exposes one.
+    #[prost(message, optional, tag = "3")]
+    pub last_modified: ::core::option::Option<::prost_wkt_types::Timestamp>,
+}
+#[derive(serde::Serialize)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListFilesResponse {
-    #[prost(string, repeated, tag = "1")]
-    pub paths: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "1")]
+    pub files: ::prost::alloc::vec::Vec<ListFilesEntry>,
 }
 #[derive(serde::Serialize)]
 #[derive(validator::Validate)]
@@ -16196,41 +16643,6 @@ pub struct ReadBatchRequest {
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadBatchResponse {
-    #[prost(bytes = "vec", repeated, tag = "1")]
-    pub data: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
-}
-/// ReadMulti: ranges across multiple files (maps to UniversalRead::read_multi).
-#[derive(serde::Serialize)]
-#[derive(validator::Validate)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ReadMultiEntry {
-    #[prost(string, tag = "1")]
-    #[validate(length(min = 1))]
-    pub path: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "2")]
-    pub byte_offset: u64,
-    #[prost(uint64, tag = "3")]
-    pub length: u64,
-}
-#[derive(serde::Serialize)]
-#[derive(validator::Validate)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ReadMultiRequest {
-    #[prost(string, tag = "1")]
-    #[validate(
-        length(min = 1, max = 255),
-        custom(function = "common::validation::validate_collection_name_legacy")
-    )]
-    pub collection_name: ::prost::alloc::string::String,
-    #[prost(uint32, tag = "2")]
-    pub shard_id: u32,
-    #[prost(message, repeated, tag = "3")]
-    #[validate(length(min = 1), nested)]
-    pub reads: ::prost::alloc::vec::Vec<ReadMultiEntry>,
-}
-#[derive(serde::Serialize)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ReadMultiResponse {
     #[prost(bytes = "vec", repeated, tag = "1")]
     pub data: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
@@ -16512,31 +16924,6 @@ pub mod storage_read_client {
                 .insert(GrpcMethod::new("qdrant.StorageRead", "ReadBatch"));
             self.inner.unary(req, path, codec).await
         }
-        /// Maps to UniversalRead::read_multi() — ranges across multiple files.
-        pub async fn read_multi(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ReadMultiRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ReadMultiResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/qdrant.StorageRead/ReadMulti",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("qdrant.StorageRead", "ReadMulti"));
-            self.inner.unary(req, path, codec).await
-        }
     }
 }
 /// Generated server implementations.
@@ -16612,14 +16999,6 @@ pub mod storage_read_server {
             request: tonic::Request<super::ReadBatchRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ReadBatchResponse>,
-            tonic::Status,
-        >;
-        /// Maps to UniversalRead::read_multi() — ranges across multiple files.
-        async fn read_multi(
-            &self,
-            request: tonic::Request<super::ReadMultiRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ReadMultiResponse>,
             tonic::Status,
         >;
     }
@@ -17013,51 +17392,6 @@ pub mod storage_read_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ReadBatchSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/qdrant.StorageRead/ReadMulti" => {
-                    #[allow(non_camel_case_types)]
-                    struct ReadMultiSvc<T: StorageRead>(pub Arc<T>);
-                    impl<
-                        T: StorageRead,
-                    > tonic::server::UnaryService<super::ReadMultiRequest>
-                    for ReadMultiSvc<T> {
-                        type Response = super::ReadMultiResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::ReadMultiRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as StorageRead>::read_multi(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = ReadMultiSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

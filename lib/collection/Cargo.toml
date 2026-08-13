@@ -12,7 +12,7 @@ edition = "2024"
 workspace = true
 
 [features]
-testing = []
+testing = ["common/testing", "segment/testing", "shard/testing"]
 tracing = ["dep:tracing", "api/tracing", "segment/tracing"]
 data-consistency-check = []
 staging = ["shard/staging"]
@@ -21,6 +21,8 @@ staging = ["shard/staging"]
 criterion = { workspace = true }
 fs-err = { workspace = true, features = ["debug"] }
 proptest = { workspace = true }
+rand_distr = { workspace = true }
+rmp-serde = { workspace = true }
 rstest = { workspace = true }
 tar = { workspace = true }
 approx = "0.5.1"
@@ -42,7 +44,6 @@ rand = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-rmp-serde = { workspace = true }
 ordered-float = { workspace = true }
 hashring = "0.3.6"
 tinyvec = { workspace = true }
@@ -86,7 +87,6 @@ tempfile = { workspace = true }
 sha2 = { workspace = true }
 bytes = { workspace = true }
 fnv = { workspace = true }
-indexmap = { workspace = true }
 ringbuffer = "0.16.0"
 strum = { workspace = true }
 urlencoding = { workspace = true }

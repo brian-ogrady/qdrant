@@ -1,16 +1,27 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use common::bitvec::BitSlice;
-use common::universal_io::UniversalRead;
+use common::universal_io::{CachedReadFs, Populate, UniversalRead, UniversalReadFs};
 
-use super::super::mmap_text_index::MmapFullTextIndex;
 use super::super::mutable_text_index::read_only::ReadOnlyAppendableFullTextIndex;
+use super::super::on_disk_text_index::OnDiskFullTextIndex;
 use super::ReadOnlyFullTextIndex;
 use crate::common::operation_error::OperationResult;
 use crate::data_types::index::TextIndexParams;
+use crate::index::field_index::full_text_index::immutable_text_index::ImmutableFullTextIndex;
 use crate::index::payload_config::IndexMutability;
 
 impl<S: UniversalRead> ReadOnlyFullTextIndex<S> {
+    /// Schedule background prefetch for the appendable (Gridstore) format.
+    ///
+    /// Returns `false` when nothing was scheduled (directory absent).
+    pub fn preopen_appendable(
+        fs: &impl CachedReadFs<File = S>,
+        dir: PathBuf,
+    ) -> OperationResult<bool> {
+        ReadOnlyAppendableFullTextIndex::preopen(fs, dir)
+    }
+
     /// Read-only mirror of [`FullTextIndex::new_gridstore`][1]: open the
     /// appendable (Gridstore-backed) full-text index read-only, threading
     /// every file open through the filesystem handle `fs`.
@@ -23,11 +34,30 @@ impl<S: UniversalRead> ReadOnlyFullTextIndex<S> {
     ///
     /// [1]: super::super::FullTextIndex::new_gridstore
     pub fn open_appendable(
-        fs: &S::Fs,
+        fs: &impl UniversalReadFs<File = S>,
         dir: PathBuf,
         config: TextIndexParams,
     ) -> OperationResult<Option<Self>> {
         Ok(ReadOnlyAppendableFullTextIndex::open(fs, dir, config)?.map(Self::Appendable))
+    }
+
+    /// Schedule background prefetch for the immutable (mmap) format.
+    ///
+    /// Returns `false` when the on-disk index doesn't exist.
+    pub fn preopen_immutable(
+        fs: &impl CachedReadFs<File = S>,
+        path: &Path,
+        is_on_disk: bool,
+    ) -> OperationResult<bool> {
+        let effective_is_on_disk =
+            is_on_disk || common::low_memory::low_memory_mode().prefer_disk();
+
+        let populate = match effective_is_on_disk {
+            true => Populate::No,
+            false => Populate::PreferBackground,
+        };
+
+        OnDiskFullTextIndex::preopen(fs, path, populate)
     }
 
     /// Read-only mirror of [`FullTextIndex::new_mmap`][1]: open the immutable
@@ -43,7 +73,7 @@ impl<S: UniversalRead> ReadOnlyFullTextIndex<S> {
     ///
     /// [1]: super::super::FullTextIndex::new_mmap
     pub fn open_immutable(
-        fs: &S::Fs,
+        fs: &impl UniversalReadFs<File = S>,
         path: PathBuf,
         config: TextIndexParams,
         is_on_disk: bool,
@@ -52,10 +82,21 @@ impl<S: UniversalRead> ReadOnlyFullTextIndex<S> {
         let effective_is_on_disk =
             is_on_disk || common::low_memory::low_memory_mode().prefer_disk();
 
-        Ok(
-            MmapFullTextIndex::open(fs, path, config, effective_is_on_disk, deleted_points)?
-                .map(Self::Immutable),
-        )
+        let populate = Populate::from(!effective_is_on_disk);
+
+        let Some(on_disk_index) =
+            OnDiskFullTextIndex::open(fs, path, config, populate, deleted_points)?
+        else {
+            return Ok(None);
+        };
+
+        let index = if effective_is_on_disk {
+            Self::OnDisk(on_disk_index)
+        } else {
+            Self::Immutable(ImmutableFullTextIndex::load_from_on_disk(on_disk_index)?)
+        };
+
+        Ok(Some(index))
     }
 
     /// Reports the on-disk format's mutability, mirroring
@@ -72,6 +113,7 @@ impl<S: UniversalRead> ReadOnlyFullTextIndex<S> {
     pub fn get_mutability_type(&self) -> IndexMutability {
         match self {
             Self::Appendable(_) => IndexMutability::Mutable,
+            Self::OnDisk(_) => IndexMutability::Immutable,
             Self::Immutable(_) => IndexMutability::Immutable,
         }
     }

@@ -7,10 +7,10 @@
 
 use std::ops::Bound;
 
+use blobstore::Blob;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use common::universal_io::UniversalRead;
-use gridstore::Blob;
+use common::universal_io::{UniversalRead, UserData};
 
 use super::super::super::numeric_index_read::NumericIndexRead;
 use super::super::super::{Encodable, StreamRange, query};
@@ -18,7 +18,7 @@ use super::ReadOnlyNumericIndexInner;
 use crate::common::operation_error::OperationResult;
 use crate::index::field_index::histogram::Histogram;
 use crate::index::field_index::numeric_point::{Numericable, Point};
-use crate::index::field_index::stored_point_to_values::StoredValue;
+use crate::index::field_index::on_disk_point_to_values::StoredValue;
 use crate::index::payload_config::StorageType;
 use crate::types::RangeInterface;
 
@@ -40,6 +40,35 @@ where
             ReadOnlyNumericIndexInner::Immutable(index) => {
                 index.check_values_any(idx, check_fn, hw_counter)
             }
+            ReadOnlyNumericIndexInner::OnDisk(index) => {
+                index.check_values_any(idx, check_fn, hw_counter)
+            }
+        }
+    }
+
+    fn for_each_matching_value<I, F, M, U>(
+        &self,
+        items: I,
+        hw_counter: &HardwareCounterCell,
+        check_fn: F,
+        on_match: M,
+    ) -> OperationResult<()>
+    where
+        U: UserData,
+        I: Iterator<Item = (U, PointOffsetType)>,
+        F: Fn(&T) -> bool,
+        M: FnMut(U, bool),
+    {
+        match self {
+            ReadOnlyNumericIndexInner::Appendable(index) => {
+                index.for_each_matching_value(items, hw_counter, check_fn, on_match)
+            }
+            ReadOnlyNumericIndexInner::Immutable(index) => {
+                index.for_each_matching_value(items, hw_counter, check_fn, on_match)
+            }
+            ReadOnlyNumericIndexInner::OnDisk(index) => {
+                index.for_each_matching_value(items, hw_counter, check_fn, on_match)
+            }
         }
     }
 
@@ -47,6 +76,7 @@ where
         match self {
             ReadOnlyNumericIndexInner::Appendable(index) => index.get_values(idx),
             ReadOnlyNumericIndexInner::Immutable(index) => index.get_values(idx),
+            ReadOnlyNumericIndexInner::OnDisk(index) => index.get_values(idx),
         }
     }
 
@@ -54,6 +84,7 @@ where
         match self {
             ReadOnlyNumericIndexInner::Appendable(index) => index.values_count(idx),
             ReadOnlyNumericIndexInner::Immutable(index) => index.values_count(idx),
+            ReadOnlyNumericIndexInner::OnDisk(index) => index.values_count(idx),
         }
     }
 
@@ -61,6 +92,7 @@ where
         match self {
             ReadOnlyNumericIndexInner::Appendable(index) => index.total_unique_values_count(),
             ReadOnlyNumericIndexInner::Immutable(index) => index.total_unique_values_count(),
+            ReadOnlyNumericIndexInner::OnDisk(index) => index.total_unique_values_count(),
         }
     }
 
@@ -75,6 +107,9 @@ where
                 Box::new(index.values_range(start_bound, end_bound, hw_counter)?)
             }
             ReadOnlyNumericIndexInner::Immutable(index) => {
+                Box::new(index.values_range(start_bound, end_bound, hw_counter)?)
+            }
+            ReadOnlyNumericIndexInner::OnDisk(index) => {
                 Box::new(index.values_range(start_bound, end_bound, hw_counter)?)
             }
         };
@@ -93,6 +128,9 @@ where
             ReadOnlyNumericIndexInner::Immutable(index) => {
                 Box::new(index.orderable_values_range(start_bound, end_bound)?)
             }
+            ReadOnlyNumericIndexInner::OnDisk(index) => {
+                Box::new(index.orderable_values_range(start_bound, end_bound)?)
+            }
         };
         Ok(boxed)
     }
@@ -101,6 +139,7 @@ where
         match self {
             ReadOnlyNumericIndexInner::Appendable(index) => index.get_histogram(),
             ReadOnlyNumericIndexInner::Immutable(index) => index.get_histogram(),
+            ReadOnlyNumericIndexInner::OnDisk(index) => index.get_histogram(),
         }
     }
 
@@ -108,6 +147,7 @@ where
         match self {
             ReadOnlyNumericIndexInner::Appendable(index) => index.get_points_count(),
             ReadOnlyNumericIndexInner::Immutable(index) => index.get_points_count(),
+            ReadOnlyNumericIndexInner::OnDisk(index) => index.get_points_count(),
         }
     }
 
@@ -115,6 +155,7 @@ where
         match self {
             ReadOnlyNumericIndexInner::Appendable(index) => index.get_max_values_per_point(),
             ReadOnlyNumericIndexInner::Immutable(index) => index.get_max_values_per_point(),
+            ReadOnlyNumericIndexInner::OnDisk(index) => index.get_max_values_per_point(),
         }
     }
 
@@ -122,6 +163,7 @@ where
         match self {
             ReadOnlyNumericIndexInner::Appendable(index) => index.storage_type(),
             ReadOnlyNumericIndexInner::Immutable(index) => index.storage_type(),
+            ReadOnlyNumericIndexInner::OnDisk(index) => index.storage_type(),
         }
     }
 
@@ -129,6 +171,7 @@ where
         match self {
             ReadOnlyNumericIndexInner::Appendable(index) => index.ram_usage_bytes(),
             ReadOnlyNumericIndexInner::Immutable(index) => index.ram_usage_bytes(),
+            ReadOnlyNumericIndexInner::OnDisk(index) => index.ram_usage_bytes(),
         }
     }
 
@@ -136,6 +179,7 @@ where
         match self {
             ReadOnlyNumericIndexInner::Appendable(index) => index.telemetry_index_type(),
             ReadOnlyNumericIndexInner::Immutable(index) => index.telemetry_index_type(),
+            ReadOnlyNumericIndexInner::OnDisk(index) => index.telemetry_index_type(),
         }
     }
 }

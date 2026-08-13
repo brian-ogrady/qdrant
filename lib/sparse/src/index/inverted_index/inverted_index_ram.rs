@@ -3,10 +3,11 @@ use std::borrow::Cow;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use blink_alloc::Blink;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::storage_version::StorageVersion;
 use common::types::PointOffsetType;
-use common::universal_io::Result;
+use common::universal_io::{UioResult, UniversalRead, UniversalWrite, UserData};
 #[cfg(feature = "testing")]
 use fs_err as fs;
 #[cfg(feature = "testing")]
@@ -14,7 +15,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use crate::common::sparse_vector::RemappedSparseVector;
 use crate::common::types::{DimId, DimOffset};
-use crate::index::inverted_index::{InvertedIndex, out_of_bounds};
+use crate::index::inverted_index::{InvertedIndex, InvertedIndexReadWrite, out_of_bounds};
 use crate::index::posting_list::{PostingList, PostingListIterator};
 use crate::index::posting_list_common::PostingElementEx;
 
@@ -39,6 +40,20 @@ pub struct InvertedIndexRam {
     pub total_sparse_size: usize,
 }
 
+impl<S: UniversalWrite> InvertedIndexReadWrite<S> for InvertedIndexRam {
+    fn open_rw_impl(_fs: &<S as UniversalRead>::Fs, _path: &Path) -> UioResult<Self> {
+        panic!("InvertedIndexRam is never persisted, so can't to be loaded");
+    }
+
+    fn from_ram_index_impl<P: AsRef<Path>>(
+        _fs: &<S as UniversalRead>::Fs,
+        ram_index: Cow<InvertedIndexRam>,
+        _path: P,
+    ) -> UioResult<Self> {
+        Ok(ram_index.into_owned())
+    }
+}
+
 impl InvertedIndex for InvertedIndexRam {
     type Iter<'a> = PostingListIterator<'a>;
 
@@ -48,29 +63,37 @@ impl InvertedIndex for InvertedIndexRam {
         false
     }
 
-    fn open(_path: &Path) -> Result<Self> {
-        panic!("InvertedIndexRam is not supposed to be loaded");
-    }
-
-    fn save(&self, _path: &Path) -> Result<()> {
+    fn save(&self, _path: &Path) -> UioResult<()> {
         panic!("InvertedIndexRam is not supposed to be saved");
     }
 
-    fn get<'a>(
+    fn get_batch<'a, U: UserData>(
         &'a self,
-        id: DimOffset,
-        _arena: &'a crate::SearchScratchArena,
+        ids: impl Iterator<Item = (U, DimOffset)>,
+        _arena: &'a Blink,
         _hw_counter: &'a HardwareCounterCell,
-    ) -> Result<PostingListIterator<'a>> {
-        Ok(self.get(id)?.iter())
+        mut callback: impl FnMut(U, PostingListIterator<'a>) -> UioResult<()>,
+    ) -> UioResult<()> {
+        for (user_data, id) in ids {
+            callback(user_data, self.get(id)?.iter())?;
+        }
+        Ok(())
     }
 
     fn len(&self) -> usize {
         self.postings.len()
     }
 
-    fn posting_list_len(&self, id: DimOffset, _hw_counter: &HardwareCounterCell) -> Result<usize> {
-        Ok(self.get(id)?.elements.len())
+    fn posting_list_len_batch<U: UserData>(
+        &self,
+        ids: impl Iterator<Item = (U, DimOffset)>,
+        _hw_counter: &HardwareCounterCell,
+        mut callback: impl FnMut(U, usize) -> UioResult<()>,
+    ) -> UioResult<()> {
+        for (user_data, id) in ids {
+            callback(user_data, self.get(id)?.elements.len())?;
+        }
+        Ok(())
     }
 
     fn files(_path: &Path) -> Vec<PathBuf> {
@@ -105,10 +128,6 @@ impl InvertedIndex for InvertedIndexRam {
         self.upsert(id, vector, old_vector);
     }
 
-    fn from_ram_index<P: AsRef<Path>>(ram_index: Cow<InvertedIndexRam>, _path: P) -> Result<Self> {
-        Ok(ram_index.into_owned())
-    }
-
     fn vector_count(&self) -> usize {
         self.vector_count
     }
@@ -135,7 +154,7 @@ impl InvertedIndexRam {
         }
     }
 
-    pub fn get(&self, id: DimOffset) -> Result<&PostingList> {
+    pub fn get(&self, id: DimOffset) -> UioResult<&PostingList> {
         self.postings
             .get(id as usize)
             .ok_or_else(|| out_of_bounds(id, self.len()))
@@ -191,13 +210,6 @@ impl InvertedIndexRam {
         }
 
         self.total_sparse_size += new_vector_size
-    }
-
-    pub fn total_posting_elements_size(&self) -> usize {
-        self.postings
-            .iter()
-            .map(|posting| posting.elements.len() * size_of::<PostingElementEx>())
-            .sum()
     }
 }
 

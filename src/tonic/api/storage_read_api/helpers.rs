@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use collection::operations::verification::new_unchecked_verification_pass;
 use collection::shards::shard::ShardId;
-use common::universal_io::{ReadRange, UniversalIoError, UniversalRead, UniversalReadFileOps};
+use common::universal_io::{
+    ReadRange, UioResult, UniversalIoError, UniversalRead, UniversalReadFileOps,
+};
 use storage::content_manager::toc::COLLECTIONS_DIR;
 use storage::dispatcher::Dispatcher;
 use storage::rbac::AccessRequirements;
@@ -205,7 +207,7 @@ fn canonicalize_existing_ancestor(path: &Path) -> std::io::Result<Option<PathBuf
 
 /// Validate a requested range against the file size using the same
 /// out-of-bounds semantics as `UniversalRead::read()`.
-pub fn validate_range(range: ReadRange, data_length: u64) -> common::universal_io::Result<()> {
+pub fn validate_range(range: ReadRange, data_length: u64) -> UioResult<()> {
     let end = range
         .byte_offset
         .checked_add(range.length)
@@ -264,6 +266,7 @@ pub fn io_error_to_status(e: UniversalIoError) -> Status {
         UniversalIoError::BytemuckCast(e) => Status::internal(format!("Bytemuck cast error: {e}")),
         UniversalIoError::ZerocopySize(e) => Status::internal(e),
         UniversalIoError::QueueIsFull => Status::internal(e.to_string()),
+        UniversalIoError::AppendOffsetConflict { .. } => Status::aborted(e.to_string()),
         UniversalIoError::S3(_)
         | UniversalIoError::S3Config { .. }
         | UniversalIoError::TaskPanicked(_) => Status::internal(e.to_string()),

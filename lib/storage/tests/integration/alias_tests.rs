@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -32,6 +36,7 @@ fn test_alias_operation() {
         snapshots_config: Default::default(),
         temp_path: None,
         on_disk_payload: false,
+        payload: None,
         optimizers: OptimizersConfig {
             deleted_threshold: 0.5,
             vacuum_min_vector_number: 100,
@@ -56,6 +61,7 @@ fn test_alias_operation() {
             incoming_shard_transfers_limit: Some(1),
             outgoing_shard_transfers_limit: Some(1),
             async_scorer: None,
+            io_uring: None,
             load_concurrency: LoadConcurrencyConfig::default(),
         },
         hnsw_index: Default::default(),
@@ -71,6 +77,7 @@ fn test_alias_operation() {
         shard_transfer_method: None,
         collection: None,
         max_collections: None,
+        quotas: Default::default(),
     };
 
     let (propose_sender, _propose_receiver) = std::sync::mpsc::channel();
@@ -105,6 +112,7 @@ fn test_alias_operation() {
                             optimizers_config: None,
                             shard_number: Some(1),
                             on_disk_payload: None,
+                            payload: None,
                             replication_factor: None,
                             write_consistency_factor: None,
                             quantization_config: None,

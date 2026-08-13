@@ -1,8 +1,12 @@
+use std::cmp::Reverse;
 use std::sync::atomic::AtomicBool;
 
+use common::condition_checker::ConditionChecker;
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
 use common::iterator_ext::IteratorExt;
 use common::types::DeferredBehavior;
+use itertools::Itertools;
 
 use crate::common::operation_error::OperationResult;
 use crate::id_tracker::IdTrackerRead;
@@ -10,7 +14,6 @@ use crate::index::PayloadIndexRead;
 use crate::payload_storage::PayloadStorageRead;
 use crate::segment::read_view::SegmentReadView;
 use crate::segment::vector_data_read::VectorDataRead;
-use crate::spaces::tools::peek_top_smallest_iterable;
 use crate::types::{Filter, PointIdType};
 
 impl<'s, TIdT, TPI, TPS, TVD> SegmentReadView<'s, TIdT, TPI, TPS, TVD>
@@ -59,14 +62,10 @@ where
         limit: Option<usize>,
         deferred_behavior: DeferredBehavior,
     ) -> Vec<PointIdType> {
-        let point_mappings = self.id_tracker.point_mappings();
-        let iter = if deferred_behavior.include_all_points() {
-            point_mappings.iter_from(offset)
-        } else {
-            point_mappings.iter_from_visible(offset)
-        };
-
-        iter.map(|x| x.0)
+        self.id_tracker
+            .point_mappings()
+            .iter_from_with_behavior(offset, deferred_behavior)
+            .map(|x| x.0)
             .take(limit.unwrap_or(usize::MAX))
             .collect()
     }
@@ -84,27 +83,48 @@ where
             .payload_index
             .estimate_cardinality(condition, hw_counter)?;
 
-        let ids_iterator = self
-            .payload_index
-            .iter_filtered_points(
-                condition,
-                &cardinality_estimation,
-                hw_counter,
-                is_stopped,
-                deferred_behavior,
-            )?
-            .filter_map(|internal_id| {
-                let external_id = self.id_tracker.external_id(internal_id)?;
-                match offset {
-                    Some(offset) if external_id < offset => None,
-                    _ => Some(external_id),
-                }
-            });
+        let internal_ids = self.payload_index.iter_filtered_points(
+            condition,
+            &cardinality_estimation,
+            hw_counter,
+            is_stopped,
+            deferred_behavior,
+        )?;
 
-        let mut page = match limit {
-            Some(limit) => peek_top_smallest_iterable(ids_iterator, limit),
-            None => ids_iterator.collect(),
-        };
+        if limit == Some(0) {
+            return Ok(vec![]);
+        }
+
+        // The candidate set is fully drained either way: feed the whole
+        // iterator into one batch pass and let the IO layer pipeline the
+        // lookups. With a limit, only the `limit` smallest ids are kept
+        // (mirrors `peek_top_smallest_iterable`, which cannot consume a
+        // callback-fed stream).
+        let mut page: Vec<PointIdType> = Vec::new();
+        let mut top = limit.map(FixedLengthPriorityQueue::new);
+        self.id_tracker
+            .external_ids_batch(internal_ids, |_, external_id| {
+                let past_offset = match offset {
+                    Some(offset) => external_id >= offset,
+                    None => true,
+                };
+                if !past_offset {
+                    return;
+                }
+                match &mut top {
+                    Some(top) => {
+                        top.push(Reverse(external_id));
+                    }
+                    None => page.push(external_id),
+                }
+            })?;
+        if let Some(top) = top {
+            page = top
+                .into_sorted_vec()
+                .into_iter()
+                .map(|Reverse(x)| x)
+                .collect();
+        }
         page.sort_unstable();
         Ok(page)
     }
@@ -119,19 +139,14 @@ where
         deferred_behavior: DeferredBehavior,
     ) -> OperationResult<Vec<PointIdType>> {
         let filter_context = self.payload_index.filter_context(condition, hw_counter)?;
-        let point_mappings = self.id_tracker.point_mappings();
-        let iter = if deferred_behavior.include_all_points() {
-            point_mappings.iter_from(offset)
-        } else {
-            point_mappings.iter_from_visible(offset)
-        };
-
-        Ok(iter
+        self.id_tracker
+            .point_mappings()
+            .iter_from_with_behavior(offset, deferred_behavior)
             .stop_if(is_stopped)
-            .filter(move |(_, internal_id)| filter_context.check(*internal_id))
-            .map(|(external_id, _)| external_id)
+            .try_filter(move |(_, internal_id)| filter_context.check(*internal_id))
+            .map_ok(|(external_id, _)| external_id)
             .take(limit.unwrap_or(usize::MAX))
-            .collect())
+            .collect()
     }
 
     pub fn read_filtered<'a>(

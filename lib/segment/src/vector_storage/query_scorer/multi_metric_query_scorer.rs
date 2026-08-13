@@ -12,14 +12,14 @@ use crate::data_types::vectors::{
     DenseVector, MultiDenseVectorInternal, TypedMultiDenseVector, TypedMultiDenseVectorRef,
 };
 use crate::spaces::metric::Metric;
-use crate::vector_storage::MultiVectorStorage;
+use crate::vector_storage::MultiVectorStorageRead;
 use crate::vector_storage::query_scorer::QueryScorer;
 
 pub struct MultiMetricQueryScorer<
     'a,
     TElement: PrimitiveVectorElement,
     TMetric: Metric<TElement>,
-    TVectorStorage: MultiVectorStorage<TElement>,
+    TVectorStorage: MultiVectorStorageRead<TElement>,
 > {
     vector_storage: &'a TVectorStorage,
     query: TypedMultiDenseVector<TElement>,
@@ -31,7 +31,7 @@ impl<
     'a,
     TElement: PrimitiveVectorElement,
     TMetric: Metric<TElement>,
-    TVectorStorage: MultiVectorStorage<TElement>,
+    TVectorStorage: MultiVectorStorageRead<TElement>,
 > MultiMetricQueryScorer<'a, TElement, TMetric, TVectorStorage>
 {
     pub fn new(
@@ -86,11 +86,9 @@ impl<
 impl<
     TElement: PrimitiveVectorElement,
     TMetric: Metric<TElement>,
-    TVectorStorage: MultiVectorStorage<TElement>,
+    TVectorStorage: MultiVectorStorageRead<TElement>,
 > QueryScorer for MultiMetricQueryScorer<'_, TElement, TMetric, TVectorStorage>
 {
-    type TVector = TypedMultiDenseVector<TElement>;
-
     #[inline]
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
         let stored = self.vector_storage.get_multi::<Random>(idx);
@@ -99,14 +97,6 @@ impl<
             .incr_delta(stored.as_ref().vectors_count());
 
         self.score_multi(TypedMultiDenseVectorRef::from(&self.query), stored.as_ref())
-    }
-
-    #[inline]
-    fn score(&self, v2: &TypedMultiDenseVector<TElement>) -> ScoreType {
-        self.score_multi(
-            TypedMultiDenseVectorRef::from(&self.query),
-            TypedMultiDenseVectorRef::from(v2),
-        )
     }
 
     fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {

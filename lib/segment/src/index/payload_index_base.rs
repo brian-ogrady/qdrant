@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 
 use ahash::AHashMap;
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::AccessPattern;
 use common::types::{DeferredBehavior, PointOffsetType, ScoreType};
 use serde_json::Value;
 
@@ -14,8 +15,8 @@ use super::query_optimization::rescore_formula::parsed_formula::ParsedFormula;
 use crate::common::Flusher;
 use crate::common::operation_error::OperationResult;
 use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition};
+use crate::index::query_optimization::optimized_filter::OptimizedFilter;
 use crate::json_path::JsonPath;
-use crate::payload_storage::FilterContext;
 use crate::telemetry::PayloadIndexTelemetry;
 use crate::types::{Filter, Payload, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef};
 
@@ -68,13 +69,17 @@ pub trait PayloadIndexRead {
     ) -> OperationResult<Vec<PointOffsetType>>;
 
     /// Return number of points, indexed by this field
-    fn indexed_points(&self, field: PayloadKeyTypeRef) -> usize;
+    ///
+    /// Fallible: see [`PayloadFieldIndexRead::count_indexed_points`].
+    ///
+    /// [`PayloadFieldIndexRead::count_indexed_points`]: crate::index::field_index::PayloadFieldIndexRead::count_indexed_points
+    fn indexed_points(&self, field: PayloadKeyTypeRef) -> OperationResult<usize>;
 
     fn filter_context<'a>(
         &'a self,
         filter: &'a Filter,
         hw_counter: &HardwareCounterCell,
-    ) -> OperationResult<Box<dyn FilterContext + 'a>>;
+    ) -> OperationResult<OptimizedFilter<'a>>;
 
     /// Look up a numeric index for the given payload key, if one exists.
     ///
@@ -90,7 +95,7 @@ pub trait PayloadIndexRead {
     fn facet_index_for(&self, key: &JsonPath) -> Option<impl FacetIndex + '_>;
 
     /// Per-field-index telemetry data.
-    fn get_telemetry_data(&self) -> Vec<PayloadIndexTelemetry>;
+    fn get_telemetry_data(&self) -> OperationResult<Vec<PayloadIndexTelemetry>>;
 
     /// Build a per-query formula scorer that evaluates the given parsed
     /// formula against this index's payload, using the prefetch scores as
@@ -138,6 +143,13 @@ pub trait PayloadIndexRead {
         point_id: PointOffsetType,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Payload>;
+
+    fn read_payloads<P: AccessPattern, U: common::universal_io::UserData>(
+        &self,
+        point_ids: impl Iterator<Item = (U, PointOffsetType)>,
+        callback: impl FnMut(U, Payload) -> OperationResult<()>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()>;
 }
 
 /// Trait for payload index with mutating operations.

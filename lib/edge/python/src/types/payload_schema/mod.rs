@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 pub mod text_index;
 
 use std::fmt;
@@ -208,13 +212,20 @@ pub struct PyKeywordIndexParams(KeywordIndexParams);
 #[pymethods]
 impl PyKeywordIndexParams {
     #[new]
-    #[pyo3(signature = (is_tenant = None, on_disk = None, enable_hnsw = None))]
-    pub fn new(is_tenant: Option<bool>, on_disk: Option<bool>, enable_hnsw: Option<bool>) -> Self {
+    #[pyo3(signature = (is_tenant = None, on_disk = None, enable_hnsw = None, prefix = None))]
+    pub fn new(
+        is_tenant: Option<bool>,
+        on_disk: Option<bool>,
+        enable_hnsw: Option<bool>,
+        prefix: Option<bool>,
+    ) -> Self {
         Self(KeywordIndexParams {
             r#type: Default::default(),
             is_tenant,
             on_disk,
+            memory: None,
             enable_hnsw,
+            prefix,
         })
     }
 
@@ -232,6 +243,11 @@ impl PyKeywordIndexParams {
     pub fn enable_hnsw(&self) -> Option<bool> {
         self.0.enable_hnsw
     }
+
+    #[getter]
+    pub fn prefix(&self) -> Option<bool> {
+        self.0.prefix
+    }
 }
 
 impl PyKeywordIndexParams {
@@ -241,7 +257,9 @@ impl PyKeywordIndexParams {
             r#type: _, // not relevant for Qdrant Edge
             is_tenant: _,
             on_disk: _,
+            memory: _,
             enable_hnsw: _,
+            prefix: _,
         } = self.0;
     }
 }
@@ -269,6 +287,7 @@ impl PyIntegerIndexParams {
             range,
             is_principal,
             on_disk,
+            memory: None,
             enable_hnsw,
         })
     }
@@ -308,6 +327,7 @@ impl PyIntegerIndexParams {
             range: _,
             is_principal: _,
             on_disk: _,
+            memory: _,
             enable_hnsw: _,
         } = self.0;
     }
@@ -332,6 +352,7 @@ impl PyFloatIndexParams {
             r#type: Default::default(),
             is_principal,
             on_disk,
+            memory: None,
             enable_hnsw,
         })
     }
@@ -359,6 +380,7 @@ impl PyFloatIndexParams {
             r#type: _, // not relevant for Qdrant Edge
             is_principal: _,
             on_disk: _,
+            memory: _,
             enable_hnsw: _,
         } = self.0;
     }
@@ -378,6 +400,7 @@ impl PyGeoIndexParams {
         Self(GeoIndexParams {
             r#type: Default::default(),
             on_disk,
+            memory: None,
             enable_hnsw,
         })
     }
@@ -399,6 +422,7 @@ impl PyGeoIndexParams {
         let GeoIndexParams {
             r#type: _, // not relevant for Qdrant Edge
             on_disk: _,
+            memory: _,
             enable_hnsw: _,
         } = self.0;
     }
@@ -418,6 +442,7 @@ impl PyBoolIndexParams {
         Self(BoolIndexParams {
             r#type: Default::default(),
             on_disk,
+            memory: None,
             enable_hnsw,
         })
     }
@@ -439,6 +464,7 @@ impl PyBoolIndexParams {
         let BoolIndexParams {
             r#type: _, // not relevant for Qdrant Edge
             on_disk: _,
+            memory: _,
             enable_hnsw: _,
         } = self.0;
     }
@@ -463,6 +489,7 @@ impl PyDatetimeIndexParams {
             r#type: Default::default(),
             is_principal,
             on_disk,
+            memory: None,
             enable_hnsw,
         })
     }
@@ -490,6 +517,7 @@ impl PyDatetimeIndexParams {
             r#type: _, // not relevant for Qdrant Edge
             is_principal: _,
             on_disk: _,
+            memory: _,
             enable_hnsw: _,
         } = self.0;
     }
@@ -510,6 +538,7 @@ impl PyUuidIndexParams {
             r#type: Default::default(),
             is_tenant,
             on_disk,
+            memory: None,
             enable_hnsw,
         })
     }
@@ -537,6 +566,7 @@ impl PyUuidIndexParams {
             r#type: _, // not relevant for Qdrant Edge
             is_tenant: _,
             on_disk: _,
+            memory: _,
             enable_hnsw: _,
         } = self.0;
     }

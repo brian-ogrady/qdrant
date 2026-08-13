@@ -9,9 +9,10 @@ use crate::common::BYTES_IN_KB;
 use crate::common::operation_error::OperationResult;
 use crate::id_tracker::IdTrackerEnum;
 use crate::index::hnsw_index::config::HnswGraphConfig;
-use crate::index::hnsw_index::graph_layers::{GraphLayers, LoadOption};
+use crate::index::hnsw_index::graph_layers::GraphLayers;
+use crate::index::hnsw_index::graph_links::GraphLinksResidency;
 use crate::index::struct_payload_index::StructPayloadIndex;
-use crate::types::HnswConfig;
+use crate::types::{HnswConfig, Memory};
 use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
 use crate::vector_storage::{VectorStorageEnum, VectorStorageRead};
 
@@ -19,9 +20,12 @@ mod build;
 #[cfg(feature = "gpu")]
 mod gpu_build;
 mod old_index;
-mod search;
+pub mod read_only;
+mod read_view;
 mod telemetry;
 mod vector_index_impl;
+
+use self::read_view::{HNSWIndexReadView, HNSWIndexReadViewEnum};
 
 const HNSW_USE_HEURISTIC: bool = true;
 const FINISH_MAIN_GRAPH_LOG_MESSAGE: &str = "Finish main graph in time";
@@ -69,7 +73,7 @@ impl HNSWIndex {
         } = args;
 
         let config_path = HnswGraphConfig::get_config_path(path);
-        let config = match HnswGraphConfig::load_via(&MmapFs, &config_path)? {
+        let config = match HnswGraphConfig::load_universal(&MmapFs, &config_path)? {
             Some(config) => config,
             None => {
                 let vector_storage = vector_storage.borrow();
@@ -98,15 +102,21 @@ impl HNSWIndex {
 
         let do_convert = LINK_COMPRESSION_CONVERT_EXISTING;
 
-        let is_on_disk = hnsw_config.on_disk.unwrap_or(false);
+        // Effective placement of the graph links: the `memory` parameter (falling back to the
+        // deprecated `on_disk` flag), degraded at load time by the node-wide low-memory mode.
+        let memory = hnsw_config.memory_placement().clamp_to_low_memory();
+        let is_on_disk = memory.is_on_disk();
 
-        let load_option = if is_on_disk {
-            LoadOption::on_disk_mmap()
-        } else {
-            LoadOption::ram_from_mmap()
+        let residency = match memory {
+            // Keep the links cold: lazily loaded from disk, cached with usage
+            Memory::Cold => GraphLinksResidency::Cold,
+            // Pre-populate the links into the page cache on load
+            Memory::Cached => GraphLinksResidency::Cached,
+            // Materialize the links on heap, so they are never evicted by cache pressure
+            Memory::Pinned => GraphLinksResidency::Pinned,
         };
 
-        let graph = GraphLayers::load(path, load_option, do_convert)?;
+        let graph = GraphLayers::load(path, residency, do_convert)?;
 
         Ok(HNSWIndex {
             id_tracker,
@@ -123,6 +133,15 @@ impl HNSWIndex {
 
     pub fn is_on_disk(&self) -> bool {
         self.is_on_disk
+    }
+
+    /// Heap RAM held by the graph links, in bytes.
+    ///
+    /// Non-zero when the links are materialized in RAM rather than backed by
+    /// a live mmap handle (freshly built index, or a non-borrowable universal-IO
+    /// backend); such links are invisible to page-cache residency probes.
+    pub fn links_heap_size_bytes(&self) -> usize {
+        self.graph.links_heap_size_bytes()
     }
 
     #[cfg(test)]
@@ -154,5 +173,25 @@ impl HNSWIndex {
         } = self;
         graph.clear_cache()?;
         Ok(())
+    }
+
+    pub fn with_view<R>(&self, f: impl FnOnce(HNSWIndexReadViewEnum<'_>) -> R) -> R {
+        let id_tracker = self.id_tracker.borrow();
+        let vector_storage = self.vector_storage.borrow();
+        let quantized_vectors = self.quantized_vectors.borrow();
+        let payload_index = self.payload_index.borrow();
+
+        payload_index.with_view(|payload_index_view| {
+            let read_view = HNSWIndexReadView {
+                id_tracker: &*id_tracker,
+                vector_storage: &*vector_storage,
+                quantized_vectors: quantized_vectors.as_ref(),
+                payload_index: payload_index_view,
+                config: &self.config,
+                graph: &self.graph,
+                searches_telemetry: &self.searches_telemetry,
+            };
+            f(read_view)
+        })
     }
 }

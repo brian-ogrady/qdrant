@@ -7,6 +7,7 @@ use common::bitvec::{BitSlice, BitSliceExt as _, BitVec, bitvec_set_deleted};
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::generic_consts::AccessPattern;
 use common::types::PointOffsetType;
+use common::universal_io::UserData;
 
 use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
@@ -17,7 +18,8 @@ use crate::types::{Distance, MultiVectorConfig, VectorStorageDatatype};
 use crate::vector_storage::common::CHUNK_SIZE;
 use crate::vector_storage::volatile_chunked_vectors::VolatileChunkedVectors;
 use crate::vector_storage::{
-    MultiVectorStorage, VectorOffsetType, VectorStorage, VectorStorageEnum, VectorStorageRead,
+    MultiVectorStorage, MultiVectorStorageRead, VectorOffsetType, VectorStorage, VectorStorageEnum,
+    VectorStorageRead, default_read_vector_bytes_impl,
 };
 
 /// All fields are counting vectors and not dimensions.
@@ -45,13 +47,22 @@ pub struct VolatileMultiDenseVectorStorage<T: PrimitiveVectorElement> {
 
 impl<T: fmt::Debug + PrimitiveVectorElement> fmt::Debug for VolatileMultiDenseVectorStorage<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            dim,
+            distance,
+            multi_vector_config,
+            vectors,
+            vectors_metadata,
+            deleted_count,
+            deleted: _,
+        } = self;
         f.debug_struct("VolatileMultiDenseVectorStorage")
-            .field("dim", &self.dim)
-            .field("distance", &self.distance)
-            .field("multi_vector_config", &self.multi_vector_config)
-            .field("vectors", &self.vectors)
-            .field("vectors_metadata", &self.vectors_metadata)
-            .field("deleted_count", &self.deleted_count)
+            .field("dim", dim)
+            .field("distance", distance)
+            .field("multi_vector_config", multi_vector_config)
+            .field("vectors", vectors)
+            .field("vectors_metadata", vectors_metadata)
+            .field("deleted_count", deleted_count)
             .finish_non_exhaustive()
     }
 }
@@ -129,11 +140,21 @@ impl<T: PrimitiveVectorElement> VolatileMultiDenseVectorStorage<T> {
         key: PointOffsetType,
         vector: VectorRef,
         is_deleted: bool,
-        _hw_counter: &HardwareCounterCell,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         let multi_vector: TypedMultiDenseVectorRef<VectorElementType> = vector.try_into()?;
         let multi_vector = T::from_float_multivector(CowMultiVector::Borrowed(multi_vector));
-        let multi_vector = multi_vector.as_vec_ref();
+        self.insert_multi_native(key, multi_vector.as_ref(), is_deleted, hw_counter)
+    }
+
+    /// Insert a multi-vector already in the storage's element type `T`.
+    fn insert_multi_native(
+        &mut self,
+        key: PointOffsetType,
+        multi_vector: TypedMultiDenseVectorRef<T>,
+        is_deleted: bool,
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         assert_eq!(multi_vector.dim, self.dim);
         let multivector_size_in_bytes = std::mem::size_of_val(multi_vector.flattened_vectors);
         if multivector_size_in_bytes >= CHUNK_SIZE {
@@ -186,7 +207,7 @@ impl<T: PrimitiveVectorElement> VolatileMultiDenseVectorStorage<T> {
     }
 }
 
-impl<T: PrimitiveVectorElement> MultiVectorStorage<T> for VolatileMultiDenseVectorStorage<T> {
+impl<T: PrimitiveVectorElement> MultiVectorStorageRead<T> for VolatileMultiDenseVectorStorage<T> {
     fn vector_dim(&self) -> usize {
         self.dim
     }
@@ -226,7 +247,31 @@ impl<T: PrimitiveVectorElement> MultiVectorStorage<T> for VolatileMultiDenseVect
     fn multi_vector_config(&self) -> &MultiVectorConfig {
         &self.multi_vector_config
     }
+}
 
+impl<T: PrimitiveVectorElement> MultiVectorStorage<T> for VolatileMultiDenseVectorStorage<T> {
+    fn update_from<'a>(
+        &mut self,
+        other_vectors: &mut impl Iterator<Item = (CowMultiVector<'a, T>, bool)>,
+        stopped: &AtomicBool,
+    ) -> OperationResult<Range<PointOffsetType>> {
+        let start_index = self.vectors_metadata.len() as PointOffsetType;
+        for (other_vector, other_deleted) in other_vectors {
+            check_process_stopped(stopped)?;
+            let new_id = self.vectors_metadata.len() as PointOffsetType;
+            self.insert_multi_native(
+                new_id,
+                other_vector.as_ref(),
+                other_deleted,
+                &HardwareCounterCell::disposable(), // This function is only used by internal operations
+            )?;
+        }
+        let end_index = self.vectors_metadata.len() as PointOffsetType;
+        Ok(start_index..end_index)
+    }
+}
+
+impl<T: PrimitiveVectorElement> VectorStorageRead for VolatileMultiDenseVectorStorage<T> {
     fn size_of_available_vectors_in_bytes(&self) -> usize {
         if self.total_vector_count() > 0 {
             let total_size = self.vectors.len() * self.vector_dim() * std::mem::size_of::<T>();
@@ -236,9 +281,7 @@ impl<T: PrimitiveVectorElement> MultiVectorStorage<T> for VolatileMultiDenseVect
             0
         }
     }
-}
 
-impl<T: PrimitiveVectorElement> VectorStorageRead for VolatileMultiDenseVectorStorage<T> {
     fn distance(&self) -> Distance {
         self.distance
     }
@@ -276,6 +319,14 @@ impl<T: PrimitiveVectorElement> VectorStorageRead for VolatileMultiDenseVectorSt
     fn deleted_vector_bitslice(&self) -> &BitSlice {
         self.deleted.as_bitslice()
     }
+
+    fn read_vector_bytes<P: AccessPattern, U: Copy + UserData>(
+        &self,
+        keys: impl IntoIterator<Item = (U, PointOffsetType)>,
+        callback: impl FnMut(U, PointOffsetType, Vec<u8>),
+    ) -> OperationResult<()> {
+        default_read_vector_bytes_impl::<Self, P, U>(self, keys, callback)
+    }
 }
 
 impl<T: PrimitiveVectorElement> VectorStorage for VolatileMultiDenseVectorStorage<T> {
@@ -286,28 +337,6 @@ impl<T: PrimitiveVectorElement> VectorStorage for VolatileMultiDenseVectorStorag
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         self.insert_vector_impl(key, vector, false, hw_counter)
-    }
-
-    fn update_from<'a>(
-        &mut self,
-        other_vectors: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
-        stopped: &AtomicBool,
-    ) -> OperationResult<Range<PointOffsetType>> {
-        let start_index = self.vectors_metadata.len() as PointOffsetType;
-        for (other_vector, other_deleted) in other_vectors {
-            check_process_stopped(stopped)?;
-            // Do not perform preprocessing - vectors should be already processed
-            let other_vector: VectorRef = other_vector.as_vec_ref();
-            let new_id = self.vectors_metadata.len() as PointOffsetType;
-            self.insert_vector_impl(
-                new_id,
-                other_vector,
-                other_deleted,
-                &HardwareCounterCell::disposable(), // This function is only used by internal operations
-            )?;
-        }
-        let end_index = self.vectors_metadata.len() as PointOffsetType;
-        Ok(start_index..end_index)
     }
 
     fn flusher(&self) -> Flusher {

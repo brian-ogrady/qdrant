@@ -1,16 +1,17 @@
 use std::path::{Path, PathBuf};
 
+use blobstore::Blob;
 use common::bitvec::BitSlice;
-use common::universal_io::UniversalRead;
-use gridstore::Blob;
+use common::universal_io::{CachedReadFs, Populate, UniversalRead, UniversalReadFs};
 
 use super::super::super::Encodable;
 use super::super::super::mutable_numeric_index::read_only::ReadOnlyAppendableNumericIndex;
 use super::ReadOnlyNumericIndexInner;
 use crate::common::operation_error::OperationResult;
-use crate::index::field_index::numeric_index::universal_numeric_index::UniversalNumericIndex;
+use crate::index::field_index::numeric_index::immutable_numeric_index::ImmutableNumericIndex;
+use crate::index::field_index::numeric_index::on_disk_numeric_index::OnDiskNumericIndex;
 use crate::index::field_index::numeric_point::Numericable;
-use crate::index::field_index::stored_point_to_values::StoredValue;
+use crate::index::field_index::on_disk_point_to_values::StoredValue;
 use crate::index::payload_config::IndexMutability;
 
 impl<T: Encodable + Numericable + StoredValue + Send + Sync + Default, S: UniversalRead>
@@ -18,6 +19,35 @@ impl<T: Encodable + Numericable + StoredValue + Send + Sync + Default, S: Univer
 where
     Vec<T>: Blob,
 {
+    /// Schedule background prefetch for the appendable (Gridstore) format.
+    ///
+    /// Returns `false` when nothing was scheduled (directory absent).
+    pub fn preopen_appendable(
+        fs: &impl CachedReadFs<File = S>,
+        dir: PathBuf,
+    ) -> OperationResult<bool> {
+        ReadOnlyAppendableNumericIndex::preopen(fs, dir)
+    }
+
+    /// Schedule background prefetch for the immutable (mmap) format.
+    ///
+    /// Returns `false` when the on-disk index doesn't exist.
+    pub fn preopen_immutable(
+        fs: &impl CachedReadFs<File = S>,
+        path: &Path,
+        is_on_disk: bool,
+    ) -> OperationResult<bool> {
+        let effective_is_on_disk =
+            is_on_disk || common::low_memory::low_memory_mode().prefer_disk();
+
+        let populate = match effective_is_on_disk {
+            true => Populate::No,
+            false => Populate::PreferBackground,
+        };
+
+        OnDiskNumericIndex::<T, S>::preopen(fs, path, populate)
+    }
+
     /// Read-only mirror of [`NumericIndexInner::new_gridstore`][1]: open the
     /// appendable (Gridstore-backed) numeric index read-only, threading every
     /// file open through the filesystem handle `fs`.
@@ -27,7 +57,10 @@ where
     /// uniformly. No `create_if_missing`: the read path never creates.
     ///
     /// [1]: super::super::NumericIndexInner::new_gridstore
-    pub fn open_appendable(fs: &S::Fs, dir: PathBuf) -> OperationResult<Option<Self>> {
+    pub fn open_appendable(
+        fs: &impl UniversalReadFs<File = S>,
+        dir: PathBuf,
+    ) -> OperationResult<Option<Self>> {
         Ok(ReadOnlyAppendableNumericIndex::open(fs, dir)?.map(Self::Appendable))
     }
 
@@ -45,7 +78,7 @@ where
     ///
     /// [1]: super::super::NumericIndexInner::new_mmap
     pub fn open_immutable(
-        fs: &S::Fs,
+        fs: &impl UniversalReadFs<File = S>,
         path: &Path,
         is_on_disk: bool,
         deleted_points: &BitSlice,
@@ -53,13 +86,18 @@ where
         let effective_is_on_disk =
             is_on_disk || common::low_memory::low_memory_mode().prefer_disk();
 
-        let Some(mmap_index) =
-            UniversalNumericIndex::open(fs, path, effective_is_on_disk, deleted_points)?
-        else {
+        let populate = Populate::from(!effective_is_on_disk);
+        let Some(mmap_index) = OnDiskNumericIndex::open(fs, path, populate, deleted_points)? else {
             return Ok(None);
         };
 
-        Ok(Some(Self::Immutable(mmap_index)))
+        let index = if effective_is_on_disk {
+            Self::OnDisk(mmap_index)
+        } else {
+            Self::Immutable(ImmutableNumericIndex::load_from_on_disk(mmap_index))
+        };
+
+        Ok(Some(index))
     }
 
     /// Reports the on-disk format's mutability, mirroring
@@ -80,6 +118,7 @@ where
         match self {
             Self::Appendable(_) => IndexMutability::Mutable,
             Self::Immutable(_) => IndexMutability::Immutable,
+            Self::OnDisk(_) => IndexMutability::Immutable,
         }
     }
 }

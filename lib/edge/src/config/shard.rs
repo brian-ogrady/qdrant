@@ -1,12 +1,13 @@
 //! Edge shard configuration: user-facing params and conversion to/from SegmentConfig.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use common::fs::{atomic_save_json, read_json};
 use segment::common::operation_error::{OperationError, OperationResult};
 use segment::types::{
-    HnswConfig, PayloadStorageType, QuantizationConfig, SegmentConfig, VectorNameBuf,
+    Distance, HnswConfig, PayloadStorageType, QuantizationConfig, SegmentConfig, VectorName,
+    VectorNameBuf,
 };
 use serde::{Deserialize, Serialize};
 use shard::operations::optimization::OptimizerThresholds;
@@ -19,56 +20,134 @@ use super::vectors::{EdgeSparseVectorParams, EdgeVectorParams};
 pub(crate) const EDGE_CONFIG_FILE: &str = "edge_config.json";
 
 /// Full configuration for an edge shard.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `vectors` and `sparse_vectors` define the stored data: when loading an existing shard they are
+/// validated for compatibility against the segments if provided (non-empty), or taken from the
+/// persisted config / the segments themselves if not.
+///
+/// Everything else is tunable and `None` means "not specified": when loading an existing shard
+/// each parameter resolves through provided → persisted → derived from segments → default (see
+/// [`EdgeConfig::fill_unspecified_from`]), so leaving a parameter unspecified keeps the shard as
+/// it is, while a `Some` value explicitly overwrites it and existing segments converge to it
+/// through the optimizers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct EdgeConfig {
     /// If true, payload is stored on disk (mmap); otherwise in RAM. Same as `CollectionParams::on_disk_payload`.
-    #[serde(default = "default_on_disk_payload")]
-    pub on_disk_payload: bool,
+    /// `None` defaults to on-disk, see [`EdgeConfig::on_disk_payload`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_disk_payload: Option<bool>,
     /// Dense vector params per vector name.
     #[serde(default)]
     pub vectors: HashMap<VectorNameBuf, EdgeVectorParams>,
     /// Sparse vector params per vector name.
     #[serde(default)]
     pub sparse_vectors: HashMap<VectorNameBuf, EdgeSparseVectorParams>,
-    /// Global HNSW config; per-vector override is in `vectors[].hnsw_config`
-    #[serde(default)]
-    pub hnsw_config: HnswConfig,
+    /// Global HNSW config; per-vector override is in `vectors[].hnsw_config`.
+    /// `None` defaults to [`HnswConfig::default`], see [`EdgeConfig::hnsw_config`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hnsw_config: Option<HnswConfig>,
     /// Global quantization config for all vectors
     /// Per-vector override in in `vectors[].quantization_config`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quantization_config: Option<QuantizationConfig>,
-    #[serde(default)]
-    pub optimizers: EdgeOptimizersConfig,
+    /// `None` defaults to [`EdgeOptimizersConfig::default`], see [`EdgeConfig::optimizers`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizers: Option<EdgeOptimizersConfig>,
     /// WAL options for the shard. `None` keeps the WAL crate's defaults
     /// (32 MiB segment capacity). Override for embedded/mobile deployments
     /// where the default segment size is too large.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wal_options: Option<WalOptions>,
-}
-
-fn default_on_disk_payload() -> bool {
-    true
-}
-
-impl Default for EdgeConfig {
-    fn default() -> Self {
-        Self {
-            on_disk_payload: default_on_disk_payload(),
-            vectors: HashMap::new(),
-            sparse_vectors: HashMap::new(),
-            hnsw_config: HnswConfig::default(),
-            quantization_config: None,
-            optimizers: EdgeOptimizersConfig::default(),
-            wal_options: None,
-        }
-    }
+    /// Number of threads in the shard's search thread pool. The pool executes per-segment reads
+    /// (search, scroll, count, facet, ...) in parallel and loads segments in parallel. `None` (the
+    /// default) derives the count from the number of CPUs, matching the core search runtime — see
+    /// [`EdgeConfig::search_thread_count`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_search_threads: Option<usize>,
+    /// Pin every thread of this shard's search pool to the given CPU core: bounds the shard's
+    /// search compute to one core while keeping the pool's IO overlap. Best-effort. `None` (the
+    /// default) leaves thread placement to the OS scheduler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_pool_core: Option<usize>,
 }
 
 impl EdgeConfig {
     /// Start building an [`EdgeConfig`] with a fluent API.
     pub fn builder() -> crate::builders::EdgeConfigBuilder {
         crate::builders::EdgeConfigBuilder::new()
+    }
+
+    /// Effective payload storage location: on-disk unless explicitly set to `false`.
+    pub fn on_disk_payload(&self) -> bool {
+        self.on_disk_payload.unwrap_or(true)
+    }
+
+    /// Effective global HNSW config: [`HnswConfig::default`] unless explicitly set.
+    pub fn hnsw_config(&self) -> HnswConfig {
+        self.hnsw_config.unwrap_or_default()
+    }
+
+    /// Effective optimizers config: [`EdgeOptimizersConfig::default`] unless explicitly set.
+    pub fn optimizers(&self) -> EdgeOptimizersConfig {
+        self.optimizers.clone().unwrap_or_default()
+    }
+
+    /// Fill parameters left unspecified from `base`, keeping explicitly provided values.
+    ///
+    /// Chained over the fallback layers of [`EdgeShard::load`](crate::EdgeShard::load):
+    /// provided → persisted → derived from segments → default.
+    ///
+    /// For tunables, unspecified means `None`. For `vectors` and `sparse_vectors` it means an
+    /// empty map: a non-empty map is taken as-is (never merged element-wise) — those define the
+    /// stored data, so the load path validates them against existing segments instead of
+    /// converging via the optimizers like the tunables do.
+    pub fn fill_unspecified_from(self, base: &EdgeConfig) -> Self {
+        let Self {
+            on_disk_payload,
+            vectors,
+            sparse_vectors,
+            hnsw_config,
+            quantization_config,
+            optimizers,
+            wal_options,
+            max_search_threads,
+            search_pool_core,
+        } = self;
+        Self {
+            on_disk_payload: on_disk_payload.or(base.on_disk_payload),
+            vectors: if vectors.is_empty() {
+                base.vectors.clone()
+            } else {
+                vectors
+            },
+            sparse_vectors: if sparse_vectors.is_empty() {
+                base.sparse_vectors.clone()
+            } else {
+                sparse_vectors
+            },
+            hnsw_config: hnsw_config.or(base.hnsw_config),
+            quantization_config: quantization_config.or_else(|| base.quantization_config.clone()),
+            optimizers: optimizers.or_else(|| base.optimizers.clone()),
+            wal_options: wal_options.or_else(|| base.wal_options.clone()),
+            max_search_threads: max_search_threads.or(base.max_search_threads),
+            search_pool_core: search_pool_core.or(base.search_pool_core),
+        }
+    }
+
+    /// Accumulate the config derived from one more segment into `acc`.
+    ///
+    /// Building block for the "derived from segments" layer of the config fallback chain: fold
+    /// this over *all* segments, so that a segment carrying no information about a parameter
+    /// (e.g. a plain appendable segment says nothing about HNSW) never masks one that does (an
+    /// indexed segment carries the actual build parameters). Fold in a deterministic segment
+    /// order: when segments disagree on a parameter, the first one providing it wins.
+    pub(crate) fn fold_from_segment_config(acc: Option<Self>, segment: &SegmentConfig) -> Self {
+        let derived = Self::from_segment_config(segment);
+        match acc {
+            Some(acc) => acc.fill_unspecified_from(&derived),
+            None => derived,
+        }
     }
 
     /// Build from existing segment config. Fills all parameters that can be inferred.
@@ -104,26 +183,32 @@ impl EdgeConfig {
                 segment::types::Indexes::Hnsw(h) => Some(*h),
             })
             .collect();
-        let hnsw_config = hnsw_configs
-            .first()
-            .and_then(|first| {
-                if hnsw_configs.iter().all(|h| h == first) {
-                    Some(*first)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
+        let hnsw_config = hnsw_configs.first().and_then(|first| {
+            if hnsw_configs.iter().all(|h| h == first) {
+                Some(*first)
+            } else {
+                None
+            }
+        });
 
         Self {
-            on_disk_payload,
+            on_disk_payload: Some(on_disk_payload),
             vectors,
             sparse_vectors,
             hnsw_config,
             quantization_config: None,
-            optimizers: EdgeOptimizersConfig::default(),
+            optimizers: None,
             wal_options: None,
+            max_search_threads: None,
+            search_pool_core: None,
         }
+    }
+
+    /// Resolve the configured [`max_search_threads`](Self::max_search_threads) into a concrete
+    /// thread count. `None` derives the count from the number of CPUs, matching the core search
+    /// runtime (`common::defaults::search_thread_count`).
+    pub fn search_thread_count(&self) -> usize {
+        common::defaults::search_thread_count(self.max_search_threads.unwrap_or(0))
     }
 
     /// Check compatibility with a segment config (e.g. loaded segment).
@@ -137,7 +222,7 @@ impl EdgeConfig {
     /// Segment config for creating appendable segments only.
     /// Does not contain any HNSW configuration (plain index only).
     pub fn plain_segment_config(&self) -> SegmentConfig {
-        let payload_storage_type = PayloadStorageType::from_on_disk_payload(self.on_disk_payload);
+        let payload_storage_type = PayloadStorageType::from_on_disk_payload(self.on_disk_payload());
         let vector_data = self
             .vectors
             .iter()
@@ -162,6 +247,18 @@ impl EdgeConfig {
         }
     }
 
+    /// All vector names (dense and sparse) currently present in this config.
+    ///
+    /// Must cover both kinds: a segment's `vector_data` holds dense and sparse vectors together,
+    /// so the optimizer merge consults this set for both.
+    pub fn vector_names(&self) -> HashSet<VectorNameBuf> {
+        self.vectors
+            .keys()
+            .chain(self.sparse_vectors.keys())
+            .cloned()
+            .collect()
+    }
+
     /// Build segment optimizer config from this config (for blocking optimizers).
     /// Use this instead of converting to SegmentConfig first.
     pub fn segment_optimizer_config(&self) -> shard::optimizers::config::SegmentOptimizerConfig {
@@ -173,6 +270,7 @@ impl EdgeConfig {
             payload_storage_type,
         } = self.plain_segment_config();
 
+        let hnsw_config = self.hnsw_config();
         let dense_vector = self
             .vectors
             .iter()
@@ -180,7 +278,7 @@ impl EdgeConfig {
                 (
                     name.clone(),
                     p.to_dense_vector_optimizer_config(
-                        &self.hnsw_config,
+                        &hnsw_config,
                         self.quantization_config.as_ref(),
                     ),
                 )
@@ -199,6 +297,7 @@ impl EdgeConfig {
             plain_sparse_vector_config,
             dense_vector,
             sparse_vector,
+            live_vector_names: None,
         }
     }
 
@@ -213,14 +312,24 @@ impl EdgeConfig {
             .map(|p| p.to_plain_vector_data_config(self.quantization_config.as_ref()))
     }
 
+    /// Distance of a named vector, mirroring `CollectionParams::get_distance`:
+    /// sparse vectors always score with `Dot`.
+    pub fn get_distance(&self, vector_name: &VectorName) -> OperationResult<Distance> {
+        if let Some(params) = self.vectors.get(vector_name) {
+            Ok(params.distance)
+        } else if self.sparse_vectors.contains_key(vector_name) {
+            Ok(Distance::Dot)
+        } else {
+            Err(OperationError::vector_name_not_exists(vector_name))
+        }
+    }
+
     pub fn optimizer_thresholds(&self, num_indexing_threads: usize) -> OptimizerThresholds {
-        let indexing_threshold_kb = self.optimizers.get_indexing_threshold_kb();
+        let optimizers = self.optimizers();
         OptimizerThresholds {
             memmap_threshold_kb: usize::MAX,
-            indexing_threshold_kb,
-            max_segment_size_kb: self
-                .optimizers
-                .get_max_segment_size_kb(num_indexing_threads),
+            indexing_threshold_kb: optimizers.get_indexing_threshold_kb(),
+            max_segment_size_kb: optimizers.get_max_segment_size_kb(num_indexing_threads),
             deferred_internal_id: None,
         }
     }
@@ -247,7 +356,7 @@ impl EdgeConfig {
     }
 
     pub fn set_hnsw_config(&mut self, hnsw_config: HnswConfig) {
-        self.hnsw_config = hnsw_config;
+        self.hnsw_config = Some(hnsw_config);
     }
 
     pub fn set_vector_hnsw_config(
@@ -265,6 +374,55 @@ impl EdgeConfig {
     }
 
     pub fn set_optimizers_config(&mut self, optimizers: EdgeOptimizersConfig) {
-        self.optimizers = optimizers;
+        self.optimizers = Some(optimizers);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use segment::types::{Distance, Indexes, VectorDataConfig, VectorStorageType};
+
+    use super::*;
+
+    fn segment_config(index: Indexes) -> SegmentConfig {
+        SegmentConfig {
+            vector_data: HashMap::from([(
+                "vec".to_string(),
+                VectorDataConfig {
+                    size: 4,
+                    distance: Distance::Dot,
+                    storage_type: VectorStorageType::ChunkedMmap,
+                    index,
+                    quantization_config: None,
+                    multivector_config: None,
+                    datatype: None,
+                },
+            )]),
+            sparse_vector_data: HashMap::new(),
+            payload_storage_type: PayloadStorageType::from_on_disk_payload(true),
+        }
+    }
+
+    /// A plain (appendable) segment carries no HNSW parameters; folding must not let it mask an
+    /// indexed segment's actual build parameters, regardless of segment order.
+    #[test]
+    fn fold_derives_hnsw_from_indexed_segment_regardless_of_order() {
+        let hnsw = HnswConfig {
+            m: 32,
+            ..HnswConfig::default()
+        };
+        let plain = segment_config(Indexes::Plain {});
+        let indexed = segment_config(Indexes::Hnsw(hnsw));
+
+        for segments in [[&plain, &indexed], [&indexed, &plain]] {
+            let derived = segments
+                .into_iter()
+                .fold(None, |acc, segment| {
+                    Some(EdgeConfig::fold_from_segment_config(acc, segment))
+                })
+                .unwrap();
+            assert_eq!(derived.hnsw_config, Some(hnsw));
+            assert!(derived.vectors.contains_key("vec"));
+        }
     }
 }

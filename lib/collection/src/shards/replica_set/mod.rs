@@ -125,6 +125,10 @@ pub struct ShardReplicaSet {
     /// Local clock set, used to tag new operations on this shard.
     clock_set: Mutex<ClockSet>,
     pub partial_snapshot_meta: PartialSnapshotMeta,
+    /// Serializes full snapshot recoveries of this shard.
+    ///
+    /// See [`ShardReplicaSet::take_snapshot_recovery_lock`].
+    snapshot_recovery_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub type AbortShardTransfer = Arc<dyn Fn(ShardTransfer, &str) + Send + Sync>;
@@ -224,6 +228,7 @@ impl ShardReplicaSet {
             write_ordering_lock: Mutex::new(()),
             clock_set: Default::default(),
             partial_snapshot_meta: PartialSnapshotMeta::default(),
+            snapshot_recovery_lock: Default::default(),
         })
     }
 
@@ -355,6 +360,7 @@ impl ShardReplicaSet {
             write_ordering_lock: Mutex::new(()),
             clock_set: Default::default(),
             partial_snapshot_meta: PartialSnapshotMeta::default(),
+            snapshot_recovery_lock: Default::default(),
         };
 
         // `active_remote_shards` includes `Active` and `ReshardingScaleDown` replicas!
@@ -371,6 +377,17 @@ impl ShardReplicaSet {
     pub async fn stop_gracefully(&self) {
         if let Some(local) = self.local.write().await.take() {
             local.stop_gracefully().await;
+        }
+    }
+
+    /// Synchronously flush every segment in the local shard. Test-only — `stop_gracefully`
+    /// signals the periodic flush worker to stop but never triggers a final flush, so
+    /// tests that need on-disk consistency without waiting for the periodic tick use this.
+    #[cfg(test)]
+    pub(crate) async fn force_flush_local_for_test(&self) {
+        use crate::shards::shard::Shard;
+        if let Some(Shard::Local(local)) = &*self.local.read().await {
+            local.full_flush();
         }
     }
 

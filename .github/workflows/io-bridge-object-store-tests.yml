@@ -13,6 +13,9 @@ on:
       - "lib/common/common/src/universal_io/**"
       - ".github/workflows/io-bridge-object-store-tests.yml"
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -30,7 +33,7 @@ jobs:
           RUSTFS_SECRET_KEY: ci-test-secret-not-for-prod
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Wait for rustfs to be ready
         run: |
@@ -56,6 +59,11 @@ jobs:
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          # Dedicated cache for this job would mostly sit idle and get evicted between runs.
+          # Instead, we reuse the integration-tests cache, which overlaps enough to speed this build up.
+          shared-key: integration-tests
+          save-if: "false"
 
       - name: Install Protoc
         uses: ./.github/actions/setup-protoc

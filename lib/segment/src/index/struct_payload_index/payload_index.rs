@@ -46,6 +46,13 @@ impl PayloadIndex for StructPayloadIndex {
         payload_schema: PayloadFieldSchema,
         field_index: Vec<FieldIndex>,
     ) -> OperationResult<()> {
+        // Contract: `field_index` data must already be durable when this is called —
+        // the config saved below is the durable commit marker the loader and WAL
+        // replay trust, and it must never list an index whose postings only exist in
+        // memory. Live builds persist in `Segment::build_field_index` (build phase,
+        // so no index I/O happens here under the segment write lock); the load-time
+        // rebuild persists in `load_from_db`; `SegmentBuilder` segments are exempt
+        // because they are not loadable until the builder flushes and promotes them.
         let index_types: Vec<_> = field_index
             .iter()
             .map(|i| i.get_full_index_type())
@@ -124,7 +131,7 @@ impl PayloadIndex for StructPayloadIndex {
             // existing files and reload the index in the new mode during
             // `build_index` instead of dropping and rebuilding from payload.
             SchemaTransition::OnlyOnDiskFlipped { .. }
-                if matches!(self.storage_type, StorageType::GridstoreNonAppendable) =>
+                if matches!(self.storage_type, StorageType::NonAppendable) =>
             {
                 Ok(false)
             }
@@ -227,19 +234,32 @@ impl PayloadIndex for StructPayloadIndex {
     fn flusher(&self) -> Flusher {
         // Most field indices have either 2 or 3 indices (including null), we also have an extra
         // payload storage flusher. Overallocate to save potential reallocations.
-        let mut flushers = Vec::with_capacity(self.field_indexes.len() * 3 + 1);
+        let mut field_flushers = Vec::with_capacity(self.field_indexes.len() * 3);
 
         for field_indexes in self.field_indexes.values() {
             for index in field_indexes {
-                flushers.push(index.flusher());
+                field_flushers.push(index.flusher());
             }
         }
-        flushers.push(self.payload.borrow().flusher());
+        let payload_flusher = self.payload.borrow().flusher();
 
         Box::new(move || {
-            for flusher in flushers {
-                flusher()?;
+            for flusher in field_flushers {
+                match flusher() {
+                    Ok(()) => {}
+                    // Cancelled = the index storage was dropped after flusher capture (e.g. a
+                    // concurrent DropIndex). Skip it but keep flushing: aborting would leave the
+                    // already-flushed indexes durably ahead of payload storage and point
+                    // versions, and WAL replay would re-derive filter-based operations through
+                    // that too-new index, silently skipping points (data loss). The drop itself
+                    // is a versioned operation that replay re-applies.
+                    Err(OperationError::Cancelled { description }) => {
+                        log::debug!("Skipping flush of dropped field index storage: {description}");
+                    }
+                    Err(err) => return Err(err),
+                }
             }
+            payload_flusher()?;
             Ok(())
         })
     }

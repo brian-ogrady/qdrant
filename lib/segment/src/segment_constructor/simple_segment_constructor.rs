@@ -45,6 +45,7 @@ pub fn build_simple_segment(
         None,
         true,
     )
+    .map(|(segment, _token)| segment)
 }
 
 pub fn build_simple_segment_with_payload_storage(
@@ -74,9 +75,12 @@ pub fn build_simple_segment_with_payload_storage(
         None,
         true,
     )
+    .map(|(segment, _token)| segment)
 }
 
-pub fn build_multivec_segment(
+/// Builds a new segment with plain index and two named dense vectors:
+/// [`VECTOR1_NAME`] with `dim1` and [`VECTOR2_NAME`] with `dim2`.
+pub fn build_segment_with_two_named_vecs(
     path: &Path,
     dim1: usize,
     dim2: usize,
@@ -118,6 +122,7 @@ pub fn build_multivec_segment(
         None,
         true,
     )
+    .map(|(segment, _token)| segment)
 }
 
 #[cfg(test)]
@@ -128,7 +133,7 @@ mod tests {
     use super::*;
     use crate::common::operation_error::OperationError;
     use crate::data_types::vectors::only_default_vector;
-    use crate::entry::entry_point::{ReadSegmentEntry as _, SegmentEntry as _};
+    use crate::entry::entry_point::{SegmentEntry as _, StorageSegmentEntry as _};
     use crate::payload_json;
 
     #[test]

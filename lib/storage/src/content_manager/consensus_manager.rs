@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::Display;
@@ -35,6 +36,7 @@ use crate::content_manager::consensus::consensus_wal::ConsensusOpWal;
 use crate::content_manager::consensus::entry_queue::EntryId;
 use crate::content_manager::consensus::operation_sender::OperationSender;
 use crate::content_manager::consensus::persistent::Persistent;
+use crate::quota::QuotaConfig;
 use crate::types::{
     ClusterInfo, ClusterStatus, ConsensusThreadStatus, MessageSendErrors, PeerAddressById,
     PeerInfo, PeerMetadataById, RaftInfo,
@@ -58,6 +60,9 @@ pub struct SnapshotData {
     pub metadata_by_id: PeerMetadataById,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub cluster_metadata: HashMap<String, serde_json::Value>,
+    /// `None` when the snapshot was taken by a peer that predates global quotas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_config: Option<QuotaConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -229,6 +234,8 @@ impl<C: CollectionContainer> ConsensusManager<C> {
     }
 
     pub fn recover_first_voter(&self) -> Result<(), StorageError> {
+        // `load_or_init` sets `first_voter` explicitly when reinitializing as first peer,
+        // so guard below short circuits and WAL is never read in that case
         if self.persistent.read().first_voter().is_none() {
             log::debug!("Recovering first voter peer...");
 
@@ -546,6 +553,10 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                 Ok(true)
             }
 
+            ConsensusOperations::SetQuotaConfig(config) => {
+                self.toc.set_quota_config(config).map(|()| true)
+            }
+
             ConsensusOperations::RequestSnapshot | ConsensusOperations::ReportSnapshot { .. } => {
                 unreachable!()
             }
@@ -573,9 +584,13 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             address_by_id,
             metadata_by_id,
             cluster_metadata,
+            quota_config,
         } = snapshot.get_data().try_into()?;
 
         self.toc.apply_collections_snapshot(collections_data)?;
+        if let Some(quota_config) = quota_config {
+            self.toc.set_quota_config(quota_config)?;
+        }
         self.persistent.write().update_from_snapshot(
             meta,
             address_by_id,
@@ -627,6 +642,9 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                     }
                     ConsensusOperations::UpdateClusterMetadata { key, value } => {
                         persistent.cluster_metadata.get(key) == Some(value)
+                    }
+                    ConsensusOperations::SetQuotaConfig(config) => {
+                        self.toc.quota_config() == *config
                     }
                     // Snapshot state can't be inspected to confirm these are satisfied — leave
                     // their awaiters pending so they fall back to the regular timeout path.
@@ -733,14 +751,14 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             let (sender, mut receiver) = broadcast::channel(1);
             let mut on_apply_lock = self.on_consensus_op_apply.lock();
             // check that the exact same operation is not already in-flight
-            match on_apply_lock.get(&operation) {
-                Some(existing_sender) => {
+            match on_apply_lock.entry(operation) {
+                Entry::Occupied(e) => {
                     // subscribe to existing sender for faster feedback
-                    receiver = existing_sender.subscribe()
+                    receiver = e.get().subscribe()
                 }
-                None => {
+                Entry::Vacant(e) => {
                     // insert new sender
-                    on_apply_lock.insert(operation, sender);
+                    e.insert(sender);
                 }
             };
             receivers.push(receiver);
@@ -882,6 +900,36 @@ impl<C: CollectionContainer> ConsensusManager<C> {
 
     pub fn clear_wal(&self) -> Result<(), StorageError> {
         self.wal.lock().clear()
+    }
+
+    /// Discard committed-but-unapplied Raft log entries inherited from a previous
+    /// cluster during first-peer consensus re-initialization (`--reinit`).
+    ///
+    /// `--reinit` resets this peer's `conf_state` to a single voter (itself) but
+    /// leaves the Raft log untouched. If this peer had been removed from consensus
+    /// before reinit, its log still holds a committed `RemoveNode(self)` conf-change
+    /// (and possibly other topology changes from the old cluster). Replaying those on
+    /// top of the reset single-voter config makes Raft abort with "removed all voters".
+    ///
+    /// Also drops pending WAL log entries that could re-trigger joint-consensus or auto leave
+    /// transitions if the node was killed mid transition.
+    ///
+    /// Drop that tail: physically truncate the WAL to the last applied index, pin
+    /// `commit` to it and clear the apply-progress queue, so a fresh single-node
+    /// leader has nothing stale left to re-commit and re-apply.
+    pub fn clear_unapplied_entries_on_reinit(&self) -> Result<(), StorageError> {
+        let last_applied = self.persistent.read().last_applied_entry().unwrap_or(0);
+
+        // Physically drop entries beyond the applied index
+        self.wal.lock().truncate_after(last_applied)?;
+
+        // Align persisted commit index and apply-progress queue with the truncated log
+        let mut persistent = self.persistent.write();
+        persistent.apply_state_update(|state| state.hard_state.commit = last_applied)?;
+        // Empty queue that still reports `last_applied` as the last applied entry
+        persistent.set_unapplied_entries(last_applied + 1, last_applied)?;
+
+        Ok(())
     }
 
     pub fn compact_wal(&self, min_entries_to_compact: u64) -> Result<bool, StorageError> {
@@ -1104,6 +1152,7 @@ impl<C: CollectionContainer> Storage for ConsensusManager<C> {
             address_by_id: persistent.peer_address_by_id(),
             metadata_by_id: persistent.peer_metadata_by_id(),
             cluster_metadata: persistent.cluster_metadata.clone(),
+            quota_config: Some(self.toc.quota_config()),
         };
 
         let raft_state = persistent.state();
@@ -1196,6 +1245,7 @@ pub fn raft_error_other(e: impl std::error::Error) -> raft::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::sync::{Arc, mpsc};
 
     use collection::shards::shard::PeerId;
@@ -1212,6 +1262,7 @@ mod tests {
     use crate::content_manager::consensus::entry_queue::EntryApplyProgressQueue;
     use crate::content_manager::consensus::operation_sender::OperationSender;
     use crate::content_manager::consensus::persistent::Persistent;
+    use crate::quota::QuotaConfig;
 
     #[test]
     fn update_is_applied() {
@@ -1347,6 +1398,17 @@ mod tests {
         }
 
         fn sync_local_state(&self) -> Result<(), crate::content_manager::errors::StorageError> {
+            Ok(())
+        }
+
+        fn quota_config(&self) -> QuotaConfig {
+            QuotaConfig::default()
+        }
+
+        fn set_quota_config(
+            &self,
+            _config: QuotaConfig,
+        ) -> Result<(), crate::content_manager::errors::StorageError> {
             Ok(())
         }
     }
@@ -1526,6 +1588,7 @@ mod tests {
             address_by_id,
             metadata_by_id: PeerMetadataById::new(),
             cluster_metadata: HashMap::new(),
+            quota_config: None,
         };
 
         let mut conf_state = ConfState::default();
@@ -1597,6 +1660,7 @@ mod tests {
             address_by_id,
             metadata_by_id: PeerMetadataById::new(),
             cluster_metadata: HashMap::new(),
+            quota_config: None,
         };
 
         let snapshot = Snapshot {
@@ -1610,11 +1674,9 @@ mod tests {
 
         consensus.apply_snapshot(&snapshot).unwrap().unwrap();
 
-        assert!(
-            matches!(
-                rx.try_recv(),
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty),
-            ),
+        assert_matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty),
             "awaiter must not be notified when snapshot does not satisfy the operation",
         );
         assert!(

@@ -7,8 +7,8 @@ use serde_json::Value;
 
 use crate::common::Flusher;
 use crate::common::operation_error::OperationResult;
+use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition};
-use crate::index::query_optimization::optimized_filter::ConditionCheckerFn;
 use crate::types::{FieldCondition, PayloadKeyType};
 
 /// Read-only operations available on every payload field index.
@@ -21,7 +21,11 @@ use crate::types::{FieldCondition, PayloadKeyType};
 /// `F: FieldIndexRead` consumers get these methods directly.
 pub trait PayloadFieldIndexRead {
     /// Return number of points with at least one value indexed in here
-    fn count_indexed_points(&self) -> usize;
+    ///
+    /// Fallible: an index whose backing data is materialized on demand (the
+    /// read-only bool index) has to read it to count. See
+    /// [`RoaringFlagsRead::get_bitmap`](crate::common::flags::roaring_flags::RoaringFlagsRead::get_bitmap).
+    fn count_indexed_points(&self) -> OperationResult<usize>;
 
     /// Get iterator over points fitting given `condition`
     /// Return `None` if condition does not match the index type
@@ -56,7 +60,7 @@ pub trait PayloadFieldIndexRead {
         &'a self,
         _condition: &FieldCondition,
         _hw_acc: HwMeasurementAcc,
-    ) -> Option<ConditionCheckerFn<'a>>;
+    ) -> OperationResult<Option<ConditionCheckerEnum<'a>>>;
 
     /// Index-aware check for conditions that need parameters held by
     /// the index (today: full-text tokenizers).

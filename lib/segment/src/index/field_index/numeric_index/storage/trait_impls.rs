@@ -13,26 +13,25 @@
 
 use std::path::PathBuf;
 
+use blobstore::Blob;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use gridstore::Blob;
 
 use super::super::numeric_index_read::NumericIndexRead;
-use super::super::{Encodable, StreamRange, query};
+use super::super::{Encodable, NumericIndexValue, StreamRange, query};
 use super::NumericIndexInner;
 use crate::common::Flusher;
 use crate::common::operation_error::OperationResult;
+use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::index::field_index::numeric_point::Numericable;
-use crate::index::field_index::stored_point_to_values::StoredValue;
+use crate::index::field_index::on_disk_point_to_values::StoredValue;
 use crate::index::field_index::{
     CardinalityEstimation, PayloadBlockCondition, PayloadFieldIndex, PayloadFieldIndexRead,
 };
-use crate::index::query_optimization::optimized_filter::ConditionCheckerFn;
 use crate::types::{FieldCondition, PayloadKeyType, RangeInterface};
 
-impl<T: Encodable + Numericable + StoredValue + Send + Sync + Default> PayloadFieldIndex
-    for NumericIndexInner<T>
+impl<T: NumericIndexValue> PayloadFieldIndex for NumericIndexInner<T>
 where
     Vec<T>: Blob,
 {
@@ -40,7 +39,7 @@ where
         match self {
             NumericIndexInner::Mutable(index) => index.wipe(),
             NumericIndexInner::Immutable(index) => index.wipe(),
-            NumericIndexInner::Mmap(index) => index.wipe(),
+            NumericIndexInner::OnDisk(index) => index.wipe(),
         }
     }
 
@@ -57,13 +56,12 @@ where
     }
 }
 
-impl<T: Encodable + Numericable + StoredValue + Send + Sync + Default> PayloadFieldIndexRead
-    for NumericIndexInner<T>
+impl<T: NumericIndexValue> PayloadFieldIndexRead for NumericIndexInner<T>
 where
     Vec<T>: Blob,
 {
-    fn count_indexed_points(&self) -> usize {
-        self.get_points_count()
+    fn count_indexed_points(&self) -> OperationResult<usize> {
+        Ok(self.get_points_count())
     }
 
     fn filter<'a>(
@@ -95,8 +93,8 @@ where
         &'a self,
         condition: &FieldCondition,
         hw_acc: HwMeasurementAcc,
-    ) -> Option<ConditionCheckerFn<'a>> {
-        query::condition_checker(self, condition, hw_acc)
+    ) -> OperationResult<Option<ConditionCheckerEnum<'a>>> {
+        Ok(query::condition_checker(self, condition, hw_acc).map(T::condition_checker_writable))
     }
 }
 

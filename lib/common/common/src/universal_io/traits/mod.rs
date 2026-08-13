@@ -1,14 +1,18 @@
+mod append;
 mod file_ops;
 mod open_extra;
 mod pipeline;
 mod read;
 mod write;
 
-pub use file_ops::{UniversalReadFileOps, UniversalReadFs};
+use std::fmt;
+
+pub use append::UniversalAppend;
+pub use file_ops::{CachedReadFs, UniversalReadFileOps, UniversalReadFs, UniversalWriteFileOps};
 pub use open_extra::OpenExtra;
-pub use pipeline::{BorrowedReadPipeline, OwnedReadPipeline};
+pub use pipeline::{OwnedPipeline, ReadPipeline};
 pub use read::UniversalRead;
-pub use write::UniversalWrite;
+pub use write::{UniversalFlush, UniversalWrite};
 
 /// An arbitrary value to distinguish requests.
 ///
@@ -20,8 +24,8 @@ pub use write::UniversalWrite;
 /// `u64`.
 ///
 /// This trait exists for documentation/code navigation purposes only.
-pub trait UserData {}
-impl<T> UserData for T {}
+pub trait UserData: fmt::Debug {}
+impl<T: fmt::Debug> UserData for T {}
 
 /// Element type read from or written to a universal I/O storage.
 ///

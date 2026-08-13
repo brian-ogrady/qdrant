@@ -1,13 +1,14 @@
 use std::path::PathBuf;
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::AccessPattern;
 use common::types::PointOffsetType;
 use serde_json::Value;
 
 use crate::common::Flusher;
 use crate::common::operation_error::OperationResult;
 use crate::json_path::JsonPath;
-use crate::types::{Filter, OwnedPayloadRef, Payload};
+use crate::types::{IoBackend, OwnedPayloadRef, Payload};
 
 /// Read-only trait for payload data storage.
 ///
@@ -41,6 +42,13 @@ pub trait PayloadStorageRead {
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<OwnedPayloadRef<'_>>;
 
+    fn read_payloads<P: AccessPattern, U: common::universal_io::UserData>(
+        &self,
+        point_offsets: impl Iterator<Item = (U, PointOffsetType)>,
+        callback: impl FnMut(U, Payload) -> OperationResult<()>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()>;
+
     /// Iterate over all stored payload and apply the provided callback.
     /// Stop iteration if callback returns false or error.
     ///
@@ -54,6 +62,12 @@ pub trait PayloadStorageRead {
 
     /// Whether this storage is on-disk or in-memory.
     fn is_on_disk(&self) -> bool;
+
+    /// Backend this storage reads through, `None` when it can only be opened on one. Surfaced
+    /// as `payload_storage_io_backend` in [`SegmentInfo`](crate::types::SegmentInfo).
+    fn io_backend(&self) -> Option<IoBackend> {
+        None
+    }
 }
 
 /// Trait for payload data storage with mutating operations. Should allow filter checks
@@ -114,16 +128,3 @@ pub trait PayloadStorage: PayloadStorageRead {
         Vec::new()
     }
 }
-
-pub trait ConditionChecker {
-    /// Check if point satisfies filter condition. Return true if satisfies
-    fn check(&self, point_id: PointOffsetType, query: &Filter) -> bool;
-}
-
-pub trait FilterContext {
-    /// Check if point satisfies filter condition. Return true if satisfies
-    fn check(&self, point_id: PointOffsetType) -> bool;
-}
-
-pub type PayloadStorageSS = dyn PayloadStorage + Sync + Send;
-pub type ConditionCheckerSS = dyn ConditionChecker + Sync + Send;

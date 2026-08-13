@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::cmp::{max, min};
-use std::io::Write;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -10,6 +9,7 @@ use common::bitvec::BitSliceExt;
 use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
 use common::fs::{atomic_save, atomic_save_bin};
 use common::types::{PointOffsetType, ScoredPointOffset};
+use common::universal_io::MmapFs;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use rand::distr::Uniform;
 use rand::{Rng, RngExt};
@@ -23,7 +23,7 @@ use crate::index::hnsw_index::entry_points::EntryPoints;
 #[cfg(test)]
 use crate::index::hnsw_index::graph_layers::SearchAlgorithm;
 use crate::index::hnsw_index::graph_layers::{GraphLayers, GraphLayersBase};
-use crate::index::hnsw_index::graph_links::serialize_graph_links;
+use crate::index::hnsw_index::graph_links::{GraphLinksResidency, serialize_graph_links};
 use crate::index::hnsw_index::point_scorer::FilteredScorer;
 use crate::index::visited_pool::{VisitedListHandle, VisitedPool};
 
@@ -219,18 +219,21 @@ impl GraphLayersBuilder {
         let links_path = GraphLayers::get_links_path(path, format_param.as_format());
 
         let edges = Self::links_layers_to_edges(self.links_layers);
-        let links;
-        if on_disk {
-            // Save memory by serializing directly to disk, then re-loading as mmap.
-            atomic_save(&links_path, |writer| {
-                serialize_graph_links(edges, format_param, self.hnsw_m, writer)
-            })?;
-            links = GraphLinks::load_from_mmap(&links_path, format_param.as_format())?;
+        // Save memory by serializing directly to disk, then re-loading as mmap.
+        atomic_save(&links_path, |writer| {
+            serialize_graph_links(edges, format_param, self.hnsw_m, writer)
+        })?;
+        // Keep the links cold (lazily on disk) when configured so; otherwise
+        // pre-populate the page cache (cheap: the pages were just written).
+        // Never pin the links in heap here, so that the just-built index has
+        // the same, single-copy residency as one loaded from disk.
+        let residency = if on_disk {
+            GraphLinksResidency::Cold
         } else {
-            // Since we'll keep it in the RAM anyway, we can afford to build in the RAM too.
-            links = GraphLinks::new_from_edges(edges, format_param, self.hnsw_m)?;
-            atomic_save(&links_path, |writer| writer.write_all(links.as_bytes()))?;
-        }
+            GraphLinksResidency::Cached
+        };
+        let links =
+            GraphLinks::load_universal(&MmapFs, &links_path, format_param.as_format(), residency)?;
 
         let entry_points = self.entry_points.into_inner();
 
@@ -603,7 +606,7 @@ mod tests {
     use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
     use itertools::Itertools;
     use rand::SeedableRng;
-    use rand::prelude::StdRng;
+    use rand::prelude::SmallRng;
     use rstest::rstest;
 
     use super::*;
@@ -713,7 +716,7 @@ mod tests {
         let num_vectors = 1000;
         let dim = 8;
 
-        let mut rng = StdRng::seed_from_u64(42);
+        let mut rng = SmallRng::seed_from_u64(42);
 
         // let (vector_holder, graph_layers_builder) =
         //     create_graph_layer::<M, _>(num_vectors, dim, false, &mut rng);
@@ -794,8 +797,8 @@ mod tests {
         let num_vectors = 1000;
         let dim = 8;
 
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut rng2 = StdRng::seed_from_u64(42);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let mut rng2 = SmallRng::seed_from_u64(42);
 
         let (vector_holder, graph_layers_builder) = create_graph_layer(
             num_vectors,
@@ -908,7 +911,7 @@ mod tests {
         const EF_CONSTRUCT: usize = 64;
         const USE_HEURISTIC: bool = true;
 
-        let mut rng = StdRng::seed_from_u64(42);
+        let mut rng = SmallRng::seed_from_u64(42);
 
         let vector_holder = TestRawScorerProducer::new(
             DIM,
@@ -966,7 +969,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         const DIM: usize = 4;
-        let mut rng = StdRng::seed_from_u64(42);
+        let mut rng = SmallRng::seed_from_u64(42);
 
         // Build a one-point graph the normal way. `link_new_point` sees an
         // empty entry-points list, takes the "new empty entry" branch, and

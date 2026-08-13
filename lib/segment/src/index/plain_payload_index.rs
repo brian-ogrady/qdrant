@@ -5,7 +5,9 @@ use std::sync::atomic::AtomicBool;
 
 use ahash::AHashMap;
 use atomic_refcell::AtomicRefCell;
+use common::condition_checker::{CheckItem, ConditionChecker, Rest, Select, default_check_batched};
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::AccessPattern;
 use common::iterator_ext::IteratorExt;
 use common::types::{DeferredBehavior, PointOffsetType, ScoreType};
 use fs_err as fs;
@@ -16,15 +18,17 @@ use super::payload_config::PayloadFieldSchemaWithIndexType;
 use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::id_tracker::{IdTrackerEnum, IdTrackerRead};
+use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::index::field_index::facet_index::FacetIndexEnum;
 use crate::index::field_index::numeric_index::{NumericFieldIndex, NumericFieldIndexRead};
 use crate::index::field_index::{CardinalityEstimation, FacetIndex, PayloadBlockCondition};
 use crate::index::payload_config::PayloadConfig;
+use crate::index::query_optimization::optimized_filter::OptimizedFilter;
 use crate::index::query_optimization::rescore_formula::FormulaScorer;
 use crate::index::query_optimization::rescore_formula::parsed_formula::ParsedFormula;
 use crate::index::{BuildIndexResult, PayloadIndex, PayloadIndexRead};
 use crate::json_path::JsonPath;
-use crate::payload_storage::{ConditionCheckerSS, FilterContext};
+use crate::payload_storage::query_checker::SimpleConditionChecker;
 use crate::telemetry::PayloadIndexTelemetry;
 use crate::types::{Filter, Payload, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef};
 
@@ -33,7 +37,7 @@ use crate::types::{Filter, Payload, PayloadFieldSchema, PayloadKeyType, PayloadK
 /// Used for small segments, which are easier to keep simple for faster updates,
 /// rather than spend time for index re-building
 pub struct PlainPayloadIndex {
-    condition_checker: Arc<ConditionCheckerSS>,
+    condition_checker: Arc<SimpleConditionChecker>,
     id_tracker: Arc<AtomicRefCell<IdTrackerEnum>>,
     config: PayloadConfig,
     path: PathBuf,
@@ -50,7 +54,7 @@ impl PlainPayloadIndex {
     }
 
     pub fn open(
-        condition_checker: Arc<ConditionCheckerSS>,
+        condition_checker: Arc<SimpleConditionChecker>,
         id_tracker: Arc<AtomicRefCell<IdTrackerEnum>>,
         path: &Path,
     ) -> OperationResult<Self> {
@@ -116,25 +120,27 @@ impl PayloadIndexRead for PlainPayloadIndex {
         let id_tracker = self.id_tracker.borrow();
         let point_mappings = id_tracker.point_mappings();
         let all_points_iter = point_mappings.iter_internal_visible();
-        Ok(all_points_iter
+        all_points_iter
             .stop_if(is_stopped)
-            .filter(|id| filter_context.check(*id))
-            .collect())
+            .try_filter(|id| filter_context.check(*id))
+            .collect()
     }
 
-    fn indexed_points(&self, _field: PayloadKeyTypeRef) -> usize {
-        0 // No points are indexed in the plain index
+    fn indexed_points(&self, _field: PayloadKeyTypeRef) -> OperationResult<usize> {
+        Ok(0) // No points are indexed in the plain index
     }
 
     fn filter_context<'a>(
         &'a self,
         filter: &'a Filter,
         _: &HardwareCounterCell,
-    ) -> OperationResult<Box<dyn FilterContext + 'a>> {
-        Ok(Box::new(PlainFilterContext {
-            filter,
-            condition_checker: self.condition_checker.clone(),
-        }))
+    ) -> OperationResult<OptimizedFilter<'a>> {
+        Ok(OptimizedFilter::from_checker(ConditionCheckerEnum::Plain(
+            PlainFilterContext {
+                filter,
+                condition_checker: self.condition_checker.clone(),
+            },
+        )))
     }
 
     fn for_each_payload_block(
@@ -163,6 +169,15 @@ impl PayloadIndexRead for PlainPayloadIndex {
         unreachable!()
     }
 
+    fn read_payloads<P: AccessPattern, U: common::universal_io::UserData>(
+        &self,
+        _point_ids: impl Iterator<Item = (U, PointOffsetType)>,
+        _callback: impl FnMut(U, Payload) -> OperationResult<()>,
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        unimplemented!()
+    }
+
     fn numeric_index_for(&self, _key: &PayloadKeyType) -> Option<impl NumericFieldIndexRead + '_> {
         // Plain index has no field indexes; the type tag is just a placeholder.
         None::<NumericFieldIndex<'_>>
@@ -173,9 +188,9 @@ impl PayloadIndexRead for PlainPayloadIndex {
         None::<FacetIndexEnum<'_>>
     }
 
-    fn get_telemetry_data(&self) -> Vec<PayloadIndexTelemetry> {
+    fn get_telemetry_data(&self) -> OperationResult<Vec<PayloadIndexTelemetry>> {
         // Plain index has no field indexes to report telemetry for.
-        Vec::new()
+        Ok(Vec::new())
     }
 
     fn formula_scorer<'q>(
@@ -206,8 +221,8 @@ impl PayloadIndexRead for PlainPayloadIndex {
             .point_mappings()
             .iter_internal_with_behavior(deferred_behavior)
             .stop_if(is_stopped)
-            .filter(|id| filter_context.check(*id))
-            .collect();
+            .try_filter(|id| filter_context.check(*id))
+            .collect::<OperationResult<_>>()?;
         Ok(matched.into_iter())
     }
 }
@@ -320,12 +335,21 @@ impl PayloadIndex for PlainPayloadIndex {
 }
 
 pub struct PlainFilterContext<'a> {
-    condition_checker: Arc<ConditionCheckerSS>,
+    condition_checker: Arc<SimpleConditionChecker>,
     filter: &'a Filter,
 }
 
-impl FilterContext for PlainFilterContext<'_> {
-    fn check(&self, point_id: PointOffsetType) -> bool {
-        self.condition_checker.check(point_id, self.filter)
+impl ConditionChecker for PlainFilterContext<'_> {
+    type Error = OperationError;
+
+    fn check(&self, point_id: PointOffsetType) -> OperationResult<bool> {
+        Ok(self.condition_checker.check(point_id, self.filter))
+    }
+
+    fn check_batched<K>(&self, ids: &mut [K], select: Select, rest: Rest) -> OperationResult<usize>
+    where
+        K: CheckItem,
+    {
+        default_check_batched(ids, select, rest, |id| self.check(id))
     }
 }

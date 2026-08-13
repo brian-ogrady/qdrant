@@ -7,7 +7,7 @@ use common::storage_version::StorageVersion;
 use common::types::PointOffsetType;
 use parking_lot::{RwLockUpgradableReadGuard, RwLockWriteGuard};
 use segment::common::operation_error::OperationResult;
-use segment::entry::ReadSegmentEntry as _;
+use segment::entry::StorageSegmentEntry as _;
 use segment::segment::SegmentVersion;
 use segment::types::SegmentConfig;
 
@@ -48,7 +48,7 @@ impl SegmentHolder {
         let hw_counter = HardwareCounterCell::disposable();
 
         // Create temporary appendable segment to direct all proxy writes into
-        let tmp_segment = segments_lock.build_tmp_segment(
+        let (tmp_segment, tmp_token) = segments_lock.build_tmp_segment(
             segments_path,
             segment_config,
             payload_index_schema,
@@ -75,6 +75,9 @@ impl SegmentHolder {
         // If this ends up not being saved due to a crash, the segment will not be used
         match &tmp_segment {
             LockedSegment::Original(segment) => {
+                // Register the temp segment before saving its version, so it exists in the manifest
+                // before it can receive proxied writes.
+                segments_lock.sync_segment_manifest(Some(tmp_token))?;
                 let segment_path = &segment.read().segment_path;
                 SegmentVersion::save(segment_path)?;
             }

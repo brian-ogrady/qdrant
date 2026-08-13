@@ -9,11 +9,11 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use ordered_float::OrderedFloat;
-use rand::prelude::StdRng;
+use rand::prelude::SmallRng;
 use rand::{Rng, RngExt, SeedableRng};
 use segment::fixtures::payload_context_fixture::create_id_tracker_fixture;
 use segment::fixtures::payload_fixtures::{FLT_KEY, INT_KEY};
-use segment::index::struct_payload_index::StructPayloadIndex;
+use segment::index::struct_payload_index::{IndexLoadMode, StorageType, StructPayloadIndex};
 use segment::index::{PayloadIndex, PayloadIndexRead};
 use segment::payload_json;
 use segment::payload_storage::PayloadStorage;
@@ -43,7 +43,7 @@ fn range_filtering(c: &mut Criterion) {
 
     let seed = 42;
 
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = SmallRng::seed_from_u64(seed);
 
     let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
 
@@ -70,8 +70,8 @@ fn range_filtering(c: &mut Criterion) {
         id_tracker.clone(),
         std::collections::HashMap::new(),
         dir.path(),
-        true,
-        true,
+        StorageType::Appendable,
+        IndexLoadMode::CreateIfMissing,
     )
     .unwrap();
 
@@ -95,11 +95,15 @@ fn range_filtering(c: &mut Criterion) {
 
     // make sure all points are indexed
     assert_eq!(
-        index.with_view(|v| v.indexed_points(&FLT_KEY.parse().unwrap())),
+        index
+            .with_view(|v| v.indexed_points(&FLT_KEY.parse().unwrap()))
+            .unwrap(),
         NUM_POINTS,
     );
     assert_eq!(
-        index.with_view(|v| v.indexed_points(&INT_KEY.parse().unwrap())),
+        index
+            .with_view(|v| v.indexed_points(&INT_KEY.parse().unwrap()))
+            .unwrap(),
         NUM_POINTS,
     );
 
@@ -144,8 +148,8 @@ fn range_filtering(c: &mut Criterion) {
         id_tracker,
         std::collections::HashMap::new(),
         dir.path(),
-        false,
-        true,
+        StorageType::NonAppendable,
+        IndexLoadMode::CreateIfMissing,
     )
     .unwrap();
 

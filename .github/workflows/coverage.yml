@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: "0 0 * * *" # Every day at midnight UTC
 
+permissions:
+  contents: read
+
 env:
   UV_VERSION: 0.9.17
 
@@ -16,12 +19,11 @@ jobs:
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           components: llvm-tools-preview
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # If scheduled by cron, run for dev branch, Otherwise specified branch (for workflow dispatch & push)
           ref: ${{ github.event_name == 'schedule' && 'dev' || github.ref_name }}
           fetch-depth: 0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install Protoc
         uses: ./.github/actions/setup-protoc
       - name: Install nextest
@@ -44,12 +46,11 @@ jobs:
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           components: llvm-tools-preview
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # If scheduled by cron, run for dev branch, Otherwise specified branch (for workflow dispatch & push)
           ref: ${{ github.event_name == 'schedule' && 'dev' || github.ref_name }}
           fetch-depth: 0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install Protoc
         uses: ./.github/actions/setup-protoc
       - name: Install nextest
@@ -58,7 +59,7 @@ jobs:
         run: cargo install cargo-llvm-cov && sudo apt install -y lcov
       - name: Install dependencies
         run: sudo apt-get install clang
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
       - name: Install uv and Python dependencies
@@ -80,7 +81,7 @@ jobs:
     needs: [unit-coverage, integration-coverage]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # If scheduled by cron, run for dev branch, Otherwise specified branch (for workflow dispatch & push)
           ref: ${{ github.event_name == 'schedule' && 'dev' || github.ref_name }}
@@ -98,7 +99,7 @@ jobs:
       - name: Merge coverage reports
         run: lcov -a unit-test-coverage.lcov -a integration-test-coverage.lcov -o merged.lcov
       - name: Upload coverage data to Codecov
-        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: merged.lcov
           override_branch: ${{ github.event_name == 'schedule' && 'dev' || github.ref_name }}

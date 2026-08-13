@@ -7,8 +7,10 @@ pub mod staging;
 pub mod vector_name_ops;
 pub mod vector_ops;
 
+use std::collections::HashSet;
+
 use segment::json_path::JsonPath;
-use segment::types::{PayloadFieldSchema, PointIdType};
+use segment::types::{PayloadFieldSchema, PointIdType, VectorNameBuf};
 use serde::{Deserialize, Serialize};
 use strum::{EnumDiscriminants, EnumIter};
 
@@ -59,6 +61,53 @@ impl CollectionUpdateOperations {
         }
     }
 
+    /// Whether applying this operation grows what the node holds, which is what
+    /// [`crate::quota`] caps.
+    ///
+    /// Only deleting whole points is excluded, and it has to be: it is the one
+    /// way out of a node that has hit its limit. Deleting a vector or a payload
+    /// key is not — copy-on-write rewrites the point to drop a field, so it
+    /// grows storage before anything is reclaimed.
+    ///
+    /// Shard-transfer syncs are excluded as well: a transfer is sized up once
+    /// before it starts, and refusing its batches partway would abandon work
+    /// that is nearly done, only for the whole transfer to be retried from the
+    /// beginning.
+    pub fn consumes_quota(&self) -> bool {
+        match self {
+            Self::PointOperation(op) => match op {
+                PointOperations::UpsertPoints(_)
+                | PointOperations::UpsertPointsConditional(_)
+                | PointOperations::UpsertPointsRaw(_) => true,
+                PointOperations::DeletePoints { .. } | PointOperations::DeletePointsByFilter(_) => {
+                    false
+                }
+                PointOperations::SyncPoints(_) | PointOperations::SyncPointsRaw(_) => false,
+            },
+            Self::VectorOperation(op) => match op {
+                vector_ops::VectorOperations::UpdateVectors(_) => true,
+                // With CoW all modifications to points create more load.
+                vector_ops::VectorOperations::DeleteVectors(..)
+                | vector_ops::VectorOperations::DeleteVectorsByFilter(..) => true,
+            },
+            Self::PayloadOperation(op) => match op {
+                payload_ops::PayloadOps::SetPayload(_)
+                | payload_ops::PayloadOps::OverwritePayload(_) => true,
+                // With CoW all modifications to points create more load.
+                payload_ops::PayloadOps::DeletePayload(_)
+                | payload_ops::PayloadOps::ClearPayload { .. }
+                | payload_ops::PayloadOps::ClearPayloadByFilter(_) => true,
+            },
+            // Both arrive already committed through consensus, on a path that
+            // does not go past a quota check — they are gated before the
+            // proposal instead, so that a peer cannot refuse what the cluster
+            // has already agreed to.
+            Self::FieldIndexOperation(_) | Self::VectorNameOperation(_) => false,
+            #[cfg(feature = "staging")]
+            Self::StagingOperation(_) => false,
+        }
+    }
+
     /// List point IDs that can be created during the operation.
     /// Do not list IDs that are deleted or modified.
     pub fn upsert_point_ids(&self) -> Option<Vec<PointIdType>> {
@@ -69,6 +118,12 @@ impl CollectionUpdateOperations {
                 PointOperations::DeletePoints { .. } => None,
                 PointOperations::DeletePointsByFilter(_) => None,
                 PointOperations::SyncPoints(op) => {
+                    Some(op.points.iter().map(|point| point.id).collect())
+                }
+                PointOperations::UpsertPointsRaw(points) => {
+                    Some(points.iter().map(|point| point.id).collect())
+                }
+                PointOperations::SyncPointsRaw(op) => {
                     Some(op.points.iter().map(|point| point.id).collect())
                 }
             },
@@ -93,6 +148,55 @@ impl CollectionUpdateOperations {
             Self::VectorNameOperation(_) => (),
             #[cfg(feature = "staging")]
             Self::StagingOperation(_) => (),
+        }
+    }
+
+    /// Drop named-vector references to vector names not in `valid`.
+    ///
+    /// Used during WAL replay: a historical operation may reference a vector name that was
+    /// since removed by `delete_named_vector`. Without this, such an operation fails segment
+    /// validation (`VectorNameNotExists`) and is dropped wholesale on reload, taking its
+    /// points with it. Stripping the dead names lets the rest of the operation apply, matching
+    /// the live outcome (the point survives, just without the deleted vector).
+    ///
+    /// This does not touch `VectorNameOperation` responsible for creating/deleting a named vector.
+    ///
+    /// Only affects the named-vector variants; the default (unnamed) vector is left untouched.
+    ///
+    /// Note: this is best-effort. Stripping a vector from an early operation silently changes the
+    /// behavior of a later operation that depended on it (e.g. a `has_vector` filter or
+    /// `UpdateVectors`), so the replayed timeline can still diverge from the live one. Tracked in
+    /// <https://github.com/qdrant/qdrant/issues/9386>.
+    pub fn retain_vector_names(&mut self, valid: &HashSet<VectorNameBuf>) {
+        match self {
+            Self::PointOperation(op) => op.retain_vector_names(valid),
+            Self::VectorOperation(op) => op.retain_vector_names(valid),
+            Self::PayloadOperation(_) => (),
+            Self::FieldIndexOperation(_) => (),
+            Self::VectorNameOperation(_) => (),
+            #[cfg(feature = "staging")]
+            Self::StagingOperation(_) => (),
+        }
+    }
+
+    /// If this operation creates a named vector, return the name it introduces.
+    ///
+    /// Used during WAL replay to grow the set of valid vector names: a historical
+    /// `CreateVectorName` must make its name valid for the operations that follow it in
+    /// the WAL, otherwise a later upsert referencing it would be wrongly stripped by
+    /// [`Self::retain_vector_names`].
+    pub fn created_vector_name(&self) -> Option<&VectorNameBuf> {
+        match self {
+            Self::VectorNameOperation(VectorNameOperations::CreateVectorName(op)) => {
+                Some(&op.vector_name)
+            }
+            Self::VectorNameOperation(VectorNameOperations::DeleteVectorName(_))
+            | Self::PointOperation(_)
+            | Self::VectorOperation(_)
+            | Self::PayloadOperation(_)
+            | Self::FieldIndexOperation(_) => None,
+            #[cfg(feature = "staging")]
+            Self::StagingOperation(_) => None,
         }
     }
 }
@@ -328,11 +432,28 @@ mod tests {
                 points: Vec::new(),
             });
 
+            // Use a non-empty raw point so the byte-blob path is actually exercised
+            let raw_point = PointStructRawPersisted {
+                id: 1.into(),
+                vectors: vec![("dense".to_string(), vec![0, 1, 2, 3, 255])].into(),
+                payload: None,
+            };
+
+            let upsert_raw = Self::UpsertPointsRaw(vec![raw_point.clone()]);
+
+            let sync_raw = Self::SyncPointsRaw(PointSyncRawOperation {
+                from_id: Some(1.into()),
+                to_id: None,
+                points: vec![raw_point],
+            });
+
             prop_oneof![
                 Just(upsert),
                 Just(delete),
                 Just(delete_by_filter),
                 Just(sync),
+                Just(upsert_raw),
+                Just(sync_raw),
             ]
             .boxed()
         }

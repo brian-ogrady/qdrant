@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::sync::Arc;
 
 use collection::collection_state::State;
@@ -71,7 +75,8 @@ pub async fn handle_existing_collections(
                 sharding_method,
                 replication_factor: Some(params.replication_factor.get()),
                 write_consistency_factor: Some(params.write_consistency_factor.get()),
-                on_disk_payload: Some(params.on_disk_payload),
+                on_disk_payload: params.on_disk_payload,
+                payload: params.payload,
                 hnsw_config: Some(hnsw_config.into()),
                 wal_config: Some(wal_config.into()),
                 optimizers_config: Some(optimizer_config.into()),

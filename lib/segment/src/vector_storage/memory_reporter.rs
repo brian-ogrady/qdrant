@@ -2,8 +2,7 @@ use std::path::PathBuf;
 
 use crate::common::memory_usage::{ComponentMemoryUsage, FileStorageIntent, MemoryReporter};
 use crate::vector_storage::vector_storage_base::{
-    DenseVectorStorage as _, MultiVectorStorage as _, VectorStorage as _, VectorStorageEnum,
-    VectorStorageRead as _,
+    VectorStorage as _, VectorStorageEnum, VectorStorageRead as _,
 };
 
 /// Determine the file storage intent for mmap-based vector storage.
@@ -66,6 +65,20 @@ impl MemoryReporter for VectorStorageEnum {
                 from_files_with_on_disk(v.files(), v.is_on_disk())
             }
             VectorStorageEnum::DenseAppendableMemmapHalf(v) => {
+                from_files_with_on_disk(v.files(), v.is_on_disk())
+            }
+
+            VectorStorageEnum::DenseTurboMemmap(v) => {
+                from_files_with_on_disk(v.files(), v.is_on_disk())
+            }
+            #[cfg(target_os = "linux")]
+            VectorStorageEnum::DenseTurboUring(v) => {
+                ComponentMemoryUsage::from_files(v.files(), FileStorageIntent::OnDisk)
+            }
+            VectorStorageEnum::DenseTurboAppendableMemmap(v) => {
+                from_files_with_on_disk(v.files(), v.is_on_disk())
+            }
+            VectorStorageEnum::MultiDenseTurbo(v) => {
                 from_files_with_on_disk(v.files(), v.is_on_disk())
             }
 

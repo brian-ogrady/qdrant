@@ -4,38 +4,37 @@
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
+use blobstore::Blob;
 use common::bitvec::BitSlice;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use gridstore::Blob;
 
 use super::numeric_index_read::NumericIndexRead;
 use super::storage::NumericIndexInner;
 use super::{
-    Encodable, NumericIndex, NumericIndexGridstoreBuilder, NumericIndexIntoInnerValue,
-    NumericIndexMmapBuilder,
+    NumericIndex, NumericIndexGridstoreBuilder, NumericIndexIntoInnerValue,
+    NumericIndexMmapBuilder, NumericIndexValue,
 };
 use crate::common::operation_error::OperationResult;
-use crate::index::field_index::numeric_point::Numericable;
-use crate::index::field_index::stored_point_to_values::StoredValue;
 use crate::index::field_index::{PayloadFieldIndex, ValueIndexer};
 use crate::index::payload_config::{IndexMutability, StorageType};
 use crate::telemetry::PayloadIndexTelemetry;
+use crate::types::Memory;
 
 pub(super) const HISTOGRAM_MAX_BUCKET_SIZE: usize = 10_000;
 pub(super) const HISTOGRAM_PRECISION: f64 = 0.01;
 
-impl<T: Encodable + Numericable + StoredValue + Send + Sync + Default, P> NumericIndex<T, P>
+impl<T: NumericIndexValue, P> NumericIndex<T, P>
 where
     Vec<T>: Blob,
 {
     /// Load immutable mmap based index, either in RAM or on disk
-    pub fn new_mmap(
+    pub fn new_immutable(
         path: &Path,
-        is_on_disk: bool,
+        memory: Memory,
         deleted_points: &BitSlice,
     ) -> OperationResult<Option<Self>> {
-        let index = NumericIndexInner::new_mmap(path, is_on_disk, deleted_points)?;
+        let index = NumericIndexInner::new_mmap(path, memory, deleted_points)?;
 
         Ok(index.map(|inner| Self {
             inner,
@@ -43,7 +42,7 @@ where
         }))
     }
 
-    pub fn new_gridstore(dir: PathBuf, create_if_missing: bool) -> OperationResult<Option<Self>> {
+    pub fn new_mutable(dir: PathBuf, create_if_missing: bool) -> OperationResult<Option<Self>> {
         let index = NumericIndexInner::new_gridstore(dir, create_if_missing)?;
 
         Ok(index.map(|inner| Self {
@@ -82,7 +81,7 @@ where
         match &self.inner {
             NumericIndexInner::Mutable(_) => IndexMutability::Mutable,
             NumericIndexInner::Immutable(_) => IndexMutability::Immutable,
-            NumericIndexInner::Mmap(_) => IndexMutability::Immutable,
+            NumericIndexInner::OnDisk(_) => IndexMutability::Immutable,
         }
     }
 
@@ -90,7 +89,7 @@ where
         match &self.inner {
             NumericIndexInner::Mutable(index) => index.storage_type(),
             NumericIndexInner::Immutable(index) => index.storage_type(),
-            NumericIndexInner::Mmap(index) => StorageType::Mmap {
+            NumericIndexInner::OnDisk(index) => StorageType::Mmap {
                 is_on_disk: index.is_on_disk(),
             },
         }

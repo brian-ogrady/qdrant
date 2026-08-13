@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::borrow::Cow;
 use std::sync::Arc;
 mod ascii_folding;
@@ -175,6 +179,7 @@ impl Tokenizer {
             lowercase,
             ascii_folding,
             on_disk: _,
+            memory: _,
             phrase_matching: _,
             stopwords,
             stemmer,
@@ -189,7 +194,7 @@ impl Tokenizer {
             lowercase,
             ascii_folding,
             stopwords_filter,
-            stemmer.as_ref().map(Stemmer::from_algorithm),
+            stemmer.as_ref().and_then(Stemmer::from_algorithm),
             *min_token_len,
             *max_token_len,
         );
@@ -255,6 +260,7 @@ mod tests {
             r#type: Snowball::Snowball,
             language,
         }))
+        .expect("snowball algorithm always yields a stemmer")
     }
 
     #[test]
@@ -413,6 +419,7 @@ mod tests {
         let text = "Hello, Мир!";
         let mut tokens = Vec::new();
         let params = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Prefix,
             min_token_len: Some(1),
@@ -446,6 +453,7 @@ mod tests {
         let text = "The quick brown fox jumps over the lazy dog";
         let mut tokens = Vec::new();
         let params = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -490,6 +498,7 @@ mod tests {
         for &tokenizer_type in &tokenizer_types {
             let mut tokens = Vec::new();
             let params = TextIndexParams {
+                memory: None,
                 r#type: TextIndexType::Text,
                 tokenizer: tokenizer_type,
                 min_token_len: None,
@@ -524,6 +533,7 @@ mod tests {
         use crate::data_types::index::Language;
 
         let params = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -564,6 +574,7 @@ mod tests {
         let text = "The quick brown fox jumps over the lazy dog as a test";
         let mut tokens = Vec::new();
         let params = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -604,6 +615,7 @@ mod tests {
         let mut tokens = Vec::new();
         use crate::data_types::index::Language;
         let params = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -641,6 +653,7 @@ mod tests {
         let mut tokens = Vec::new();
         use crate::data_types::index::Language;
         let params = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -687,6 +700,7 @@ mod tests {
         let text = "The quick brown fox jumps over the lazy dog";
         let mut tokens = Vec::new();
         let params = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -736,6 +750,7 @@ mod tests {
 
         // ascii_folding disabled (default)
         let params_disabled = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
@@ -755,6 +770,7 @@ mod tests {
 
         // ascii_folding enabled
         let params_enabled = TextIndexParams {
+            memory: None,
             r#type: TextIndexType::Text,
             tokenizer: TokenizerType::Word,
             min_token_len: None,
