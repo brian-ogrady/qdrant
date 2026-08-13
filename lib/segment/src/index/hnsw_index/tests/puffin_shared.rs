@@ -618,7 +618,7 @@ fn read_bin_vectors(path: &Path, expected_count: usize, dim: usize) -> Option<Ve
 /// Sidecar contents the loader validates before returning vectors.
 /// `created` and `notes` are read for logging/diagnostics; the compiler can't
 /// see the print sites through serde so the fields warn as dead — allow.
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct RealDataSidecar {
     pub count: usize,
@@ -650,7 +650,7 @@ fn read_sidecar(path: &Path) -> Option<RealDataSidecar> {
 
 /// Loaded real-data pair, ready for a Phase 3 test run. v3.13 adds
 /// `body_source_indices` — for each `body[i]`, the parquet row it came from.
-#[allow(dead_code)] // `query_sidecar` reserved for future use / diagnostics
+#[expect(dead_code)] // `query_sidecar` reserved for future use / diagnostics
 pub(super) struct RealDataFixture {
     pub body: Vec<Vec<f32>>,
     pub queries: Vec<Vec<f32>>,
