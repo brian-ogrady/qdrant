@@ -157,6 +157,8 @@ impl EdgeSparseVectorParams {
                 index_type: SparseIndexType::default(),
                 datatype: *datatype,
                 memory: None,
+                // Edge does not expose `wand_pruning`; `None` keeps the default (enabled).
+                wand_pruning: None,
             },
             storage_type: SparseVectorStorageType::Mmap,
             modifier: *modifier,
@@ -189,6 +191,7 @@ impl EdgeSparseVectorParams {
             index_type,
             datatype,
             memory: _,
+            wand_pruning: _, // not exposed by edge
         } = index;
         Self {
             full_scan_threshold: *full_scan_threshold,

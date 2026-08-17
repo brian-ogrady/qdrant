@@ -7279,6 +7279,11 @@
                 "nullable": true
               }
             ]
+          },
+          "wand_pruning": {
+            "description": "Whether to use WAND pruning when searching this sparse index. Default: `true`.\n\nDisabling it makes sparse ingest substantially cheaper, at the cost of the search-side skip-ahead on every segment still using the mutable RAM index — the one being written to, plus any segment small enough that optimization leaves it mutable. Correctness is unaffected.",
+            "type": "boolean",
+            "nullable": true
           }
         }
       },
@@ -12823,6 +12828,11 @@
                 "nullable": true
               }
             ]
+          },
+          "wand_pruning": {
+            "description": "Whether WAND pruning is used when searching this index. `None` means enabled.\n\nDisabling it makes sparse ingest substantially cheaper, at the cost of the search-side skip-ahead. Only the `MutableRam` index type is affected — the compressed variants store no `max_next_weight` bound and never prune either way — and correctness is unaffected.",
+            "type": "boolean",
+            "nullable": true
           }
         }
       },

@@ -139,6 +139,13 @@ pub trait InvertedIndex: Sized + Debug + 'static {
 
     /// Get max existed index
     fn max_index(&self) -> Option<DimOffset>;
+
+    /// Whether this index instance's `max_next_weight` bounds may be trusted for WAND pruning.
+    /// `SearchContext::new` requires both to agree before it prunes. Defaults to `true` so index
+    /// types that never take writes are unaffected.
+    fn max_next_weight_reliable(&self) -> bool {
+        true
+    }
 }
 
 /// Error returned from [`InvertedIndex::get_batch`] and [`InvertedIndex::posting_list_len_batch`].

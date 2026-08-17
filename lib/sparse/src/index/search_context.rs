@@ -70,7 +70,15 @@ impl<'a, T: PostingListIter> SearchContext<'a, T> {
         // Query vectors with negative values can NOT use the pruning mechanism which relies on the pre-computed `max_next_weight`.
         // The max contribution per posting list that we calculate is not made to compute the max value of two negative numbers.
         // This is a limitation of the current pruning implementation.
-        let use_pruning = T::reliable_max_next_weight() && query.values.iter().all(|v| *v >= 0.0);
+        //
+        // The two `max_next_weight` checks are separate questions: the posting list *type* must be
+        // able to carry the bound (the compressed formats store none), and this particular index
+        // *instance* must actually be maintaining it — an `InvertedIndexRam` built for a collection
+        // with `wand_pruning` disabled skips propagation on write, so its bounds are stale and too
+        // low, which would make pruning drop valid results.
+        let use_pruning = T::reliable_max_next_weight()
+            && inverted_index.max_next_weight_reliable()
+            && query.values.iter().all(|v| *v >= 0.0);
         let min_record_id = Some(min_record_id);
         Ok(SearchContext {
             postings_iterators,

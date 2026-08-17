@@ -264,10 +264,12 @@ fn cached_compressed_index<W: Weight>(index: &InvertedIndexRam, name: &str) -> P
 /// For performance reasons, use only a subset of the data.
 fn inverted_index_partial_hash(index: &InvertedIndexRam) -> String {
     let mut hasher = sha2::Sha256::new();
+    // `maintain_max_next_weight` is runtime policy, not index content, so it stays out of the hash.
     let InvertedIndexRam {
         postings,
         vector_count,
         total_sparse_size,
+        ..
     } = index;
     hasher.update(vector_count.as_bytes());
     hasher.update(total_sparse_size.as_bytes());

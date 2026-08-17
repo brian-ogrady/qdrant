@@ -162,6 +162,7 @@ impl SegmentOptimizerConfig {
                 index_datatype,
                 storage_type,
                 modifier,
+                wand_pruning,
             } = input;
             plain_sparse_vector_config.insert(
                 name.clone(),
@@ -171,6 +172,7 @@ impl SegmentOptimizerConfig {
                         index_type: SparseIndexType::MutableRam,
                         datatype: index_datatype,
                         memory,
+                        wand_pruning,
                     },
                     storage_type,
                     modifier,
@@ -226,6 +228,7 @@ pub struct SparseVectorOptimizerInput {
     pub index_datatype: Option<VectorStorageDatatype>,
     pub storage_type: SparseVectorStorageType,
     pub modifier: Option<Modifier>,
+    pub wand_pruning: Option<bool>,
 }
 
 /// Target segment count for the merge optimizer.

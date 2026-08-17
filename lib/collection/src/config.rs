@@ -761,6 +761,7 @@ impl CollectionParams {
                                     .and_then(|index| index.datatype)
                                     .map(VectorStorageDatatype::from),
                                 memory: params.index.and_then(|index| index.memory),
+                                wand_pruning: params.index.and_then(|index| index.wand_pruning),
                             },
                             storage_type: params.storage_type(),
                             modifier: params.modifier,
@@ -809,6 +810,52 @@ mod tests {
         let mut params = CollectionParams::empty();
         params.vectors = VectorsConfig::Single(builder.build());
         params
+    }
+
+    /// `wand_pruning` has to survive the collection-params to segment-config conversion, otherwise
+    /// the API accepts the setting and nothing downstream ever sees it.
+    #[test]
+    fn wand_pruning_reaches_the_segment_config() {
+        use crate::operations::types::{SparseIndexParams, SparseVectorParams};
+
+        let params_with = |wand_pruning: Option<bool>| {
+            let mut params = CollectionParams::empty();
+            params.sparse_vectors = Some(BTreeMap::from([(
+                "text".to_string(),
+                SparseVectorParams {
+                    index: Some(SparseIndexParams {
+                        wand_pruning,
+                        ..Default::default()
+                    }),
+                    modifier: None,
+                },
+            )]));
+            params
+        };
+
+        for wand_pruning in [None, Some(true), Some(false)] {
+            let data = params_with(wand_pruning).to_sparse_vector_data();
+            assert_eq!(data["text"].index.wand_pruning, wand_pruning);
+            assert_eq!(
+                data["text"].index.wand_pruning_enabled(),
+                wand_pruning.unwrap_or(true),
+            );
+        }
+
+        // A sparse vector with no index params at all keeps the default (enabled).
+        let mut params = CollectionParams::empty();
+        params.sparse_vectors = Some(BTreeMap::from([(
+            "text".to_string(),
+            SparseVectorParams {
+                index: None,
+                modifier: None,
+            },
+        )]));
+        assert!(
+            params.to_sparse_vector_data()["text"]
+                .index
+                .wand_pruning_enabled()
+        );
     }
 
     #[test]

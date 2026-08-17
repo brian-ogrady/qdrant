@@ -38,6 +38,10 @@ pub struct InvertedIndexRam {
     pub vector_count: usize,
     /// Total size of all searchable sparse vectors in bytes
     pub total_sparse_size: usize,
+    /// Whether `max_next_weight` is kept up to date as this index is mutated.
+    /// Crate-private so that outside `sparse` the only way to change it is
+    /// [`InvertedIndexRam::set_maintain_max_next_weight`], which documents the lifetime rule.
+    pub(crate) maintain_max_next_weight: bool,
 }
 
 impl<S: UniversalWrite> InvertedIndexReadWrite<S> for InvertedIndexRam {
@@ -107,9 +111,10 @@ impl InvertedIndex for InvertedIndexRam {
 
     fn remove(&mut self, id: PointOffsetType, old_vector: RemappedSparseVector) {
         let old_vector_size = old_vector.len() * size_of::<PostingElementEx>();
+        let propagate = self.maintain_max_next_weight;
         for dim_id in old_vector.indices {
             if let Some(posting) = self.postings.get_mut(dim_id as usize) {
-                posting.delete(id);
+                posting.delete_with(id, propagate);
             } else {
                 log::debug!("Posting list for dimension {dim_id} not found");
             }
@@ -142,6 +147,10 @@ impl InvertedIndex for InvertedIndexRam {
             len => Some(len as DimId - 1),
         }
     }
+
+    fn max_next_weight_reliable(&self) -> bool {
+        self.maintain_max_next_weight
+    }
 }
 
 impl InvertedIndexRam {
@@ -151,7 +160,26 @@ impl InvertedIndexRam {
             postings: Vec::new(),
             vector_count: 0,
             total_sparse_size: 0,
+            maintain_max_next_weight: true,
         }
+    }
+
+    /// Whether `max_next_weight` is maintained on write, and so usable for pruning on read.
+    pub fn maintain_max_next_weight(&self) -> bool {
+        self.maintain_max_next_weight
+    }
+
+    /// Set whether `max_next_weight` is maintained on write.
+    ///
+    /// Call this before the index takes any writes — it is a policy for the index's whole
+    /// lifetime, not a toggle.
+    pub fn set_maintain_max_next_weight(&mut self, maintain: bool) {
+        debug_assert!(
+            self.maintain_max_next_weight || !maintain,
+            "cannot re-enable max_next_weight maintenance on an index that has already skipped \
+             propagation: the bounds it holds are stale and pruning over them drops valid results",
+        );
+        self.maintain_max_next_weight = maintain;
     }
 
     pub fn get(&self, id: DimOffset) -> UioResult<&PostingList> {
@@ -167,6 +195,8 @@ impl InvertedIndexRam {
         vector: RemappedSparseVector,
         old_vector: Option<RemappedSparseVector>,
     ) {
+        let propagate = self.maintain_max_next_weight;
+
         // Find elements of the old vector that are not in the new vector
         if let Some(old_vector) = &old_vector {
             let elements_to_delete = old_vector
@@ -176,7 +206,7 @@ impl InvertedIndexRam {
                 .map(|&dim_id| dim_id as usize);
             for dim_id in elements_to_delete {
                 if let Some(posting) = self.postings.get_mut(dim_id) {
-                    posting.delete(id);
+                    posting.delete_with(id, propagate);
                 } else {
                     log::debug!("Posting list for dimension {dim_id} not found");
                 }
@@ -191,7 +221,7 @@ impl InvertedIndexRam {
                 Some(posting) => {
                     // update existing posting list
                     let posting_element = PostingElementEx::new(id, weight);
-                    posting.upsert(posting_element);
+                    posting.upsert_with(posting_element, propagate);
                 }
                 None => {
                     // resize postings vector (fill gaps with empty posting lists)
@@ -223,6 +253,8 @@ impl InvertedIndexRam {
             postings,
             vector_count,
             total_sparse_size,
+            // Runtime policy rather than index content: not part of the benchmark fixture format.
+            maintain_max_next_weight: _,
         } = self;
 
         let mut f = BufWriter::new(fs::File::create(path)?);
@@ -275,6 +307,7 @@ impl InvertedIndexRam {
             postings,
             vector_count,
             total_sparse_size,
+            maintain_max_next_weight: true,
         })
     }
 }

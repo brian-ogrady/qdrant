@@ -161,12 +161,18 @@ impl<S: UniversalReadExt> ReadOnlySparseVectorIndex<S, InvertedIndexRam> {
     ) -> OperationResult<Self> {
         // The read-only open path carries no cancellation flag.
         let stopped = AtomicBool::new(false);
-        let (inverted_index, indices_tracker) = super::build_ram_index(
+        let (mut inverted_index, indices_tracker) = super::build_ram_index(
             &*id_tracker.borrow(),
             &*vector_storage.borrow(),
             &stopped,
             || (),
         )?;
+        // Mirroring `plan()` means mirroring the `wand_pruning` policy too, not just the rebuild.
+        // Without this, a collection configured with `wand_pruning: false` still pays the full
+        // `propagate_max_next_weight_to_the_left` walk on this path — `live_reload` below calls
+        // `InvertedIndexRam::upsert`, which consults exactly this flag — and searches over this
+        // index would prune while searches over the writable segment for the same data would not.
+        inverted_index.set_maintain_max_next_weight(config.wand_pruning_enabled());
         Ok(Self {
             config,
             id_tracker,

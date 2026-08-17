@@ -904,6 +904,8 @@ impl From<SparseVectorDataConfig> for SegmentSparseVectorDataConfig {
                 full_scan_threshold: full_scan_threshold.map(crate::error::clamp_usize),
                 datatype: datatype.map(SegmentVectorStorageDatatype::from),
                 memory: None,
+                // Not an FFI knob; `None` keeps the default (pruning enabled).
+                wand_pruning: None,
             },
             storage_type: SparseVectorStorageType::Mmap,
             modifier: modifier.map(SegmentModifier::from),
@@ -922,6 +924,7 @@ impl From<SegmentSparseVectorDataConfig> for SparseVectorDataConfig {
                     full_scan_threshold,
                     datatype,
                     memory: _,
+                    wand_pruning: _,
                 },
             storage_type: _,
             modifier,

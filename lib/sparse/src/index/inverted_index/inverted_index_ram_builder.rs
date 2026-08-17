@@ -52,6 +52,10 @@ impl InvertedIndexBuilder {
                 postings: vec![],
                 total_sparse_size: self.total_sparse_size,
                 vector_count: self.vector_count,
+                // The one-pass build always computes exact bounds; whether they are then
+                // maintained across later writes is the caller's policy, set afterwards via
+                // `set_maintain_max_next_weight`.
+                maintain_max_next_weight: true,
             };
         }
 
@@ -72,6 +76,7 @@ impl InvertedIndexBuilder {
             postings,
             vector_count,
             total_sparse_size,
+            maintain_max_next_weight: true,
         }
     }
 

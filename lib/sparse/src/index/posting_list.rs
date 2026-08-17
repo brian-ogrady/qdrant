@@ -32,6 +32,13 @@ impl PostingList {
     }
 
     pub fn delete(&mut self, record_id: PointOffsetType) {
+        self.delete_with(record_id, true);
+    }
+
+    /// Delete a record, optionally skipping `max_next_weight` maintenance.
+    ///
+    /// See [`Self::upsert_with`] for what `propagate = false` means and when it is safe.
+    pub(crate) fn delete_with(&mut self, record_id: PointOffsetType, propagate: bool) {
         let index = self
             .elements
             .binary_search_by_key(&record_id, |e| e.record_id);
@@ -39,6 +46,9 @@ impl PostingList {
             self.elements.remove(found_index);
             if let Some(last) = self.elements.last_mut() {
                 last.max_next_weight = DEFAULT_MAX_NEXT_WEIGHT;
+            }
+            if !propagate {
+                return;
             }
             if found_index < self.elements.len() {
                 self.propagate_max_next_weight_to_the_left(found_index);
@@ -53,6 +63,18 @@ impl PostingList {
     /// Worst case is adding a new element at the end of the list with a very large weight.
     /// This forces to propagate it as potential max_next_weight to all the previous elements.
     pub fn upsert(&mut self, posting_element: PostingElementEx) {
+        self.upsert_with(posting_element, true);
+    }
+
+    /// Upsert a posting element, optionally skipping `max_next_weight` maintenance.
+    ///
+    /// `propagate = false` leaves the stored bounds stale, and an append leaves them too *low* —
+    /// which makes WAND pruning over-prune, silently dropping results that belong in the top-k. A
+    /// caller passing `false` must therefore keep pruning disabled for the whole lifetime of this
+    /// posting list; [`InvertedIndexRam`] ties the two to one flag so they cannot drift apart.
+    ///
+    /// [`InvertedIndexRam`]: crate::index::inverted_index::inverted_index_ram::InvertedIndexRam
+    pub(crate) fn upsert_with(&mut self, posting_element: PostingElementEx, propagate: bool) {
         // find insertion point in sorted posting list (most expensive operation for large posting list)
         let index = self
             .elements
@@ -85,7 +107,9 @@ impl PostingList {
             }
         };
         // Propagate max_next_weight update to the previous entries
-        if let Some(modified_index) = modified_index {
+        if let Some(modified_index) = modified_index
+            && propagate
+        {
             self.propagate_max_next_weight_to_the_left(modified_index);
         }
     }

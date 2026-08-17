@@ -249,12 +249,18 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
         if !config.index_type.is_persisted() {
             // RAM mutable case - build from scratch, keep the provided config, do not persist.
             fs::create_dir_all(path)?;
-            let (ram_index, indices_tracker) = build_ram_index(
+            let (mut ram_index, indices_tracker) = build_ram_index(
                 &*id_tracker.borrow(),
                 &*vector_storage.borrow(),
                 stopped,
                 tick_progress,
             )?;
+            // The mutable RAM index is the only sparse index that maintains `max_next_weight`,
+            // so it is the only one `wand_pruning` can act on. Applied here, before the index
+            // takes any writes, because it is a policy for the index's whole lifetime: the same
+            // flag both skips the propagation walk on write and marks the bounds unusable for
+            // pruning on read, and those two must never disagree.
+            ram_index.set_maintain_max_next_weight(config.wand_pruning_enabled());
             return Ok(SparseOpenPlan::Build {
                 config,
                 ram_index,

@@ -124,6 +124,7 @@ fn sparse_config_to_params(config: &SparseVectorConfig) -> SparseVectorParams {
             on_disk: None,
             memory: None,
             datatype: Some(storage_datatype_to_collection(dt)),
+            wand_pruning: None,
         }),
         modifier: *modifier,
     }

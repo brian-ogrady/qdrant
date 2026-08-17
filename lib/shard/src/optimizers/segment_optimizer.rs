@@ -333,6 +333,14 @@ pub trait SegmentOptimizer: Sync {
                     .sparse_vector
                     .get(vector_name)
                     .and_then(|cfg| cfg.memory);
+                // Same reasoning as `memory` just above, applied in the other direction:
+                // `wand_pruning` is read only by the mutable RAM index, so persisting it into a
+                // compressed one records a setting that index will never consult and contradicts
+                // the "only MutableRam is affected" invariant its own doc states. Clearing it also
+                // keeps a legacy-only compressed index config byte-identical for older versions.
+                if index_type != SparseIndexType::MutableRam {
+                    config.index.wand_pruning = None;
+                }
             });
 
         let optimized_config = segment::types::SegmentConfig {

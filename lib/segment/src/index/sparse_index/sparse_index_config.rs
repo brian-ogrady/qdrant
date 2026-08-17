@@ -86,6 +86,18 @@ pub struct SparseIndexConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<Memory>,
+    /// Whether WAND pruning is used when searching this index. `None` means enabled.
+    ///
+    /// Disabling it makes sparse ingest substantially cheaper, at the cost of the search-side
+    /// skip-ahead. Only the `MutableRam` index type is affected — the compressed variants
+    /// store no `max_next_weight` bound and never prune either way — and correctness is
+    /// unaffected.
+    // Keep this `Option<bool>`. `#[serde(default)]` on a bare `bool` yields `false`,
+    // which would silently disable pruning for every segment config written before
+    // this field existed.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wand_pruning: Option<bool>,
 }
 
 impl SparseIndexConfig {
@@ -100,7 +112,13 @@ impl SparseIndexConfig {
             index_type,
             datatype,
             memory,
+            wand_pruning: None,
         }
+    }
+
+    /// Whether WAND pruning is enabled for this index. Defaults to enabled when unset.
+    pub fn wand_pruning_enabled(&self) -> bool {
+        self.wand_pruning.unwrap_or(true)
     }
 
     /// Effective memory placement of the index, derived from the structural `index_type` and
@@ -161,5 +179,40 @@ mod tests {
         assert_eq!(restored, cached);
         let json = serde_json::to_string(&mmap).unwrap();
         assert!(!json.contains("memory"));
+    }
+
+    #[test]
+    fn test_wand_pruning_defaults_to_enabled() {
+        // Unset means enabled, so nothing changes for a config that never mentions the field.
+        let default = SparseIndexConfig::new(None, SparseIndexType::MutableRam, None, None);
+        assert_eq!(default.wand_pruning, None);
+        assert!(default.wand_pruning_enabled());
+
+        // A `sparse_index_config.json` written before this field existed must still load, and must
+        // load as *enabled*. This is why the field is `Option<bool>` rather than a bare `bool`:
+        // `#[serde(default)]` on a bool would yield `false` and silently turn pruning off for
+        // every pre-existing segment on upgrade.
+        let legacy = r#"{"full_scan_threshold":null,"index_type":"MutableRam"}"#;
+        let restored: SparseIndexConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(restored.wand_pruning, None);
+        assert!(restored.wand_pruning_enabled());
+
+        // Explicit settings survive a round-trip, and the field is omitted when unset so configs
+        // written by this version stay readable by older ones.
+        for value in [true, false] {
+            let config = SparseIndexConfig {
+                wand_pruning: Some(value),
+                ..SparseIndexConfig::new(None, SparseIndexType::MutableRam, None, None)
+            };
+            let json = serde_json::to_string(&config).unwrap();
+            let restored: SparseIndexConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, config);
+            assert_eq!(restored.wand_pruning_enabled(), value);
+        }
+        assert!(
+            !serde_json::to_string(&default)
+                .unwrap()
+                .contains("wand_pruning")
+        );
     }
 }

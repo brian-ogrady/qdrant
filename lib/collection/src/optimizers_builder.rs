@@ -245,6 +245,7 @@ pub fn build_segment_optimizer_config(
                                 .map(VectorStorageDatatype::from),
                             storage_type: params.storage_type(),
                             modifier: *modifier,
+                            wand_pruning: index.and_then(|index| index.wand_pruning),
                         },
                     )
                 })

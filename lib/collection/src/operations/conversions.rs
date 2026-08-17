@@ -847,6 +847,7 @@ impl TryFrom<api::grpc::qdrant::SparseVectorParams> for SparseVectorParams {
                         on_disk: index_config.on_disk,
                         memory: convert_memory_from_proto(index_config.memory)?,
                         datatype: convert_datatype_from_proto(index_config.datatype)?,
+                        wand_pruning: index_config.wand_pruning,
                     })
                 })
                 .transpose()?,
@@ -869,12 +870,14 @@ impl From<SparseVectorParams> for api::grpc::qdrant::SparseVectorParams {
                     on_disk,
                     memory,
                     datatype,
+                    wand_pruning,
                 } = index_config;
                 api::grpc::qdrant::SparseIndexConfig {
                     full_scan_threshold: full_scan_threshold.map(|v| v as u64),
                     on_disk,
                     memory: convert_memory_to_proto(memory),
                     datatype: datatype.map(|dt| api::grpc::qdrant::Datatype::from(dt).into()),
+                    wand_pruning,
                 }
             }),
             modifier: modifier.map(|modifier| api::grpc::qdrant::Modifier::from(modifier) as i32),

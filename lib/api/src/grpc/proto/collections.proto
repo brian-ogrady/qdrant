@@ -270,6 +270,11 @@ message SparseIndexConfig {
   // Memory placement of the index.
   // Overrides the deprecated `on_disk` flag if both are set.
   optional Memory memory = 4;
+  // Use WAND pruning when searching this sparse index. Default: true.
+  // Disabling it makes sparse ingest substantially cheaper, at the cost of the search-side
+  // skip-ahead on every segment still using the mutable RAM index — the one being written to,
+  // plus any segment small enough that optimization leaves it mutable. Correctness is unaffected.
+  optional bool wand_pruning = 5;
 }
 
 message WalConfigDiff {

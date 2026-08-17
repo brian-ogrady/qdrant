@@ -691,3 +691,83 @@ fn deferred_index_opens_on_first_search() {
 
     assert_query_equivalence(&eager, &deferred);
 }
+
+/// The read-only opener must honour `wand_pruning`, not just rebuild the index.
+#[test]
+fn read_only_segment_sparse_honours_wand_pruning() {
+    use sparse::common::sparse_vector::SparseVector;
+    use sparse::index::inverted_index::InvertedIndex;
+
+    use crate::data_types::vectors::VectorRef;
+    use crate::index::read_only::VectorIndexReadEnum;
+    use crate::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
+    use crate::types::{SparseVectorDataConfig, SparseVectorStorageType};
+
+    const NAME: &str = "sparse";
+    let hw = HardwareCounterCell::disposable();
+
+    // `None` (the default) and an explicit `Some(true)` must prune; `Some(false)` must not.
+    for (wand_pruning, want_reliable) in [(None, true), (Some(true), true), (Some(false), false)] {
+        let dir = tempfile::Builder::new()
+            .prefix("ro-wand-pruning")
+            .tempdir()
+            .unwrap();
+        let (mut mutable, _) = build_segment(
+            dir.path(),
+            &SegmentConfig {
+                vector_data: Default::default(),
+                sparse_vector_data: HashMap::from([(
+                    NAME.to_owned(),
+                    SparseVectorDataConfig {
+                        index: SparseIndexConfig {
+                            wand_pruning,
+                            ..SparseIndexConfig::new(None, SparseIndexType::MutableRam, None, None)
+                        },
+                        storage_type: SparseVectorStorageType::default(),
+                        modifier: None,
+                    },
+                )]),
+                payload_storage_type: Default::default(),
+            },
+            None,
+            true,
+        )
+        .unwrap();
+        mutable.append_only_mutations = true;
+
+        for i in 0..32u64 {
+            let vector = SparseVector::new(vec![1, 5, 9], vec![1.0, 0.5 + i as f32, 0.25]).unwrap();
+            let vectors = NamedVectors::from_ref(NAME, VectorRef::Sparse(&vector));
+            mutable
+                .upsert_point(i + 1, (i + 1).into(), vectors, &hw)
+                .unwrap();
+        }
+        mutable.flush(true).unwrap();
+
+        let read_only = ReadOnlySegment::<MmapFile>::open(
+            &MmapFs,
+            &mutable.data_path(),
+            mutable.uuid,
+            None,
+            None,
+        )
+        .expect("read-only open");
+
+        let index = read_only.vector_data[NAME].vector_index.borrow();
+        let VectorIndexReadEnum::SparseMutableRam(sparse) = &*index else {
+            panic!("expected a read-only MutableRam sparse index, got another variant");
+        };
+        assert_eq!(
+            sparse.inverted_index().max_next_weight_reliable(),
+            want_reliable,
+            "read-only open with wand_pruning={wand_pruning:?} should report \
+             max_next_weight_reliable()={want_reliable}; if this fails the parameter is inert on \
+             the read-only opener",
+        );
+        assert_eq!(
+            sparse.inverted_index().maintain_max_next_weight(),
+            want_reliable,
+            "the write-side and read-side halves must agree on the read-only opener too",
+        );
+    }
+}

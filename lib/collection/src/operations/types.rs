@@ -1564,6 +1564,14 @@ pub struct SparseIndexParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(custom(function = "validate_sparse_datatype"))]
     pub datatype: Option<Datatype>,
+    /// Whether to use WAND pruning when searching this sparse index. Default: `true`.
+    ///
+    /// Disabling it makes sparse ingest substantially cheaper, at the cost of the search-side
+    /// skip-ahead on every segment still using the mutable RAM index — the one being written to,
+    /// plus any segment small enough that optimization leaves it mutable. Correctness is
+    /// unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wand_pruning: Option<bool>,
 }
 
 impl SparseIndexParams {
@@ -1573,6 +1581,7 @@ impl SparseIndexParams {
             on_disk,
             memory,
             datatype,
+            wand_pruning,
         } = other;
 
         self.full_scan_threshold
@@ -1580,6 +1589,7 @@ impl SparseIndexParams {
         self.on_disk.replace_if_some(on_disk);
         self.memory.replace_if_some(memory);
         self.datatype.replace_if_some(datatype);
+        self.wand_pruning.replace_if_some(wand_pruning);
     }
 }
 

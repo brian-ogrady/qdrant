@@ -766,6 +766,12 @@ pub struct SparseIndexConfig {
     /// Overrides the deprecated `on_disk` flag if both are set.
     #[prost(enumeration = "Memory", optional, tag = "4")]
     pub memory: ::core::option::Option<i32>,
+    /// Use WAND pruning when searching this sparse index. Default: true.
+    /// Disabling it makes sparse ingest substantially cheaper, at the cost of the search-side
+    /// skip-ahead on every segment still using the mutable RAM index — the one being written to,
+    /// plus any segment small enough that optimization leaves it mutable. Correctness is unaffected.
+    #[prost(bool, optional, tag = "5")]
+    pub wand_pruning: ::core::option::Option<bool>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -1402,7 +1408,8 @@ pub struct CollectionParamsDiff {
     pub payload: ::core::option::Option<PayloadStorageParams>,
     /// Number of virtual nodes per shard on the hash ring. Read-only after the collection is
     /// created: it decides which shard a point id lands on, so changing it would remap part of the
-    /// keyspace. Sending the collection's current value is accepted; sending a different
+    /// keyspace. Sending the collection's current value is accepted, so a client that reads
+    /// CollectionParams and writes the whole object back is not penalised; sending a different
     /// value is rejected.
     #[prost(uint32, optional, tag = "7")]
     #[validate(range(min = 1, max = 100_000))]
