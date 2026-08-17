@@ -575,11 +575,24 @@ impl Collection {
             }
 
             if replica_set.is_dummy().await {
-                // We can reach here because of either of these:
-                // 1. Qdrant is in recovery mode, and user intentionally triggered a transfer
-                // 2. Shard is dirty (shard initializing flag), and Qdrant triggered a transfer to recover from Dead state after an update fails
+                // A dummy shard here usually means the directory holds nothing worth keeping and the
+                // transfer is what refills it — Qdrant started in recovery mode and the user triggered
+                // this transfer, or the shard is dirty and Qdrant triggered it to recover from Dead.
                 //
-                // In both cases, it's safe to drop existing local shard data
+                // It does NOT always mean that. A shard whose points were placed under a different hash
+                // ring scale also loads as a dummy, and there the directory is the only copy of that
+                // data. Do not reason about which case this is from the fact that it is a dummy: ask
+                // `DummyShardReason::may_be_discarded`, which is an exhaustive match and so cannot go
+                // stale when a new cause is added. `init_empty_local_shard` refuses independently, from
+                // what is on disk, so this check is the readable half rather than the load-bearing one.
+                if let Some(reason) = replica_set.local_dummy_reason_forbidding_discard().await {
+                    return Err(CollectionError::service_error(format!(
+                        "Refusing to initialize an empty local shard for transfer to shard {}: its \
+                         current data must not be discarded. {reason}",
+                        replica_set.shard_id,
+                    )));
+                }
+
                 log::debug!(
                     "Initiating transfer to dummy shard {}. Initializing empty local shard first",
                     replica_set.shard_id,

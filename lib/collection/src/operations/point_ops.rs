@@ -348,6 +348,7 @@ mod tests {
     use segment::types::{ExtendedPointId, PointIdType};
 
     use super::*;
+    use crate::hash_ring::DEFAULT_HASH_RING_SHARD_SCALE;
 
     #[test]
     fn split_point_operations() {
@@ -372,7 +373,9 @@ mod tests {
             })
             .collect();
 
-        let mut hash_ring = HashRingRouter::single();
+        // Pinned explicitly rather than taken from the env-configurable default: this test asserts
+        // the exact historical point-to-shard mapping, so it must not move with configuration.
+        let mut hash_ring = HashRingRouter::single(DEFAULT_HASH_RING_SHARD_SCALE);
         hash_ring.add(0);
         hash_ring.add(1);
         hash_ring.add(2);

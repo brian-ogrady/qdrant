@@ -414,6 +414,14 @@ impl Collection {
         self.collection_config.read().await.params.vectors.clone()
     }
 
+    pub async fn hash_ring_shard_scale(&self) -> u32 {
+        self.collection_config
+            .read()
+            .await
+            .params
+            .hash_ring_shard_scale
+    }
+
     pub async fn info(
         &self,
         shard_selection: &ShardSelectorInternal,

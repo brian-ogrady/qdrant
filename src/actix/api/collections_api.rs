@@ -117,12 +117,21 @@ async fn create_collection(
     ActixAuth(auth): ActixAuth,
 ) -> HttpResponse {
     let timing = Instant::now();
-    let create_collection_op =
-        CreateCollectionOperation::new(collection.collection_name.clone(), operation.into_inner());
+    let operation = operation.into_inner();
+    let requested_hash_ring_shard_scale = operation.hash_ring_shard_scale;
 
-    let Ok(create_collection_op) = create_collection_op else {
-        return process_response(create_collection_op, timing, None);
-    };
+    let create_collection_op =
+        match CreateCollectionOperation::new(collection.collection_name.clone(), operation) {
+            Ok(op) => op,
+            Err(err) => return process_response::<()>(Err(err), timing, None),
+        };
+
+    if let Err(err) = dispatcher.check_hash_ring_shard_scale_requestable(
+        &collection.collection_name,
+        requested_hash_ring_shard_scale,
+    ) {
+        return process_response::<()>(Err(err), timing, None);
+    }
 
     let response = dispatcher
         .submit_collection_meta_op(

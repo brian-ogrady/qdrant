@@ -577,8 +577,12 @@ impl LocalShard {
         optimizer_resource_budget: ResourceBudget,
         effective_optimizers_config: OptimizersConfig,
     ) -> CollectionResult<LocalShard> {
-        // initialize local shard config file
-        let local_shard_config = ShardConfig::new_replica_set();
+        // initialize local shard config file, recording the hash ring scale this shard's points are
+        // placed under so a later load can detect that the collection is no longer routing them the
+        // same way
+        let local_shard_config = ShardConfig::new_replica_set_with_scale(
+            collection_config.read().await.params.hash_ring_shard_scale,
+        );
         let shard = Self::build(
             id,
             collection_id,

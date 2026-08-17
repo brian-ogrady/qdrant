@@ -19,7 +19,9 @@ use segment::types::{
 
 use super::{ALL_CANDIDATES, COLLECTION_NAME, PEER_ID, QuantizationKind, VectorKind};
 use crate::collection::{Collection, RequestShardTransfer};
-use crate::config::{CollectionConfigInternal, CollectionParams, WalConfig};
+use crate::config::{
+    CollectionConfigInternal, CollectionParams, WalConfig, default_hash_ring_shard_scale,
+};
 use crate::operations::config_diff::HnswConfigDiff;
 use crate::operations::shared_storage_config::SharedStorageConfig;
 use crate::operations::types::{Datatype, SparseVectorParams, VectorsConfig};
@@ -176,6 +178,7 @@ pub(super) async fn fixture(
         read_fan_out_delay_ms: None,
         on_disk_payload: Some(false),
         payload: None,
+        hash_ring_shard_scale: default_hash_ring_shard_scale(),
     };
 
     // Optimizer config — `max_segment_size_kb` / `indexing_threshold_kb` are caller-supplied

@@ -115,6 +115,15 @@ pub struct CollectionParamsDiff {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(nested)]
     pub payload: Option<PayloadStorageParams>,
+    /// Number of virtual nodes per shard on the hash ring.
+    ///
+    /// Immutable — see [`CollectionParams::hash_ring_shard_scale`]. Accepted on the diff only so a
+    /// read-modify-write client can PATCH the whole params object back with the value it already
+    /// read; a *differing* value is rejected on the request path, and `CollectionParams::update`
+    /// ignores this field entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1, max = 100_000))]
+    pub hash_ring_shard_scale: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq)]
@@ -323,6 +332,11 @@ impl DiffConfig<CollectionParamsDiff> for CollectionParams {
             read_fan_out_delay_ms,
             on_disk_payload,
             payload,
+            // Deliberately unused — immutable, see `CollectionParams::hash_ring_shard_scale`.
+            // The request path rejects a differing value; this pins it regardless, which is what
+            // guards the apply path on follower peers. Bound explicitly so that wiring it into the
+            // struct below means deleting this line first.
+            hash_ring_shard_scale: _,
         } = diff;
 
         CollectionParams {
@@ -340,6 +354,7 @@ impl DiffConfig<CollectionParamsDiff> for CollectionParams {
             sharding_method: self.sharding_method,
             sparse_vectors: self.sparse_vectors.clone(),
             vectors: self.vectors.clone(),
+            hash_ring_shard_scale: self.hash_ring_shard_scale,
         }
     }
 }
@@ -462,6 +477,8 @@ impl From<CollectionParams> for CollectionParamsDiff {
             sharding_method: _,
             sparse_vectors: _,
             vectors: _,
+            // Not diffable, see the `DiffConfig` impl below
+            hash_ring_shard_scale: _,
         } = config;
 
         CollectionParamsDiff {
@@ -471,6 +488,9 @@ impl From<CollectionParams> for CollectionParamsDiff {
             read_fan_out_delay_ms,
             on_disk_payload,
             payload,
+            // Left unset on purpose: a diff derived from an existing config must not ask to change
+            // the scale, or feeding it back through the update path would be rejected.
+            hash_ring_shard_scale: None,
         }
     }
 }
@@ -564,7 +584,21 @@ mod tests {
             read_fan_out_delay_ms: None,
             on_disk_payload: None,
             payload: None,
+            hash_ring_shard_scale: None,
         };
+
+        // Even if a scale somehow reaches `update` (the request path rejects it first), applying the
+        // diff must never move it — doing so would remap the collection's keyspace.
+        let scale_before = params.hash_ring_shard_scale;
+        let hostile_diff = CollectionParamsDiff {
+            hash_ring_shard_scale: Some(scale_before + 1),
+            ..diff.clone()
+        };
+        assert_eq!(
+            params.update(&hostile_diff).hash_ring_shard_scale,
+            scale_before,
+            "`hash_ring_shard_scale` must be immutable through the diff path",
+        );
 
         let new_params = params.update(&diff);
 
@@ -596,6 +630,7 @@ mod tests {
             payload: Some(PayloadStorageParams {
                 memory: Some(segment::types::Memory::Cached),
             }),
+            hash_ring_shard_scale: None,
         };
 
         let new_params = params.update(&diff);

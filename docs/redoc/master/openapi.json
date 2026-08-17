@@ -6737,6 +6737,14 @@
               "$ref": "#/components/schemas/SparseVectorParams"
             },
             "nullable": true
+          },
+          "hash_ring_shard_scale": {
+            "description": "Number of virtual nodes per shard on the hash ring.\n\nRange `1..=100_000`, default `100`. Higher values distribute points more evenly across shards, at the cost of more memory per ring and slightly slower shard lookup.\n\nRead-only after creation. Fixed from the create request, or failing that the `storage.collection.hash_ring_shard_scale` service default. It determines which shard each point id belongs to, so changing it would remap a proportional fraction of the keyspace and leave existing points unreachable by id — an update requesting a *different* value is rejected, an update repeating the current one is accepted. To use another scale, create a new collection and migrate the points into it.\n\nIn a cluster, a non-default value additionally requires every known peer to support the field; if one does not, creation falls back to the default.",
+            "default": 100,
+            "type": "integer",
+            "format": "uint32",
+            "maximum": 100000,
+            "minimum": 1
           }
         }
       },
@@ -9746,6 +9754,15 @@
                 "nullable": true
               }
             ]
+          },
+          "hash_ring_shard_scale": {
+            "description": "Number of virtual nodes each shard gets on the hash ring. Immutable once the collection exists, because changing it would remap a proportional fraction of the keyspace.",
+            "default": null,
+            "type": "integer",
+            "format": "uint32",
+            "maximum": 100000,
+            "minimum": 1,
+            "nullable": true
           }
         }
       },
@@ -10273,6 +10290,14 @@
                 "nullable": true
               }
             ]
+          },
+          "hash_ring_shard_scale": {
+            "description": "Number of virtual nodes per shard on the hash ring.\n\nImmutable — see [`CollectionParams::hash_ring_shard_scale`]. Accepted on the diff only so a read-modify-write client can PATCH the whole params object back with the value it already read; a *differing* value is rejected on the request path, and `CollectionParams::update` ignores this field entirely.",
+            "type": "integer",
+            "format": "uint32",
+            "maximum": 100000,
+            "minimum": 1,
+            "nullable": true
           }
         }
       },

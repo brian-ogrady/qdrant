@@ -570,6 +570,10 @@ message CreateCollection {
   map<string, Value> metadata = 18;
   // Configuration of the payload storage
   optional PayloadStorageParams payload = 19;
+  // Number of virtual nodes each shard gets on the hash ring. Higher values spread points more
+  // evenly across shards, at the cost of more memory per ring and slightly slower shard lookup.
+  // Immutable once the collection exists. If unset, the service default is used.
+  optional uint32 hash_ring_shard_scale = 20;
 }
 
 message UpdateCollection {
@@ -640,6 +644,10 @@ message CollectionParams {
   optional uint64 read_fan_out_delay_ms = 11;
   // Configuration of the payload storage
   optional PayloadStorageParams payload = 12;
+  // Number of virtual nodes each shard gets on the hash ring. Read-only; fixed when the collection
+  // is created. Optional so that a response from a peer that does not report it is distinguishable
+  // from a real value (0 is not a valid scale).
+  optional uint32 hash_ring_shard_scale = 13;
 }
 
 message CollectionParamsDiff {
@@ -656,6 +664,12 @@ message CollectionParamsDiff {
   optional uint64 read_fan_out_delay_ms = 5;
   // Update params of the payload storage
   optional PayloadStorageParams payload = 6;
+  // Number of virtual nodes per shard on the hash ring. Read-only after the collection is
+  // created: it decides which shard a point id lands on, so changing it would remap part of the
+  // keyspace. Sending the collection's current value is accepted, so a client that reads
+  // CollectionParams and writes the whole object back is not penalised; sending a different
+  // value is rejected.
+  optional uint32 hash_ring_shard_scale = 7;
 }
 
 message CollectionConfig {

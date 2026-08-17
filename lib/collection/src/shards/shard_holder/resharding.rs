@@ -811,9 +811,48 @@ mod tests {
     }
 
     fn make_holder() -> (tempfile::TempDir, ShardHolder) {
+        make_holder_with_scale(crate::hash_ring::DEFAULT_HASH_RING_SHARD_SCALE)
+    }
+
+    fn make_holder_with_scale(scale: u32) -> (tempfile::TempDir, ShardHolder) {
         let dir = tempfile::tempdir().unwrap();
-        let holder = ShardHolder::new(dir.path(), ShardingMethod::Auto).unwrap();
+        let holder = ShardHolder::new(dir.path(), ShardingMethod::Auto, scale).unwrap();
         (dir, holder)
+    }
+
+    /// Virtual nodes per shard of the router's active ring.
+    fn ring_scale(router: &HashRingRouter) -> u32 {
+        let ring = match router {
+            HashRingRouter::Single(ring) => ring,
+            HashRingRouter::Resharding { new, .. } => new,
+        };
+        match ring {
+            crate::hash_ring::HashRing::Fair { scale, .. } => *scale,
+            crate::hash_ring::HashRing::Raw { .. } => panic!("expected a fair ring"),
+        }
+    }
+
+    /// `rebuild_rings` discards every ring and builds fresh ones, so it has to take the scale from
+    /// the holder rather than a default.
+    #[test]
+    fn rebuild_rings_preserves_the_collection_scale() {
+        const SCALE: u32 = 7;
+        assert_ne!(
+            SCALE,
+            crate::hash_ring::DEFAULT_HASH_RING_SHARD_SCALE,
+            "the scale under test must differ from the default, or this proves nothing",
+        );
+
+        let (_dir, mut holder) = make_holder_with_scale(SCALE);
+        assert_eq!(ring_scale(&holder.rings[&None]), SCALE);
+
+        holder.rebuild_rings();
+
+        assert_eq!(
+            ring_scale(&holder.rings[&None]),
+            SCALE,
+            "a rebuilt ring must keep the collection's scale",
+        );
     }
 
     // ------------------------------------------------------------------

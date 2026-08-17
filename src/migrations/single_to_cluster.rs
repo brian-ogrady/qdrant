@@ -84,6 +84,10 @@ pub async fn handle_existing_collections(
                 strict_mode_config,
                 uuid,
                 metadata,
+                // Carry the collection's existing scale through explicitly. Leaving this `None`
+                // would let the resolution in `submit_collection_meta_op` substitute this node's
+                // environment value, silently remapping a collection that already has data.
+                hash_ring_shard_scale: Some(params.hash_ring_shard_scale),
             },
         )
         .expect("Failed to create collection operation");
@@ -139,9 +143,23 @@ pub async fn handle_existing_collections(
         }
 
         for operation in consensus_operations {
-            let _res = dispatcher_arc
+            // Surfaced rather than discarded. If a collection fails to enter consensus it survives
+            // only locally, and is then deleted as "not part of the consensus snapshot" the next time
+            // consensus state is applied — previously indistinguishable from a clean migration.
+            //
+            // Not an error, because this op is a make-sure-it-is-registered retry: "already exists"
+            // is the ordinary outcome when the collection reached consensus earlier in this run.
+            if let Err(err) = dispatcher_arc
                 .submit_collection_meta_op(operation, full_auth.clone(), None)
-                .await;
+                .await
+            {
+                log::warn!(
+                    "Migrating collection {collection_name} into consensus returned: {err}. \
+                     Expected if it is already registered with the cluster; if it is not, the \
+                     collection exists only on this node and will be removed when consensus state \
+                     is next applied",
+                );
+            }
         }
 
         for (shard_id, shard_info) in shards {

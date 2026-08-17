@@ -184,6 +184,20 @@ async fn _do_recover_from_snapshot(
         Some(collection) => collection,
         None => {
             log::debug!("Collection {collection_pass} does not exist, creating it");
+            if !dispatcher.hash_ring_shard_scale_supported()
+                && snapshot_config.params.hash_ring_shard_scale
+                    != collection::config::default_hash_ring_shard_scale()
+            {
+                return Err(StorageError::bad_request(format!(
+                    "Cannot restore {collection_pass}: the snapshot was taken from a collection \
+                     with `hash_ring_shard_scale` of {}, and that cannot be put into consensus until \
+                     every peer runs at least {}. Older peers would ignore it and build a different \
+                     point-to-shard mapping. Finish the rolling upgrade, then restore",
+                    snapshot_config.params.hash_ring_shard_scale,
+                    *collection::hash_ring::HASH_RING_SHARD_SCALE_VERSION,
+                )));
+            }
+
             let operation =
                 CollectionMetaOperations::CreateCollection(CreateCollectionOperation::new(
                     collection_pass.to_string(),
@@ -228,6 +242,13 @@ async fn _do_recover_from_snapshot(
         return Err(StorageError::bad_input(format!(
             "Snapshot is not compatible with existing collection: Collection shard number: {:?} Snapshot shard number: {:?}",
             state.config.params.shard_number, snapshot_config.params.shard_number
+        )));
+    }
+    // Check hash ring shard scale
+    if snapshot_config.params.hash_ring_shard_scale != state.config.params.hash_ring_shard_scale {
+        return Err(StorageError::bad_input(format!(
+            "Snapshot is not compatible with existing collection: Collection hash ring shard scale: {} Snapshot hash ring shard scale: {}",
+            state.config.params.hash_ring_shard_scale, snapshot_config.params.hash_ring_shard_scale,
         )));
     }
 

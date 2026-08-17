@@ -100,6 +100,7 @@ impl TryFrom<grpc::CreateCollection> for CollectionMetaOperations {
             sparse_vectors_config,
             strict_mode_config,
             metadata,
+            hash_ring_shard_scale,
         } = value;
         let op = CreateCollectionOperation::new(
             collection_name,
@@ -128,6 +129,9 @@ impl TryFrom<grpc::CreateCollection> for CollectionMetaOperations {
                     .transpose()?,
                 strict_mode_config: strict_mode_config.map(strict_mode_from_api),
                 uuid: None,
+                // `None` leaves it for `submit_collection_meta_op` to fill in from the service
+                // default, resolved once there so every peer applies the same number.
+                hash_ring_shard_scale,
                 metadata: if metadata.is_empty() {
                     None
                 } else {
@@ -462,6 +466,34 @@ mod tests {
     fn test_grpc_update_collection_rejects_pinned_memory() {
         assert_rejected(update_request(Some(grpc::Memory::Pinned), None).try_into());
         assert_rejected(update_request(None, Some(grpc::Memory::Pinned)).try_into());
+    }
+
+    /// The scale has to survive this conversion rather than being dropped on the floor, because the
+    /// refusal lives further in, in `Dispatcher::submit_collection_meta_op`. Discarding it here is
+    /// what made a gRPC update silently report success while ignoring what was asked for — the
+    /// rejection cannot fire on a value that never arrives.
+    #[test]
+    fn test_grpc_update_collection_carries_hash_ring_shard_scale() {
+        let mut request = update_request(None, None);
+        request.params = Some(grpc::CollectionParamsDiff {
+            hash_ring_shard_scale: Some(256),
+            ..Default::default()
+        });
+
+        let operation: CollectionMetaOperations =
+            request.try_into().expect("conversion must succeed");
+        let CollectionMetaOperations::UpdateCollection(operation) = operation else {
+            panic!("expected an update operation");
+        };
+        assert_eq!(
+            operation
+                .update_collection
+                .params
+                .expect("params must survive the conversion")
+                .hash_ring_shard_scale,
+            Some(256),
+            "dropping the scale here would make the immutability check unreachable over gRPC",
+        );
     }
 
     #[test]

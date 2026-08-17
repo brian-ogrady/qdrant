@@ -147,6 +147,24 @@ pub struct CollectionParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(nested)]
     pub sparse_vectors: Option<BTreeMap<VectorNameBuf, SparseVectorParams>>,
+    /// Number of virtual nodes per shard on the hash ring.
+    ///
+    /// Range `1..=100_000`, default `100`. Higher values distribute points more evenly across
+    /// shards, at the cost of more memory per ring and slightly slower shard lookup.
+    ///
+    /// Read-only after creation. Fixed from the create request, or failing that the
+    /// `storage.collection.hash_ring_shard_scale` service default. It determines which shard each
+    /// point id belongs to, so changing it would remap a proportional fraction of the keyspace and
+    /// leave existing points unreachable by id — an update requesting a *different* value is
+    /// rejected, an update repeating the current one is accepted. To use another scale, create a
+    /// new collection and migrate the points into it.
+    ///
+    /// In a cluster, a non-default value additionally requires every known peer to support the
+    /// field; if one does not, creation falls back to the default.
+    #[serde(default = "default_hash_ring_shard_scale")]
+    #[validate(range(min = 1, max = 100_000))]
+    #[anonymize(false)]
+    pub hash_ring_shard_scale: u32,
 }
 
 /// Params of the payload storage
@@ -244,6 +262,11 @@ impl CollectionParams {
             on_disk_payload: _, // May be changed
             payload: _,      // May be changed
             sparse_vectors: _, // Sets may differ via named vector CRUD
+            // Immutable, but deliberately NOT enforced here: a failure from this function makes
+            // `apply_collections_snapshot` drop and recreate the collection, so a mismatch would
+            // cost all local data. `Collection::apply_config` guards it non-destructively instead,
+            // and no update request can express a change (see the field's docs).
+            hash_ring_shard_scale: _,
         } = other;
 
         let this_sharding_method = self.sharding_method.unwrap_or_default();
@@ -315,6 +338,11 @@ pub fn default_replication_factor() -> NonZeroU32 {
 
 pub fn default_write_consistency_factor() -> NonZeroU32 {
     NonZeroU32::new(1).unwrap()
+}
+
+/// Default for [`CollectionParams::hash_ring_shard_scale`]
+pub const fn default_hash_ring_shard_scale() -> u32 {
+    crate::hash_ring::DEFAULT_HASH_RING_SHARD_SCALE
 }
 
 pub const fn default_on_disk_payload() -> bool {
@@ -464,6 +492,7 @@ impl CollectionParams {
             payload: None,
             on_disk_payload: default_on_disk_payload_opt(),
             sparse_vectors: None,
+            hash_ring_shard_scale: default_hash_ring_shard_scale(),
         }
     }
 

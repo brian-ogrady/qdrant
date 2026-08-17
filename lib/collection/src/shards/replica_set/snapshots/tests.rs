@@ -237,6 +237,171 @@ async fn test_abandoned_snapshot_recovery_does_not_roll_back_the_retry() {
     target_replica_set.stop_gracefully().await;
 }
 
+/// A shard snapshot carries segments and WAL but no collection config, so nothing about the archive
+/// says which hash ring placed its points. Restoring one captured under a different scale leaves the
+/// points on disk but off the ring: unreachable by id, duplicated on re-upsert, and hard-deleted by
+/// the shard cleanup endpoint. The recorded scale in `shard_config.json` is what makes that
+/// detectable — this pins that the check exists and is wired into the restore.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_refuses_a_shard_snapshot_from_a_different_hash_ring_scale() {
+    const COLLECTION_SCALE: u32 = 7;
+
+    let target_collection_dir = Builder::new()
+        .prefix("scale-mismatch-target")
+        .tempdir()
+        .unwrap();
+    let target_replica_set = new_shard_replica_set_with_scale(
+        &target_collection_dir,
+        TEST_TARGET_SHARD_ID,
+        COLLECTION_SCALE,
+    )
+    .await;
+
+    // Stamped as if taken from a collection at the default scale, which this one is not.
+    let (_mismatched_dir, mismatched) = new_shard_snapshot().await;
+    ShardConfig::new_replica_set_with_scale(DEFAULT_HASH_RING_SHARD_SCALE)
+        .save(&mismatched)
+        .unwrap();
+
+    let err = target_replica_set
+        .restore_local_replica_from(
+            &mismatched,
+            RecoveryType::Full,
+            target_collection_dir.path(),
+            cancel::CancellationToken::new(),
+        )
+        .await
+        .expect_err("a snapshot from a different hash ring scale must be refused");
+
+    let message = err.to_string();
+    for expected in ["not compatible with collection", "hash ring shard scale"] {
+        assert!(
+            message.contains(expected),
+            "the rejection should explain the mismatch; missing {expected:?} in {message:?}",
+        );
+    }
+
+    // An archive with no recorded scale must be refused too, not waved through. Skipping the check
+    // when the field is absent is the tempting simplification, and it would re-admit every
+    // pre-existing and hand-edited archive into a collection that routes its points elsewhere.
+    let (_unstamped_dir, unstamped) = new_shard_snapshot().await;
+    ShardConfig::new_replica_set().save(&unstamped).unwrap();
+
+    let err = target_replica_set
+        .restore_local_replica_from(
+            &unstamped,
+            RecoveryType::Full,
+            target_collection_dir.path(),
+            cancel::CancellationToken::new(),
+        )
+        .await
+        .expect_err("a snapshot with no recorded scale must be treated as the historical default");
+    assert!(
+        err.to_string().contains("not compatible with collection"),
+        "expected a compatibility rejection, got {err:?}",
+    );
+
+    // The same snapshot, stamped to match, must still restore — otherwise the check would be
+    // refusing everything and the assertions above would prove nothing.
+    let (_matching_dir, matching) = new_shard_snapshot().await;
+    ShardConfig::new_replica_set_with_scale(COLLECTION_SCALE)
+        .save(&matching)
+        .unwrap();
+
+    target_replica_set
+        .restore_local_replica_from(
+            &matching,
+            RecoveryType::Full,
+            target_collection_dir.path(),
+            cancel::CancellationToken::new(),
+        )
+        .await
+        .expect("a snapshot recorded at the collection's own scale must be accepted");
+
+    target_replica_set.stop_gracefully().await;
+}
+
+/// Restoring a snapshot must re-record the scale, or the documented remedy for a diverged shard does
+/// not survive a restart.
+///
+/// `LocalShard::clear` deliberately preserves configuration files and `move_data` only moves shard
+/// data, so nothing in the restore chain rewrote `shard_config.json`. A shard whose data was placed
+/// under the wrong scale is *supposed* to be fixable by restoring a snapshot taken at the collection's
+/// scale — but with a stale stamp left behind, the next `ShardReplicaSet::load` re-flags the shard as
+/// diverged and refuses to serve data that is now correct. The operator would have to redo the restore
+/// after every restart, and only hand-editing `shard_config.json` would end it.
+#[tokio::test(flavor = "multi_thread")]
+async fn restoring_a_replica_records_the_scale_the_data_is_now_placed_under() {
+    // Deliberately not the default, so the assertions below cannot pass by coincidence.
+    const COLLECTION_SCALE: u32 = 7;
+
+    let target_collection_dir = Builder::new().prefix("restore-restamp").tempdir().unwrap();
+    let target_replica_set = new_shard_replica_set_with_scale(
+        &target_collection_dir,
+        TEST_TARGET_SHARD_ID,
+        COLLECTION_SCALE,
+    )
+    .await;
+
+    let shard_path = target_collection_dir
+        .path()
+        .join(TEST_TARGET_SHARD_ID.to_string());
+
+    // Put the shard in the state the remedy is for: its recorded scale disagrees with the collection.
+    ShardConfig::new_replica_set_with_scale(DEFAULT_HASH_RING_SHARD_SCALE)
+        .save(&shard_path)
+        .unwrap();
+    assert_ne!(
+        COLLECTION_SCALE, DEFAULT_HASH_RING_SHARD_SCALE,
+        "the two scales must differ or this test proves nothing",
+    );
+    assert_eq!(
+        target_replica_set
+            .diverged_hash_ring_shard_scale()
+            .await
+            .unwrap(),
+        Some(DEFAULT_HASH_RING_SHARD_SCALE),
+        "precondition: the shard must read as diverged before the restore",
+    );
+
+    // The remedy: restore a snapshot taken at the collection's own scale.
+    let (_matching_dir, matching) = new_shard_snapshot().await;
+    ShardConfig::new_replica_set_with_scale(COLLECTION_SCALE)
+        .save(&matching)
+        .unwrap();
+
+    target_replica_set
+        .restore_local_replica_from(
+            &matching,
+            RecoveryType::Full,
+            target_collection_dir.path(),
+            cancel::CancellationToken::new(),
+        )
+        .await
+        .expect("a snapshot at the collection's scale must restore");
+
+    // The restore has to leave the shard describing the data it now holds, on disk — checked by
+    // re-reading the file rather than any in-memory state, because it is the next process that reads it.
+    assert_eq!(
+        ShardConfig::load(&shard_path)
+            .unwrap()
+            .expect("the shard config must still exist")
+            .hash_ring_shard_scale,
+        Some(COLLECTION_SCALE),
+        "the restored shard must record the collection's scale, not the one it used to hold",
+    );
+    assert_eq!(
+        target_replica_set
+            .diverged_hash_ring_shard_scale()
+            .await
+            .unwrap(),
+        None,
+        "after the remedy the shard must no longer read as diverged, or the next restart re-flags it",
+    );
+
+    target_replica_set.stop_gracefully().await;
+}
+
 /// Build a valid unpacked shard snapshot to recover from.
 ///
 /// Returns the temp dir - which the caller must keep alive - and the replica path
@@ -315,6 +480,14 @@ fn install_restore_local_replica_before_flag_hook(
 }
 
 async fn new_shard_replica_set(collection_dir: &TempDir, shard_id: ShardId) -> ShardReplicaSet {
+    new_shard_replica_set_with_scale(collection_dir, shard_id, DEFAULT_HASH_RING_SHARD_SCALE).await
+}
+
+async fn new_shard_replica_set_with_scale(
+    collection_dir: &TempDir,
+    shard_id: ShardId,
+    hash_ring_shard_scale: u32,
+) -> ShardReplicaSet {
     let update_runtime = Handle::current();
     let search_runtime = AdaptiveSearchHandle::current_for_tests();
 
@@ -329,6 +502,7 @@ async fn new_shard_replica_set(collection_dir: &TempDir, shard_id: ShardId) -> S
         shard_number: NonZeroU32::new(1).unwrap(),
         replication_factor: NonZeroU32::new(1).unwrap(),
         write_consistency_factor: NonZeroU32::new(1).unwrap(),
+        hash_ring_shard_scale,
         ..CollectionParams::empty()
     };
 

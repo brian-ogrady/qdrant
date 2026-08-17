@@ -5,6 +5,7 @@ mod continuous_snapshot_test;
 mod create_shard_key_test;
 mod distance_matrix_test;
 mod grouping_test;
+mod hash_ring_scale_test;
 mod lookup_test;
 mod multi_vec_test;
 mod pagination_test;

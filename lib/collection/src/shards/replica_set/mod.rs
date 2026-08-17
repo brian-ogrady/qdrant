@@ -46,7 +46,7 @@ use crate::operations::types::{CollectionError, CollectionResult, UpdateResult, 
 use crate::operations::{CollectionUpdateOperations, OperationWithClockTag, point_ops};
 use crate::optimizers_builder::OptimizersConfig;
 use crate::shards::channel_service::ChannelService;
-use crate::shards::dummy_shard::DummyShard;
+use crate::shards::dummy_shard::{DummyShard, DummyShardReason};
 use crate::shards::replica_set::clock_set::ClockSet;
 use crate::shards::shard::{PeerId, Shard, ShardId};
 use crate::shards::shard_config::ShardConfig;
@@ -203,7 +203,9 @@ impl ShardReplicaSet {
 
         // Save shard config as the last step, to ensure that the file state is consistent
         // Presence of shard config indicates that the shard is ready to be used
-        let replica_set_shard_config = ShardConfig::new_replica_set();
+        let replica_set_shard_config = ShardConfig::new_replica_set_with_scale(
+            collection_config.read().await.params.hash_ring_shard_scale,
+        );
         replica_set_shard_config.save(&shard_path)?;
 
         Ok(Self {
@@ -282,18 +284,64 @@ impl ShardReplicaSet {
             &channel_service,
         );
 
+        // Does the data on disk belong to the ring this collection now routes with?
+        // Only a *recorded* scale can disagree. A shard from before the field existed has none and is
+        // never flagged.
+        let expected_hash_ring_shard_scale =
+            collection_config.read().await.params.hash_ring_shard_scale;
+        let diverged_hash_ring_shard_scale = ShardConfig::load(shard_path)
+            // Detection degrades to "no divergence" if the record cannot be read, rather than failing
+            // the load
+            .inspect_err(|err| {
+                log::error!(
+                    "Could not read the recorded hash ring shard scale for shard \
+                     {collection_id}:{shard_id} ({shard_path:?}): {err}. Continuing without \
+                     divergence detection for this shard",
+                );
+            })
+            .ok()
+            .flatten()
+            .filter(|config| {
+                config.diverges_from_hash_ring_shard_scale(expected_hash_ring_shard_scale)
+            })
+            .and_then(|config| config.hash_ring_shard_scale);
+
         let mut local_load_failure = false;
         let local = if replica_state.read().is_local {
             let shard = if let Some(recovery_reason) = &shared_storage_config.recovery_mode {
-                Shard::Dummy(DummyShard::new(recovery_reason))
+                Shard::Dummy(DummyShard::new(DummyShardReason::RecoveryMode(
+                    recovery_reason.clone(),
+                )))
+            } else if let Some(placed_under) = diverged_hash_ring_shard_scale {
+                //  unreachable in normal operation, but included for completeness
+                log::error!(
+                    "Shard {collection_id}:{shard_id} was placed under hash ring shard scale \
+                     {placed_under}, but collection {collection_id} is configured for \
+                     {expected_hash_ring_shard_scale} - loading as dummy shard. Its points would route \
+                     to other shards under the current ring, so it is kept intact and not served. \
+                     Which fix applies depends on which side is wrong. If the data is right, make the \
+                     collection's `hash_ring_shard_scale` {placed_under} again - note there is no API \
+                     for this, so on a single node it means editing `config.json`, and in a cluster \
+                     the value comes from consensus. If the configured \
+                     {expected_hash_ring_shard_scale} is right, replace this shard's data by \
+                     recovering it from a snapshot - but only once this peer's configured scale \
+                     agrees with the rest of the cluster, because an incoming snapshot is checked \
+                     against this peer's own config and one taken elsewhere in the collection would \
+                     itself be refused",
+                );
+                local_load_failure = true;
+                Shard::Dummy(DummyShard::new(
+                    DummyShardReason::HashRingShardScaleMismatch {
+                        placed_under,
+                        expected: expected_hash_ring_shard_scale,
+                    },
+                ))
             } else if is_dirty_shard {
                 log::error!(
                     "Shard {collection_id}:{shard_id} is not fully initialized - loading as dummy shard"
                 );
                 // This dummy shard will be replaced only when it rejects an update (marked as dead so recovery process kicks in)
-                Shard::Dummy(DummyShard::new(
-                    "Dirty shard - shard is not fully initialized",
-                ))
+                Shard::Dummy(DummyShard::new(DummyShardReason::DirtyShard))
             } else {
                 let res = LocalShard::load(
                     shard_id,
@@ -325,9 +373,9 @@ impl ShardReplicaSet {
                              {err}"
                         );
 
-                        Shard::Dummy(DummyShard::new(format!(
+                        Shard::Dummy(DummyShard::new(DummyShardReason::LoadFailed(format!(
                             "Failed to load local shard {shard_path:?}: {err}"
-                        )))
+                        ))))
                     }
                 }
             };
@@ -433,6 +481,20 @@ impl ShardReplicaSet {
     pub async fn is_dummy(&self) -> bool {
         let local_read = self.local.read().await;
         matches!(*local_read, Some(Shard::Dummy(_)))
+    }
+
+    /// Why this shard's local data must not be discarded, if it must not be.
+    ///
+    /// `None` means nothing stands in the way: either there is no local dummy shard at all, or its
+    /// reason is one that recovery is expected to replace.
+    pub async fn local_dummy_reason_forbidding_discard(&self) -> Option<DummyShardReason> {
+        let local = self.local.read().await;
+        let Some(Shard::Dummy(dummy)) = &*local else {
+            return None;
+        };
+
+        let reason = dummy.reason();
+        (!reason.may_be_discarded()).then(|| reason.clone())
     }
 
     pub fn peers(&self) -> HashMap<PeerId, ReplicaState> {
@@ -599,8 +661,52 @@ impl ShardReplicaSet {
         }
     }
 
+    /// Hash ring scale this shard's data was placed under, when it disagrees with the scale the
+    /// collection now routes with.
+    pub async fn diverged_hash_ring_shard_scale(&self) -> CollectionResult<Option<u32>> {
+        let expected = self
+            .collection_config
+            .read()
+            .await
+            .params
+            .hash_ring_shard_scale;
+
+        Ok(ShardConfig::load(&self.shard_path)?
+            .filter(|config| config.diverges_from_hash_ring_shard_scale(expected))
+            .and_then(|config| config.hash_ring_shard_scale))
+    }
+
+    /// Refuses to destroy local data that was placed under a different hash ring scale than the one the
+    /// collection now routes with.
+    async fn ensure_safe_to_clear_local(&self, operation: &str) -> CollectionResult<()> {
+        let Some(placed_under) = self.diverged_hash_ring_shard_scale().await? else {
+            return Ok(());
+        };
+
+        let expected = self
+            .collection_config
+            .read()
+            .await
+            .params
+            .hash_ring_shard_scale;
+
+        Err(CollectionError::service_error(format!(
+            "refusing to {operation} for shard {}:{} - its points were placed under hash ring shard \
+             scale {placed_under} but the collection is configured for {expected}, so clearing it \
+             would destroy the only copy of that data. Make the collection's \
+             `hash_ring_shard_scale` {placed_under} again to bring this shard back; to discard it \
+             instead, recover the shard from a snapshot, which is checked against this peer's \
+             configured scale rather than blindly cleared",
+            self.collection_id, self.shard_id,
+        )))
+    }
+
     /// Clears the local shard data and loads an empty local shard
     pub async fn init_empty_local_shard(&self) -> CollectionResult<()> {
+        // Do not clear as part of recovering a shard whose data disagrees with the collection's ring
+        self.ensure_safe_to_clear_local("initialize an empty local shard")
+            .await?;
+
         let mut local = self.local.write().await;
 
         let current_shard = local.take();
@@ -625,6 +731,17 @@ impl ShardReplicaSet {
 
         match local_shard_res {
             Ok(local_shard) => {
+                // This directory now holds data placed under the collection's *current* scale, so
+                // re-record it. `LocalShard::clear` deliberately preserves `shard_config.json`, so
+                // without this the stamp would keep describing the data that used to be here.
+                let scale = self
+                    .collection_config
+                    .read()
+                    .await
+                    .params
+                    .hash_ring_shard_scale;
+                ShardConfig::new_replica_set_with_scale(scale).save(&self.shard_path)?;
+
                 *local = Some(Shard::Local(local_shard));
                 Ok(())
             }
@@ -634,7 +751,9 @@ impl ShardReplicaSet {
                     self.shard_path
                 );
                 log::error!("{error}");
-                *local = Some(Shard::Dummy(DummyShard::new(error)));
+                *local = Some(Shard::Dummy(DummyShard::new(
+                    DummyShardReason::InitializationFailed(error),
+                )));
                 Err(err)
             }
         }
@@ -680,6 +799,21 @@ impl ShardReplicaSet {
         };
 
         if let Some(removing_local) = removing_local {
+            // Deliberately NOT guarded by `ensure_safe_to_clear_local`, unlike the recovery paths.
+            // Removing a replica is an explicit instruction to stop holding this data here — dropping a
+            // replica, or a transfer that moved it elsewhere — so refusing would block a legitimate
+            // operation, and for a diverged shard it would leave the operator no way to drop it at all.
+            if let Ok(Some(placed_under)) = self.diverged_hash_ring_shard_scale().await {
+                log::warn!(
+                    "Removing local shard {}:{} whose points were placed under hash ring shard scale \
+                     {placed_under}, which disagrees with the collection - this deletes the only copy \
+                     of that data. It was being kept intact for recovery; removing the replica \
+                     discards it",
+                    self.collection_id,
+                    self.shard_id,
+                );
+            }
+
             // stop ongoing tasks and delete data
             removing_local.stop_gracefully().await;
             LocalShard::clear(&self.shard_path).await?;

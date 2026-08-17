@@ -11,8 +11,9 @@ use shard::snapshots::snapshot_utils::{SnapshotMergePlan, SnapshotUtils};
 
 use super::{REPLICA_STATE_FILE, ShardReplicaSet};
 use crate::common::file_utils::{move_dir, move_file};
+use crate::hash_ring::DEFAULT_HASH_RING_SHARD_SCALE;
 use crate::operations::types::{CollectionError, CollectionResult};
-use crate::shards::dummy_shard::DummyShard;
+use crate::shards::dummy_shard::{DummyShard, DummyShardReason};
 use crate::shards::local_shard::LocalShard;
 use crate::shards::replica_set::replica_set_state::ReplicaSetState;
 use crate::shards::shard::{PeerId, Shard};
@@ -50,6 +51,15 @@ impl ShardReplicaSet {
         let replica_state = self.replica_state.clone();
         let temp_path = temp_path.to_path_buf();
 
+        // Read before the future is built, so the value recorded in the snapshot is the one in
+        // effect when the snapshot was requested.
+        let hash_ring_shard_scale = self
+            .collection_config
+            .read()
+            .await
+            .params
+            .hash_ring_shard_scale;
+
         let local_read = self.local.read().await;
 
         let maybe_local_snapshot_future = if let Some(local) = &*local_read {
@@ -73,7 +83,7 @@ impl ShardReplicaSet {
 
             replica_state.save_to_tar(&tar, REPLICA_STATE_FILE).await?;
 
-            let shard_config = ShardConfig::new_replica_set();
+            let shard_config = ShardConfig::new_replica_set_with_scale(hash_ring_shard_scale);
             shard_config.save_to_tar(&tar).await?;
             Ok(())
         };
@@ -156,6 +166,41 @@ impl ShardReplicaSet {
         Ok(())
     }
 
+    /// Refuse a shard snapshot whose points were routed by a different hash ring than this
+    /// collection's.
+    async fn check_snapshot_hash_ring_compatible(
+        &self,
+        replica_path: &Path,
+    ) -> CollectionResult<()> {
+        let collection_scale = self
+            .collection_config
+            .read()
+            .await
+            .params
+            .hash_ring_shard_scale;
+
+        // Two distinct absent cases, both meaning "predates the field" and both resolving to the
+        // scale of that era: no `shard_config.json` in the archive at all (`load` yields `None`), and
+        // a config present without the key (handled inside `snapshot_hash_ring_shard_scale`).
+        let snapshot_scale = ShardConfig::load(replica_path)?
+            .as_ref()
+            .map_or(DEFAULT_HASH_RING_SHARD_SCALE, |config| {
+                config.snapshot_hash_ring_shard_scale()
+            });
+
+        if snapshot_scale != collection_scale {
+            return Err(CollectionError::bad_input(format!(
+                "shard snapshot is not compatible with collection {}: \
+                 snapshot hash ring shard scale is {snapshot_scale}, collection is \
+                 {collection_scale}. The scale determines which shard each point belongs to, so \
+                 restoring this snapshot here would leave its points unreachable by id",
+                self.collection_id,
+            )));
+        }
+
+        Ok(())
+    }
+
     /// # Cancel safety
     ///
     /// This method is *not* cancel safe.
@@ -174,6 +219,9 @@ impl ShardReplicaSet {
 
         let snapshot_manifest =
             SnapshotManifest::load_from_snapshot(replica_path, Some(recovery_type))?;
+
+        self.check_snapshot_hash_ring_compatible(replica_path)
+            .await?;
 
         // TODO:
         //   Check that shard snapshot is compatible with the collection
@@ -346,6 +394,21 @@ impl ShardReplicaSet {
 
         match restore.await {
             Ok(new_local) => {
+                // Re-record the scale this directory's points are now placed under. The data just came
+                // from the snapshot, and `check_snapshot_hash_ring_compatible` above established that
+                // the snapshot was routed at the collection's scale — but neither `LocalShard::clear`
+                // (which deliberately preserves configuration files) nor `move_data`/`move_dir` touches
+                // `shard_config.json`, so without this the stamp still describes the data that used to
+                // be here.
+                ShardConfig::new_replica_set_with_scale(
+                    self.collection_config
+                        .read()
+                        .await
+                        .params
+                        .hash_ring_shard_scale,
+                )
+                .save(&self.shard_path)?;
+
                 local.replace(Shard::Local(new_local));
                 // remove shard_id initialization flag because shard is fully recovered
                 tokio_fs::remove_file(&shard_flag).await?;
@@ -360,7 +423,7 @@ impl ShardReplicaSet {
             Err(restore_err) => {
                 // Initialize "dummy" replica
                 local.replace(Shard::Dummy(DummyShard::new(
-                    "Failed to restore local replica",
+                    DummyShardReason::RestoreFailed("Failed to restore local replica".into()),
                 )));
 
                 // Mark local replica as Dead since it's dummy and dirty
@@ -425,6 +488,14 @@ impl ShardReplicaSet {
             )));
         }
 
+        // A shard whose data was placed under a different hash ring scale is *not* source-of-truth, so
+        // the check above lets it through - but it is also not something to discard on the way to a
+        // refill. This runs before the download (see `recover_shard_snapshot`), so without it an
+        // automatic transfer onto a diverged replica deletes the data first and only then discovers the
+        // replacement is incompatible.
+        self.ensure_safe_to_clear_local("clear the local shard for snapshot recovery")
+            .await?;
+
         let mut local = self.local.write().await;
 
         // Mark the shard as initializing before touching disk, so a crash during or
@@ -439,7 +510,7 @@ impl ShardReplicaSet {
         // keep reporting a local shard while the data is cleared and the replacement
         // snapshot is recovered. `restore_local_replica_from` drops this dummy afterwards.
         let dummy = Shard::Dummy(DummyShard::new(
-            "Local shard is being cleared for snapshot recovery",
+            DummyShardReason::ClearingForSnapshotRecovery,
         ));
         if let Some(shard) = local.replace(dummy) {
             shard.stop_gracefully().await;

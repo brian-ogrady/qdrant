@@ -442,7 +442,10 @@ impl TableOfContent {
         self.get_collection_unchecked(collection.name()).await
     }
 
-    async fn get_collection_opt(&self, collection_name: String) -> Option<Arc<Collection>> {
+    pub(crate) async fn get_collection_opt(
+        &self,
+        collection_name: String,
+    ) -> Option<Arc<Collection>> {
         self.get_collection_unchecked(&collection_name).await.ok()
     }
 

@@ -191,6 +191,12 @@ pub struct CreateCollection {
     /// such as creation time, migration data, inference model info, etc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Payload>,
+    /// Number of virtual nodes each shard gets on the hash ring.
+    /// Immutable once the collection exists, because changing it
+    /// would remap a proportional fraction of the keyspace.
+    #[serde(default)]
+    #[validate(range(min = 1, max = 100_000))]
+    pub hash_ring_shard_scale: Option<u32>,
 }
 
 /// Operation for creating new collection and (optionally) specify index params
@@ -536,6 +542,7 @@ impl From<CollectionConfigInternal> for CreateCollection {
             on_disk_payload,
             payload,
             sparse_vectors,
+            hash_ring_shard_scale,
         } = params;
 
         Self {
@@ -554,6 +561,9 @@ impl From<CollectionConfigInternal> for CreateCollection {
             strict_mode_config,
             uuid,
             metadata,
+            // Carried over rather than left for the environment to fill in: this conversion exists
+            // to reproduce an existing collection's config, and the scale is part of it.
+            hash_ring_shard_scale: Some(hash_ring_shard_scale),
         }
     }
 }

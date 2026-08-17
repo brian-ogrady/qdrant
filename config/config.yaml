@@ -232,6 +232,11 @@ storage:
     # How many replicas should apply the operation for us to consider it successful
     write_consistency_factor: 1
 
+    # Number of virtual nodes each shard gets on the hash ring, for collections created without an
+    # explicit `hash_ring_shard_scale`. Higher values spread points more evenly across shards, at
+    # the cost of more memory per ring and slightly slower shard lookup. Must be 1..=100000.
+    # hash_ring_shard_scale: 100
+
     # Default parameters for vectors.
     vectors:
       # Deprecated: use `memory` instead.

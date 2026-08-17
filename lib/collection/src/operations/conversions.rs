@@ -41,8 +41,9 @@ use super::types::{
     VectorsConfigDiff,
 };
 use crate::config::{
-    CollectionParams, PayloadStorageParams, ShardingMethod, WalConfig, default_on_disk_payload,
-    default_replication_factor, default_write_consistency_factor,
+    CollectionParams, PayloadStorageParams, ShardingMethod, WalConfig,
+    default_hash_ring_shard_scale, default_on_disk_payload, default_replication_factor,
+    default_write_consistency_factor,
 };
 use crate::lookup::WithLookup;
 use crate::lookup::types::WithLookupInterface;
@@ -334,6 +335,7 @@ impl TryFrom<api::grpc::qdrant::CollectionParamsDiff> for CollectionParamsDiff {
             on_disk_payload,
             read_fan_out_delay_ms,
             payload,
+            hash_ring_shard_scale,
         } = value;
         Ok(Self {
             replication_factor: replication_factor
@@ -353,6 +355,7 @@ impl TryFrom<api::grpc::qdrant::CollectionParamsDiff> for CollectionParamsDiff {
             read_fan_out_delay_ms,
             on_disk_payload,
             payload: payload.map(PayloadStorageParams::try_from).transpose()?,
+            hash_ring_shard_scale,
         })
     }
 }
@@ -472,6 +475,7 @@ impl From<CollectionInfo> for api::grpc::qdrant::CollectionInfo {
             read_fan_out_factor,
             sharding_method,
             sparse_vectors,
+            hash_ring_shard_scale,
         } = params;
 
         api::grpc::qdrant::CollectionInfo {
@@ -538,6 +542,7 @@ impl From<CollectionInfo> for api::grpc::qdrant::CollectionInfo {
                     }),
                     read_fan_out_delay_ms,
                     payload: payload.map(api::grpc::qdrant::PayloadStorageParams::from),
+                    hash_ring_shard_scale: Some(hash_ring_shard_scale),
                 }),
                 hnsw_config: Some(api::grpc::qdrant::HnswConfigDiff {
                     m: Some(m as u64),
@@ -1925,6 +1930,7 @@ impl TryFrom<api::grpc::qdrant::CollectionConfig> for CollectionConfig {
                         sharding_method,
                         sparse_vectors_config,
                         read_fan_out_delay_ms,
+                        hash_ring_shard_scale,
                     } = params;
                     CollectionParams {
                         vectors: match vectors_config {
@@ -1983,6 +1989,10 @@ impl TryFrom<api::grpc::qdrant::CollectionConfig> for CollectionConfig {
                             .transpose()?,
                         read_fan_out_delay_ms,
                         payload: payload.map(PayloadStorageParams::try_from).transpose()?,
+                        // `None` means the responding peer predates the proto field, so fall back to
+                        // the scale those collections were routed at rather than inventing one.
+                        hash_ring_shard_scale: hash_ring_shard_scale
+                            .unwrap_or_else(default_hash_ring_shard_scale),
                     }
                 }
             },

@@ -24,6 +24,10 @@ pub struct CollectionConfigDefaults {
     #[validate(range(min = 1))]
     pub write_consistency_factor: Option<u32>,
 
+    /// Virtual nodes per shard on the hash ring, for collections created without an explicit value.
+    #[validate(range(min = 1, max = 100_000))]
+    pub hash_ring_shard_scale: Option<u32>,
+
     #[validate(nested)]
     pub strict_mode: Option<StrictModeConfig>,
 }

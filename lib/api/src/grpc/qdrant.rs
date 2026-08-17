@@ -1248,6 +1248,11 @@ pub struct CreateCollection {
     /// Configuration of the payload storage
     #[prost(message, optional, tag = "19")]
     pub payload: ::core::option::Option<PayloadStorageParams>,
+    /// Number of virtual nodes each shard gets on the hash ring. Higher values spread points more
+    /// evenly across shards, at the cost of more memory per ring and slightly slower shard lookup.
+    /// Immutable once the collection exists. If unset, the service default is used.
+    #[prost(uint32, optional, tag = "20")]
+    pub hash_ring_shard_scale: ::core::option::Option<u32>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -1363,6 +1368,11 @@ pub struct CollectionParams {
     /// Configuration of the payload storage
     #[prost(message, optional, tag = "12")]
     pub payload: ::core::option::Option<PayloadStorageParams>,
+    /// Number of virtual nodes each shard gets on the hash ring. Read-only; fixed when the collection
+    /// is created. Optional so that a response from a peer that does not report it is distinguishable
+    /// from a real value (0 is not a valid scale).
+    #[prost(uint32, optional, tag = "13")]
+    pub hash_ring_shard_scale: ::core::option::Option<u32>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -1390,6 +1400,13 @@ pub struct CollectionParamsDiff {
     /// Update params of the payload storage
     #[prost(message, optional, tag = "6")]
     pub payload: ::core::option::Option<PayloadStorageParams>,
+    /// Number of virtual nodes per shard on the hash ring. Read-only after the collection is
+    /// created: it decides which shard a point id lands on, so changing it would remap part of the
+    /// keyspace. Sending the collection's current value is accepted; sending a different
+    /// value is rejected.
+    #[prost(uint32, optional, tag = "7")]
+    #[validate(range(min = 1, max = 100_000))]
+    pub hash_ring_shard_scale: ::core::option::Option<u32>,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]

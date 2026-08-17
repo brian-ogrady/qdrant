@@ -126,7 +126,11 @@ impl Collection {
         let start_time = std::time::Instant::now();
 
         let sharding_method = collection_config.params.sharding_method.unwrap_or_default();
-        let mut shard_holder = ShardHolder::new(path, sharding_method)?;
+        let mut shard_holder = ShardHolder::new(
+            path,
+            sharding_method,
+            collection_config.params.hash_ring_shard_scale,
+        )?;
         shard_holder.set_shard_key_mappings(shard_key_mapping.clone().unwrap_or_default())?;
 
         let payload_index_schema = Arc::new(Self::load_payload_index_schema(path)?);
@@ -259,8 +263,12 @@ impl Collection {
         collection_config.validate_and_warn();
 
         let sharding_method = collection_config.params.sharding_method.unwrap_or_default();
-        let mut shard_holder =
-            ShardHolder::new(path, sharding_method).expect("Can not create shard holder");
+        let mut shard_holder = ShardHolder::new(
+            path,
+            sharding_method,
+            collection_config.params.hash_ring_shard_scale,
+        )
+        .expect("Can not create shard holder");
 
         let mut effective_optimizers_config = collection_config.optimizer_config.clone();
 
@@ -810,6 +818,16 @@ impl Collection {
             // Don't recover replicas if not dead
             let is_dead = this_peer_state == Some(Dead);
             if !is_dead {
+                continue;
+            }
+
+            // Don't automatically recover a replica whose data was used a different hash ring scale.
+            if let Some(reason) = replica_set.local_dummy_reason_forbidding_discard().await {
+                log::debug!(
+                    "Not proposing automatic recovery of shard {}:{shard_id}: {reason}. \
+                     This needs manual intervention",
+                    self.name(),
+                );
                 continue;
             }
 

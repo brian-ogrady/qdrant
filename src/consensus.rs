@@ -1706,6 +1706,7 @@ mod tests {
                                 strict_mode_config: None,
                                 uuid: None,
                                 metadata: None,
+                                hash_ring_shard_scale: None,
                             },
                         )
                         .unwrap(),

@@ -27,16 +27,104 @@ use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQu
 use crate::shards::shard_trait::{ShardOperation, WaitUntil};
 use crate::shards::telemetry::LocalShardTelemetry;
 
+/// Why a local shard is standing in as a [`DummyShard`] instead of serving.
+///
+/// This exists to answer one question that consumers cannot otherwise ask: **may the data in this
+/// shard's directory be discarded?** Most causes of a dummy shard mean "yes, and please refill me" —
+/// the recovery machinery relies on that, clearing the directory and pulling a fresh copy from another
+/// replica. One cause means the exact opposite, and reading it as discardable destroys the only copy of
+/// the data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DummyShardReason {
+    /// Qdrant was started in recovery mode, so no local shard was loaded at all.
+    RecoveryMode(String),
+
+    /// The shard is not fully initialized — the "dirty shard" flag is set, so a previous write or
+    /// recovery was interrupted partway. Recovery is expected to replace it.
+    DirtyShard,
+
+    /// The shard's points were placed by a hash ring at a different scale than the collection now
+    /// routes with, so serving them would misroute every id in the shard.
+    ///
+    /// The one reason that must **not** be discarded: this directory holds the only copy of data placed
+    /// under `placed_under`, and restoring the collection to that scale is supposed to bring it back.
+    HashRingShardScaleMismatch { placed_under: u32, expected: u32 },
+
+    /// Placeholder held while the local shard is deliberately cleared ahead of a snapshot recovery.
+    ClearingForSnapshotRecovery,
+
+    /// Loading the shard from disk failed.
+    LoadFailed(String),
+
+    /// Restoring the shard from a snapshot failed, and its data was cleared.
+    RestoreFailed(String),
+
+    /// Building a fresh empty local shard failed.
+    InitializationFailed(String),
+}
+
+impl DummyShardReason {
+    /// Whether the data in this shard's directory may be discarded to make room for a replacement.
+    ///
+    /// `false` means the bytes on disk are the only copy and destroying them loses data. Callers that
+    /// clear or remove shard data must not do so when this is `false` without explicit operator intent.
+    pub fn may_be_discarded(&self) -> bool {
+        match self {
+            // All of these mean the directory holds nothing worth keeping, or is expected to be
+            // replaced by a healthy copy.
+            Self::RecoveryMode(_)
+            | Self::DirtyShard
+            | Self::ClearingForSnapshotRecovery
+            | Self::LoadFailed(_)
+            | Self::RestoreFailed(_)
+            | Self::InitializationFailed(_) => true,
+
+            // The only copy of data placed under another scale. See the variant's docs.
+            Self::HashRingShardScaleMismatch { .. } => false,
+        }
+    }
+}
+
+impl std::fmt::Display for DummyShardReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecoveryMode(reason) => write!(f, "{reason}"),
+            Self::DirtyShard => write!(f, "Dirty shard - shard is not fully initialized"),
+            Self::HashRingShardScaleMismatch {
+                placed_under,
+                expected,
+            } => write!(
+                f,
+                "Shard was placed under hash ring shard scale {placed_under}, \
+                 but the collection is configured for {expected}",
+            ),
+            Self::ClearingForSnapshotRecovery => {
+                write!(f, "Local shard is being cleared for snapshot recovery")
+            }
+            Self::LoadFailed(err) => write!(f, "{err}"),
+            Self::RestoreFailed(err) => write!(f, "{err}"),
+            Self::InitializationFailed(err) => write!(f, "{err}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DummyShard {
+    reason: DummyShardReason,
     message: String,
 }
 
 impl DummyShard {
-    pub fn new(message: impl Into<String>) -> Self {
+    pub fn new(reason: DummyShardReason) -> Self {
         Self {
-            message: message.into(),
+            message: reason.to_string(),
+            reason,
         }
+    }
+
+    /// Why this shard is not serving, in a form consumers can branch on.
+    pub fn reason(&self) -> &DummyShardReason {
+        &self.reason
     }
 
     pub fn snapshot_manifest(&self) -> CollectionResult<SnapshotManifest> {
@@ -211,4 +299,87 @@ impl ShardOperation for DummyShard {
     }
 
     async fn stop_gracefully(self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The distinction the type exists for. Every cause that means "this directory is expendable" must
+    /// read as discardable, and the one that means "this is the only copy" must not — that inversion is
+    /// what previously destroyed a diverged shard and then could not refill it.
+    #[test]
+    fn only_a_scale_mismatch_forbids_discarding_the_data() {
+        let discardable = [
+            DummyShardReason::RecoveryMode("recovering".into()),
+            DummyShardReason::DirtyShard,
+            DummyShardReason::ClearingForSnapshotRecovery,
+            DummyShardReason::LoadFailed("boom".into()),
+            DummyShardReason::RestoreFailed("boom".into()),
+            DummyShardReason::InitializationFailed("boom".into()),
+        ];
+        for reason in &discardable {
+            assert!(
+                reason.may_be_discarded(),
+                "{reason:?} should be discardable - recovery relies on refilling these",
+            );
+        }
+
+        let protected = DummyShardReason::HashRingShardScaleMismatch {
+            placed_under: 7,
+            expected: 100,
+        };
+        assert!(
+            !protected.may_be_discarded(),
+            "a scale mismatch means the directory holds the only copy of that data",
+        );
+
+        // Guards against the whole thing collapsing to one answer, which would make the loop above
+        // pass while protecting nothing.
+        assert_ne!(
+            discardable[0].may_be_discarded(),
+            protected.may_be_discarded(),
+            "the two kinds must not answer the same way",
+        );
+    }
+
+    /// The reason has to survive into the message a caller sees, because that message is the only thing
+    /// an operator gets when a write is refused.
+    #[test]
+    fn the_reason_reaches_the_error_a_caller_sees() {
+        let shard = DummyShard::new(DummyShardReason::HashRingShardScaleMismatch {
+            placed_under: 7,
+            expected: 100,
+        });
+
+        let message = shard.dummy_error("update").to_string();
+        for expected in ["hash ring shard scale", "7", "100"] {
+            assert!(
+                message.contains(expected),
+                "the error should carry {expected:?}, got {message:?}",
+            );
+        }
+
+        assert_eq!(
+            shard.reason(),
+            &DummyShardReason::HashRingShardScaleMismatch {
+                placed_under: 7,
+                expected: 100,
+            },
+            "the reason must be readable back for consumers that branch on it",
+        );
+    }
+
+    /// A dirty shard is the case recovery depends on, so its message must stay recognisable.
+    #[test]
+    fn a_dirty_shard_still_reports_itself_as_before() {
+        let shard = DummyShard::new(DummyShardReason::DirtyShard);
+        assert!(
+            shard
+                .dummy_error("update")
+                .to_string()
+                .contains("Dirty shard")
+        );
+        assert!(shard.reason().may_be_discarded());
+    }
 }

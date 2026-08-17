@@ -161,6 +161,23 @@ impl Collection {
                 )));
             }
 
+            // Guard the hash ring scale here rather than in `CollectionParams::check_compatible`.
+            // This must be caught rather than applied: the scale is a routing input, and the
+            // in-memory hash rings in `ShardHolder` are built from it once at load time. Silently
+            // accepting a different value would leave `config.json` and the live rings disagreeing,
+            // and the next restart would rebuild the rings at the new scale and orphan every point
+            // written under the old one.
+            if config.params.hash_ring_shard_scale != new_config.params.hash_ring_shard_scale {
+                return Err(CollectionError::service_error(format!(
+                    "collection {} hash ring shard scale mismatch: \
+                     existing collection scale: {}, Raft snapshot collection scale: {}. \
+                     The scale determines point-to-shard routing and cannot change in place",
+                    self.id,
+                    config.params.hash_ring_shard_scale,
+                    new_config.params.hash_ring_shard_scale,
+                )));
+            }
+
             if let Err(err) = config.params.check_compatible(&new_config.params) {
                 // Stop consensus with a service error, if new config is incompatible with current one.
                 //

@@ -4,6 +4,7 @@ use std::sync::LazyLock;
 use collection::collection_state;
 use collection::config::ShardingMethod;
 use collection::events::{CollectionDeletedEvent, IndexCreatedEvent};
+use collection::hash_ring::MAX_HASH_RING_VIRTUAL_NODES;
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
 use collection::shards::replica_set::replica_set_state::ReplicaState;
 use collection::shards::transfer::ShardTransfer;
@@ -693,8 +694,26 @@ impl TableOfContent {
             ReplicaState::Active
         };
 
-        self.get_collection_unchecked(&operation.collection_name)
-            .await?
+        let collection = self
+            .get_collection_unchecked(&operation.collection_name)
+            .await?;
+
+        // Checked on the apply path rather than at the API boundary so every peer refuses the same
+        // operation, matching where `create_collection` enforces it.
+        let shards = operation.placement.len() as u64;
+        let scale = u64::from(collection.hash_ring_shard_scale().await);
+        let virtual_nodes = scale * shards;
+        if virtual_nodes > MAX_HASH_RING_VIRTUAL_NODES {
+            return Err(StorageError::bad_input(format!(
+                "shard key {:?} with {shards} shards needs {virtual_nodes} virtual nodes on its hash \
+                 ring at `hash_ring_shard_scale` {scale}, above the limit of \
+                 {MAX_HASH_RING_VIRTUAL_NODES}. Use fewer shards for this key, or a collection with a \
+                 lower `hash_ring_shard_scale`",
+                operation.shard_key,
+            )));
+        }
+
+        collection
             .create_shard_key(operation.shard_key, operation.placement, init_state)
             .await?;
 

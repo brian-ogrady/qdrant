@@ -9,6 +9,7 @@ use collection::collection::Collection;
 use collection::config::{
     self, CollectionConfigInternal, CollectionParams, PayloadStorageParams, ShardingMethod,
 };
+use collection::hash_ring::{MAX_HASH_RING_SHARD_SCALE, MAX_HASH_RING_VIRTUAL_NODES};
 use collection::operations::config_diff::DiffConfig as _;
 use collection::operations::types::{CollectionResult, VectorParams, VectorsConfig};
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
@@ -82,7 +83,23 @@ impl TableOfContent {
             strict_mode_config,
             uuid,
             metadata,
+            hash_ring_shard_scale,
         } = operation;
+
+        // Normally populated by `submit_collection_meta_op` before this operation was proposed or
+        // applied. `None` means the request did not come through that path, so fall back to the
+        // historical scale rather than this peer's environment.
+        let hash_ring_shard_scale =
+            hash_ring_shard_scale.unwrap_or_else(config::default_hash_ring_shard_scale);
+
+        // Checked before any directory is created, so a rejected value cannot leave a half-built
+        // collection behind.
+        if !(1..=MAX_HASH_RING_SHARD_SCALE).contains(&hash_ring_shard_scale) {
+            return Err(StorageError::bad_input(format!(
+                "`hash_ring_shard_scale` must be in 1..={MAX_HASH_RING_SHARD_SCALE}, \
+                 got {hash_ring_shard_scale}",
+            )));
+        }
 
         {
             let collections = self.collections.read().await;
@@ -141,6 +158,17 @@ impl TableOfContent {
             }
         };
 
+        let virtual_nodes = u64::from(hash_ring_shard_scale) * u64::from(shard_number);
+        if virtual_nodes > MAX_HASH_RING_VIRTUAL_NODES {
+            return Err(StorageError::bad_input(format!(
+                "`hash_ring_shard_scale` of {hash_ring_shard_scale} with {shard_number} shards needs \
+                 {virtual_nodes} virtual nodes on the hash ring, above the limit of \
+                 {MAX_HASH_RING_VIRTUAL_NODES}. Virtual nodes exist to even out distribution when \
+                 there are few shards, so a collection with this many shards does not need a high \
+                 scale — lower `hash_ring_shard_scale` or reduce `shard_number`",
+            )));
+        }
+
         let replication_factor = replication_factor
             .or_else(|| collection_defaults_config.and_then(|i| i.replication_factor))
             .unwrap_or_else(|| config::default_replication_factor().get());
@@ -183,6 +211,7 @@ impl TableOfContent {
             )?,
             read_fan_out_factor: None,
             read_fan_out_delay_ms: None,
+            hash_ring_shard_scale,
         };
         let wal_config = self.storage_config.wal.update_opt(wal_config_diff.as_ref());
 

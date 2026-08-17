@@ -17,6 +17,7 @@ use collection::operations::cluster_ops::{
 };
 use collection::operations::types::{AliasDescription, CollectionsAliasesResponse};
 use collection::operations::verification::new_unchecked_verification_pass;
+use storage::content_manager::collection_meta_ops::CollectionMetaOperations;
 use storage::dispatcher::Dispatcher;
 use tonic::{Request, Response, Status};
 
@@ -49,9 +50,18 @@ impl CollectionsService {
         let auth = extract_auth(&mut request);
         let operation = request.into_inner();
         let wait_timeout = operation.wait_timeout();
+        let operation = operation.try_into()?;
+
+        if let CollectionMetaOperations::CreateCollection(create) = &operation {
+            self.dispatcher.check_hash_ring_shard_scale_requestable(
+                &create.collection_name,
+                create.create_collection.hash_ring_shard_scale,
+            )?;
+        }
+
         let result = self
             .dispatcher
-            .submit_collection_meta_op(operation.try_into()?, auth, wait_timeout)
+            .submit_collection_meta_op(operation, auth, wait_timeout)
             .await?;
 
         let response = CollectionOperationResponse::from((timing, result));

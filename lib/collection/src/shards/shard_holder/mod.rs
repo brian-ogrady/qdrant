@@ -43,7 +43,7 @@ use crate::common::collection_size_stats::CollectionSizeStats;
 use crate::common::snapshot_stream::SnapshotStream;
 use crate::common::timeout_writer::TimeoutWriter;
 use crate::config::{CollectionConfigInternal, ShardingMethod};
-use crate::hash_ring::HashRingRouter;
+use crate::hash_ring::{HashRingRouter, MAX_HASH_RING_SHARD_SCALE};
 use crate::operations::cluster_ops::ReshardingDirection;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::shared_storage_config::SharedStorageConfig;
@@ -97,6 +97,14 @@ pub struct ShardHolder {
     // Duplicates the information from `key_mapping` for faster access, does not use locking
     shard_id_to_key_mapping: AHashMap<ShardId, ShardKey>,
     sharding_method: ShardingMethod,
+    /// Virtual nodes per shard for every hash ring in this holder.
+    ///
+    /// Mirrors the owning collection's persisted
+    /// [`CollectionParams::hash_ring_shard_scale`](crate::config::CollectionParams::hash_ring_shard_scale).
+    /// Held as a field so that rings created lazily after construction — a new shard key, or a
+    /// rebuild after restart — use the collection's scale rather than a default, which would
+    /// otherwise change the point-to-shard mapping.
+    hash_ring_shard_scale: u32,
     /// Active snapshot recoveries on this peer (destination side of transfers).
     /// Tracks progress of downloading, unpacking, and restoring snapshots.
     /// Entries are added and removed via [`ShardRecoveryGuard`].
@@ -110,7 +118,20 @@ impl ShardHolder {
         }
     }
 
-    pub fn new(collection_path: &Path, sharding_method: ShardingMethod) -> CollectionResult<Self> {
+    pub fn new(
+        collection_path: &Path,
+        sharding_method: ShardingMethod,
+        hash_ring_shard_scale: u32,
+    ) -> CollectionResult<Self> {
+        if !(1..=MAX_HASH_RING_SHARD_SCALE).contains(&hash_ring_shard_scale) {
+            return Err(CollectionError::service_error(format!(
+                "hash ring shard scale {hash_ring_shard_scale} is out of range, \
+                 must be in 1..={MAX_HASH_RING_SHARD_SCALE} \
+                 (in {}/config.json)",
+                collection_path.display(),
+            )));
+        }
+
         let shard_transfers =
             SaveOnDisk::load_or_init_default(collection_path.join(SHARD_TRANSFERS_FILE))?;
         let resharding_state: SaveOnDisk<Option<ReshardState>> =
@@ -128,7 +149,9 @@ impl ShardHolder {
         }
 
         let rings = match sharding_method {
-            ShardingMethod::Auto => HashMap::from([(None, HashRingRouter::single())]),
+            ShardingMethod::Auto => {
+                HashMap::from([(None, HashRingRouter::single(hash_ring_shard_scale))])
+            }
             ShardingMethod::Custom => HashMap::new(),
         };
 
@@ -143,6 +166,7 @@ impl ShardHolder {
             key_mapping,
             shard_id_to_key_mapping,
             sharding_method,
+            hash_ring_shard_scale,
             active_recoveries: ActiveRecoveries::default(),
         })
     }
@@ -285,10 +309,13 @@ impl ShardHolder {
             })?;
         }
 
+        // Copied out before the `entry` call so the closure does not borrow `self` while `rings` is
+        // mutably borrowed.
+        let hash_ring_shard_scale = self.hash_ring_shard_scale;
         let ring = self
             .rings
             .entry(shard_key.clone())
-            .or_insert_with(HashRingRouter::single);
+            .or_insert_with(|| HashRingRouter::single(hash_ring_shard_scale));
 
         for &(shard_id, _) in &shards {
             ring.add(shard_id);
@@ -336,10 +363,15 @@ impl ShardHolder {
         Ok(())
     }
 
+    /// A fresh ring at this collection's scale.
+    fn new_ring(&self) -> HashRingRouter {
+        HashRingRouter::single(self.hash_ring_shard_scale)
+    }
+
     fn rebuild_rings(&mut self) {
         let mut rings = match self.sharding_method {
             // With auto sharding, we have a single hash ring
-            ShardingMethod::Auto => HashMap::from([(None, HashRingRouter::single())]),
+            ShardingMethod::Auto => HashMap::from([(None, self.new_ring())]),
             // With custom sharding, we have a hash ring per shard key
             ShardingMethod::Custom => HashMap::new(),
         };
@@ -356,7 +388,7 @@ impl ShardHolder {
             );
             rings
                 .entry(shard_key)
-                .or_insert_with(HashRingRouter::single)
+                .or_insert_with(|| self.new_ring())
                 .add(*shard_id);
         }
 

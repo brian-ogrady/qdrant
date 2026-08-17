@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use api::rest::models::HardwareUsage;
 use collection::common::fetch_vectors::CollectionName;
 use collection::config::ShardingMethod;
+use collection::hash_ring::MAX_HASH_RING_SHARD_SCALE;
 use collection::operations::verification::VerificationPass;
 use collection::shards::replica_set::replica_set_state::ReplicaState;
 use common::counter::hardware_accumulator::HwSharedDrain;
@@ -60,6 +61,32 @@ impl Dispatcher {
         self.resharding_enabled
     }
 
+    /// Whether a non-default `hash_ring_shard_scale` can safely be put into consensus.
+    /// Raft entries are CBOR maps with no `deny_unknown_fields`, so a peer that predates the field
+    /// silently drops it and builds its ring at the default — one collection, two point-to-shard
+    /// mappings, and nothing reconciles them afterwards because the scale is deliberately excluded
+    /// from `CollectionParams::check_compatible`. Always true single-node: nobody to disagree.
+    pub fn hash_ring_shard_scale_supported(&self) -> bool {
+        self.consensus_state.is_none()
+            || self
+                .toc
+                .get_channel_service()
+                .all_known_peers_at_version(&collection::hash_ring::HASH_RING_SHARD_SCALE_VERSION)
+    }
+
+    /// Reject a *client-requested* non-default scale that consensus cannot carry safely yet.
+    pub fn check_hash_ring_shard_scale_requestable(
+        &self,
+        collection_name: &str,
+        requested: Option<u32>,
+    ) -> Result<(), StorageError> {
+        check_hash_ring_shard_scale_requestable(
+            collection_name,
+            requested,
+            self.hash_ring_shard_scale_supported(),
+        )
+    }
+
     /// If `wait_timeout` is not supplied - then default duration will be used.
     ///
     /// This function needs to be called from a runtime with timers enabled.
@@ -71,11 +98,80 @@ impl Dispatcher {
     /// On deployments without consensus - a submitted operation is always run to completion.
     pub async fn submit_collection_meta_op(
         &self,
-        operation: CollectionMetaOperations,
+        mut operation: CollectionMetaOperations,
         auth: Auth,
         wait_timeout: Option<Duration>,
     ) -> Result<bool, StorageError> {
         auth.check_collection_meta_operation(&operation)?;
+
+        // Refuse an attempt to *change* the scale of an existing collection rather than dropping it
+        // on the floor (immutability itself: see `CollectionParams::hash_ring_shard_scale`).
+        if let CollectionMetaOperations::UpdateCollection(op) = &operation
+            && let Some(params) = &op.update_collection.params
+            && let Some(requested) = params.hash_ring_shard_scale
+            && let Some(collection) = self
+                .toc
+                .get_collection_opt(op.collection_name.clone())
+                .await
+            && collection.hash_ring_shard_scale().await != requested
+        {
+            let current = collection.hash_ring_shard_scale().await;
+            return Err(StorageError::bad_input(format!(
+                "`hash_ring_shard_scale` cannot be changed after a collection is created \
+                 (collection {} is {current}, requested {requested}). It determines which shard each \
+                 point belongs to, so changing it would move a portion of the keyspace and leave \
+                 existing points unreachable by id. To use a different scale, create a new collection \
+                 with `hash_ring_shard_scale` set and migrate the points into it",
+                op.collection_name,
+            )));
+        }
+
+        if let CollectionMetaOperations::CreateCollection(op) = &mut operation
+            && op.create_collection.hash_ring_shard_scale.is_none()
+        {
+            let configured = self
+                .toc
+                .storage_config
+                .collection
+                .as_ref()
+                .and_then(|defaults| defaults.hash_ring_shard_scale);
+
+            // `Settings::validate_and_warn` already reports an out-of-range value at startup, but it
+            // only warns, so the bad value is still here. Fall back to default value rather than
+            // propagating it.
+            let mut scale = match configured {
+                Some(scale) if (1..=MAX_HASH_RING_SHARD_SCALE).contains(&scale) => scale,
+                Some(invalid) => {
+                    log::warn!(
+                        "Ignoring storage.collection.hash_ring_shard_scale={invalid}: \
+                         must be in 1..={MAX_HASH_RING_SHARD_SCALE}. \
+                         Creating collection {} with {} instead",
+                        op.collection_name,
+                        collection::config::default_hash_ring_shard_scale(),
+                    );
+                    collection::config::default_hash_ring_shard_scale()
+                }
+                None => collection::config::default_hash_ring_shard_scale(),
+            };
+
+            // A non-default default cannot go into consensus while any peer predates the field (see
+            // `hash_ring_shard_scale_supported`), so fall back rather than refuse.
+            if scale != collection::config::default_hash_ring_shard_scale()
+                && !self.hash_ring_shard_scale_supported()
+            {
+                log::warn!(
+                    "Creating collection {} with hash ring shard scale {} instead of the configured \
+                     {scale}: not all peers run at least {}, and older peers would build a different \
+                     point-to-shard mapping for it",
+                    op.collection_name,
+                    collection::config::default_hash_ring_shard_scale(),
+                    *collection::hash_ring::HASH_RING_SHARD_SCALE_VERSION,
+                );
+                scale = collection::config::default_hash_ring_shard_scale();
+            }
+
+            op.create_collection.hash_ring_shard_scale = Some(scale);
+        }
 
         // if distributed deployment is enabled
         if let Some(state) = self.consensus_state.as_ref() {
@@ -362,5 +458,93 @@ impl Dispatcher {
     #[must_use]
     pub fn get_collection_hw_metrics(&self, collection: String) -> Arc<HwSharedDrain> {
         self.toc.get_collection_hw_metrics(collection)
+    }
+}
+
+/// The decision behind [`Dispatcher::check_hash_ring_shard_scale_requestable`], split out so the
+/// matrix is testable: constructing a `Dispatcher` whose `hash_ring_shard_scale_supported()` is false
+/// requires a live `ConsensusStateRef`, which a unit test cannot build.
+fn check_hash_ring_shard_scale_requestable(
+    collection_name: &str,
+    requested: Option<u32>,
+    supported: bool,
+) -> Result<(), StorageError> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+
+    // The default is always safe to propose: it is exactly what a peer that ignores the field picks.
+    if requested == collection::config::default_hash_ring_shard_scale() || supported {
+        return Ok(());
+    }
+
+    Err(StorageError::bad_request(format!(
+        "`hash_ring_shard_scale` of {requested} cannot be used for collection {collection_name} \
+         until every peer runs at least {}: older peers ignore this setting and would build a \
+         different point-to-shard mapping for the same collection. Finish the rolling upgrade, or \
+         omit `hash_ring_shard_scale` to use the default of {}",
+        *collection::hash_ring::HASH_RING_SHARD_SCALE_VERSION,
+        collection::config::default_hash_ring_shard_scale(),
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A create request must be refused only when it asks for a scale that consensus cannot carry
+    /// safely yet. Getting any cell of this wrong is either a silent split-brain (accepting when it
+    /// should refuse) or an outage (refusing a default-scale create, which is every normal request).
+    #[test]
+    fn hash_ring_shard_scale_is_refused_only_when_requested_and_unsupported() {
+        let default = collection::config::default_hash_ring_shard_scale();
+        let non_default = default + 1;
+
+        for (requested, supported, should_pass, case) in [
+            (None, false, true, "no request, mixed cluster"),
+            (None, true, true, "no request, upgraded cluster"),
+            (
+                Some(default),
+                false,
+                true,
+                "default requested, mixed cluster",
+            ),
+            (
+                Some(default),
+                true,
+                true,
+                "default requested, upgraded cluster",
+            ),
+            (
+                Some(non_default),
+                true,
+                true,
+                "non-default, upgraded cluster",
+            ),
+            (
+                Some(non_default),
+                false,
+                false,
+                "non-default, mixed cluster",
+            ),
+        ] {
+            let result = check_hash_ring_shard_scale_requestable("c", requested, supported);
+            assert_eq!(
+                result.is_ok(),
+                should_pass,
+                "{case}: expected pass={should_pass}, got {result:?}",
+            );
+        }
+
+        // The refusal has to say what to do about it, not just that it failed.
+        let err = check_hash_ring_shard_scale_requestable("c", Some(non_default), false)
+            .expect_err("a non-default scale on a mixed cluster must be refused");
+        let message = err.to_string();
+        for expected in ["hash_ring_shard_scale", "every peer runs at least", "c"] {
+            assert!(
+                message.contains(expected),
+                "refusal should be actionable; missing {expected:?} in {message:?}",
+            );
+        }
     }
 }

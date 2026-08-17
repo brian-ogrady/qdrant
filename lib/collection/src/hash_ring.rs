@@ -1,18 +1,49 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hash};
+use std::sync::LazyLock;
 
 use bytemuck::TransparentWrapper as _;
 use common::stable_hash::{StableHash, StableHashed};
 use itertools::Itertools as _;
 use segment::index::field_index::CardinalityEstimation;
 use segment::types::{CustomIdCheckerCondition, PointIdType};
+use semver::Version;
 use smallvec::SmallVec;
 
 use crate::operations::cluster_ops::ReshardingDirection;
 use crate::shards::shard::ShardId;
 
-pub const HASH_RING_SHARD_SCALE: u32 = 100;
+/// Default number of virtual nodes per shard on the hash ring.
+///
+/// Must never change: it is the serde default for `CollectionParams::hash_ring_shard_scale`, so every
+/// collection written before that field existed is routed at this value. A different number here
+/// silently remaps all of them.
+pub const DEFAULT_HASH_RING_SHARD_SCALE: u32 = 100;
+
+/// Upper bound on the hash ring scale.
+pub const MAX_HASH_RING_SHARD_SCALE: u32 = 100_000;
+
+/// Upper bound on `hash_ring_shard_scale * shard_number`, i.e. the total virtual nodes in one ring.
+pub const MAX_HASH_RING_VIRTUAL_NODES: u64 = 1_000_000;
+
+/// The bound is repeated as a literal in four `validate(range(max = ...))` attributes —
+/// `CollectionParams`, `CollectionParamsDiff`, the `CreateCollection` op, and
+/// `CollectionConfigDefaults` — plus in prose in `config/config.yaml`. Only the last of those is forced
+/// to duplicate it (`segment` sits below `collection` in the dependency graph and cannot name the
+/// constant); the other three could reference it and do not.
+///
+/// This pins the constant itself, so editing it without the attributes fails the build. It does not
+/// catch the opposite edit — relaxing one attribute in isolation — so if you change the bound, grep
+/// for `100_000`.
+const _: () = assert!(MAX_HASH_RING_SHARD_SCALE == 100_000);
+
+/// Minimum Qdrant version required for `hash_ring_shard_scale`.
+///
+/// Prevents mixed-version clusters from using inconsistent hash-ring mappings
+/// when older peers do not understand this collection parameter.
+pub static HASH_RING_SHARD_SCALE_VERSION: LazyLock<Version> =
+    LazyLock::new(|| Version::parse("1.19.1-dev").expect("valid version string"));
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HashRingRouter<T: Eq + StableHash + Hash = ShardId> {
@@ -25,11 +56,15 @@ pub enum HashRingRouter<T: Eq + StableHash + Hash = ShardId> {
 }
 
 impl<T: Copy + Eq + StableHash + Hash> HashRingRouter<T> {
-    /// Create a new single hashring.
+    /// Create a new single hashring with a fair distribution of points at the given `scale`.
     ///
-    /// The hashring is created with a fair distribution of points and `HASH_RING_SHARD_SCALE` scale.
-    pub fn single() -> Self {
-        Self::Single(HashRing::fair(HASH_RING_SHARD_SCALE))
+    /// `scale` is a routing input, so it must come from the owning collection's persisted
+    /// [`CollectionParams::hash_ring_shard_scale`](crate::config::CollectionParams::hash_ring_shard_scale)
+    /// rather than from the environment — otherwise the mapping could shift across restarts or
+    /// differ between peers. It is a required argument precisely so no caller can silently fall
+    /// back to a default.
+    pub fn single(scale: u32) -> Self {
+        Self::Single(HashRing::fair(scale))
     }
 
     pub fn add(&mut self, shard: T) -> bool {
@@ -236,9 +271,7 @@ impl<T: Copy + Eq + StableHash + Hash> HashRing<T> {
             }
 
             HashRing::Fair { ring, scale, .. } => {
-                for idx in 0..*scale {
-                    ring.add(StableHashed((shard, idx)));
-                }
+                ring.batch_add((0..*scale).map(|idx| StableHashed((shard, idx))).collect());
             }
         }
 
@@ -255,10 +288,22 @@ impl<T: Copy + Eq + StableHash + Hash> HashRing<T> {
                 ring.remove(&StableHashed(*shard));
             }
 
-            HashRing::Fair { ring, scale, .. } => {
-                for idx in 0..*scale {
-                    ring.remove(&StableHashed((*shard, idx)));
-                }
+            HashRing::Fair { nodes, ring, scale } => {
+                // Rebuilt from the remaining shards rather than deleted node by node. `hashring::remove`
+                // is a binary search plus a `Vec::remove` per virtual node, so dropping one shard costs
+                // O(scale × nodes) — measured in release at 9.76s for 1M nodes, versus 39ms for this
+                // rebuild. Producing the same nodes in the same order is what keeps routing identical;
+                // `removing_a_shard_leaves_the_ring_the_remaining_shards_would_have_built` pins that.
+                let mut rebuilt = hashring::HashRing::with_hasher(StableHashBuilder::new());
+                rebuilt.batch_add(
+                    nodes
+                        .iter()
+                        .flat_map(|&remaining| {
+                            (0..*scale).map(move |idx| StableHashed((remaining, idx)))
+                        })
+                        .collect(),
+                );
+                *ring = rebuilt;
             }
         }
 
@@ -386,5 +431,97 @@ mod tests {
                 assert_eq!(*y, 4);
             }
         }
+    }
+
+    /// Removing a shard must leave exactly the ring the remaining shards would have built.
+    /// Compares the surviving mapping key by key rather than just the node count, since two rings can
+    /// hold the same nodes and still order them differently.
+    #[test]
+    fn removing_a_shard_leaves_the_ring_the_remaining_shards_would_have_built() {
+        const SCALE: u32 = 7;
+        const SHARDS: ShardId = 6;
+        const REMOVED: ShardId = 2;
+        const KEYS: u64 = 2_000;
+
+        let mut removed_from = HashRing::fair(SCALE);
+        for shard in 0..SHARDS {
+            removed_from.add(shard);
+        }
+        assert!(removed_from.remove(&REMOVED));
+
+        let mut built_without = HashRing::fair(SCALE);
+        for shard in (0..SHARDS).filter(|&shard| shard != REMOVED) {
+            built_without.add(shard);
+        }
+
+        let mapping =
+            |ring: &HashRing<ShardId>| (0..KEYS).map(|key| *ring.get(&key).unwrap()).collect_vec();
+        let after_removal = mapping(&removed_from);
+        assert_eq!(
+            after_removal,
+            mapping(&built_without),
+            "a ring with a shard removed must route exactly like one built without that shard",
+        );
+
+        // The removed shard must own nothing, and the rest must still own something — otherwise the
+        // comparison above could hold for a degenerate ring.
+        assert!(
+            !after_removal.contains(&REMOVED),
+            "the removed shard must not own any part of the keyspace",
+        );
+        assert_eq!(
+            after_removal.iter().unique().count(),
+            SHARDS as usize - 1,
+            "every remaining shard should still own part of the keyspace",
+        );
+
+        // Removing a shard that was never there must not disturb the ring.
+        let mut untouched = removed_from.clone();
+        assert!(!untouched.remove(&REMOVED));
+        assert_eq!(mapping(&untouched), after_removal);
+    }
+
+    #[test]
+    fn batching_virtual_nodes_does_not_change_routing() {
+        const SCALE: u32 = 7;
+        const SHARDS: ShardId = 5;
+        const KEYS: u64 = 500;
+
+        // What the code does now: one batch per shard.
+        let batched = {
+            let mut ring = HashRing::fair(SCALE);
+            for shard in 0..SHARDS {
+                ring.add(shard);
+            }
+            (0..KEYS).map(|key| *ring.get(&key).unwrap()).collect_vec()
+        };
+
+        let per_node = {
+            let mut ring = hashring::HashRing::with_hasher(StableHashBuilder::new());
+            for shard in 0..SHARDS {
+                for idx in 0..SCALE {
+                    ring.add(StableHashed((shard, idx)));
+                }
+            }
+            (0..KEYS)
+                .map(|key| {
+                    let StableHashed((shard, _idx)) =
+                        ring.get(StableHashed::wrap_ref(&key)).unwrap();
+                    *shard
+                })
+                .collect_vec()
+        };
+
+        assert_eq!(
+            batched, per_node,
+            "batching virtual nodes must not change the point-to-shard mapping",
+        );
+
+        // Guards against a degenerate ring making the comparison above vacuous.
+        let distinct = batched.iter().unique().count();
+        assert_eq!(
+            distinct, SHARDS as usize,
+            "expected all {SHARDS} shards to own part of the keyspace, saw {distinct}",
+        );
     }
 }

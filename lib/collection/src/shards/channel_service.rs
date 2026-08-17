@@ -202,6 +202,25 @@ impl ChannelService {
         all
     }
 
+    /// Check whether every peer whose version we *know* is running at least the given version.
+    ///
+    /// Unlike [`Self::all_peers_at_version`], a peer that has not published its version yet does not
+    /// count against this. The two answer different questions: that one asks "can I prove every peer
+    /// is new enough", this one asks "do I know of any peer that is too old".
+    pub fn all_known_peers_at_version(&self, version: &Version) -> bool {
+        let id_to_metadata = self.id_to_metadata.read();
+
+        let all = id_to_metadata
+            .values()
+            .all(|metadata| &metadata.version >= version);
+
+        if !all {
+            log::info!("Not all known peers at version:{version} peers:{id_to_metadata:?}");
+        }
+
+        all
+    }
+
     /// Check whether the specified peer is running at least the given version
     ///
     /// If the version is not known for the peer, this returns `false`.
@@ -275,5 +294,106 @@ impl Default for ChannelService {
             api_key: None,
             alt_api_key: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GATE: &str = "1.19.1";
+
+    fn gate() -> Version {
+        Version::parse(GATE).unwrap()
+    }
+
+    fn with_peers(peers: &[(PeerId, Option<&str>)]) -> ChannelService {
+        let service = ChannelService::new(6333, false, None, None);
+        {
+            let mut addresses = service.id_to_address.write();
+            let mut metadata = service.id_to_metadata.write();
+            for &(peer_id, version) in peers {
+                // Every peer has an address. Only a peer that has published has metadata — that
+                // asymmetry is the whole subject of these tests.
+                addresses.insert(
+                    peer_id,
+                    format!("http://127.0.0.1:{peer_id}").parse().unwrap(),
+                );
+                if let Some(version) = version {
+                    metadata.insert(
+                        peer_id,
+                        PeerMetadata {
+                            version: Version::parse(version).unwrap(),
+                        },
+                    );
+                }
+            }
+        }
+        service
+    }
+
+    /// The reason this function exists. A peer publishes its version from its own consensus tick, so a
+    /// brand-new peer is silent for the whole of its join — and `all_peers_at_version` reports a fully
+    /// upgraded cluster as mixed for that entire time. Measured against a real cluster before this
+    /// existed, 29 of 30 collections created during one peer join silently took the built-in hash ring
+    /// scale instead of the configured one, permanently, because that answer is persisted.
+    ///
+    /// Asserting both functions on the same input on purpose: if they ever agree here, the distinction
+    /// has been lost and the join window is back.
+    #[test]
+    fn a_peer_that_has_not_published_its_version_does_not_block() {
+        // Peer 2 has just joined: address known, nothing published yet.
+        let service = with_peers(&[(1, Some(GATE)), (2, None)]);
+
+        assert!(
+            service.all_known_peers_at_version(&gate()),
+            "a silent peer must not be treated as too old",
+        );
+        assert!(
+            !service.all_peers_at_version(&gate()),
+            "the strict check is expected to still refuse here — if it does not, these two functions \
+             no longer differ and this test has stopped testing anything",
+        );
+    }
+
+    /// What the gate is actually for. A peer that has been running has published its version, so a
+    /// rolling upgrade in progress is visible through metadata that is *present* — which is why
+    /// ignoring absent metadata above does not weaken this.
+    #[test]
+    fn a_peer_known_to_be_older_still_blocks() {
+        let service = with_peers(&[(1, Some(GATE)), (2, Some("1.18.0"))]);
+
+        assert!(
+            !service.all_known_peers_at_version(&gate()),
+            "a peer whose published version is too old must block",
+        );
+
+        // ...and it keeps blocking even with a silent peer alongside it, so the leniency above cannot
+        // be used to smuggle a genuinely old cluster past the gate.
+        let service = with_peers(&[(1, Some(GATE)), (2, Some("1.18.0")), (3, None)]);
+        assert!(
+            !service.all_known_peers_at_version(&gate()),
+            "a known-old peer must block regardless of any silent peer",
+        );
+    }
+
+    /// A newer peer satisfies a gate, and an exactly-equal version does too.
+    #[test]
+    fn known_peers_at_or_above_the_gate_pass() {
+        assert!(
+            with_peers(&[(1, Some(GATE)), (2, Some("1.20.0"))]).all_known_peers_at_version(&gate())
+        );
+        assert!(
+            with_peers(&[(1, Some(GATE)), (2, Some(GATE))]).all_known_peers_at_version(&gate())
+        );
+    }
+
+    /// Documented consequence rather than an endorsement: with nothing published at all the check is
+    /// vacuously true, so during the bootstrap of a fresh cluster the gate passes without having
+    /// verified any version. `all_peers_at_version` behaves the same way once both maps are empty.
+    #[test]
+    fn no_published_versions_at_all_is_vacuously_true() {
+        assert!(with_peers(&[]).all_known_peers_at_version(&gate()));
+        assert!(with_peers(&[(1, None), (2, None)]).all_known_peers_at_version(&gate()));
     }
 }
