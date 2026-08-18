@@ -1,8 +1,11 @@
+use std::cmp::Reverse;
 use std::ops::Deref as _;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
-use common::bitvec::{BitSliceExt as _, BitVec};
+use common::bitvec::{BitSlice, BitSliceExt as _, BitVec};
+use common::condition_checker::ConditionChecker as _;
 use common::counter::hardware_counter::HardwareCounterCell;
 #[cfg(target_os = "linux")]
 use common::cpu::linux_low_thread_priority;
@@ -10,7 +13,9 @@ use common::progress_tracker::ProgressTracker;
 use common::types::{DeferredBehavior, PointOffsetType};
 use fs_err as fs;
 use log::{debug, trace};
-use rand::Rng;
+use parking_lot::Mutex;
+use rand::rngs::SmallRng;
+use rand::{Rng, RngExt, SeedableRng};
 use rayon::ThreadPool;
 use rayon::prelude::*;
 
@@ -38,7 +43,9 @@ use crate::index::hnsw_index::graph_layers::GraphLayers;
 use crate::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
 use crate::index::hnsw_index::graph_layers_healer::GraphLayersHealer;
 use crate::index::hnsw_index::graph_links::{GraphLinksFormatParam, StorageGraphLinksVectors};
-use crate::index::hnsw_index::point_scorer::FilteredScorer;
+use crate::index::hnsw_index::point_scorer::{
+    BlockVectors, FilteredScorer, GATHER_BYTES_PER_THREAD, GatherBudget, MAX_BLOCK_GATHER_BYTES,
+};
 use crate::index::query_optimization::optimized_filter::OptimizedFilter;
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::index::visited_pool::{VisitedListHandle, VisitedPool};
@@ -47,12 +54,74 @@ use crate::segment_constructor::VectorIndexBuildArgs;
 use crate::types::Condition::Field;
 use crate::types::{FieldCondition, Filter};
 use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
-use crate::vector_storage::{VectorStorageEnum, VectorStorageRead};
+use crate::vector_storage::{NotDeletedChecker, VectorStorageEnum, VectorStorageRead};
+
+/// How a block's insertions are scheduled after its serial warm-start prefix.
+#[derive(Clone, Copy)]
+enum BlockInsertMode<'a> {
+    /// Publish insertions to `pool`, which the caller is *not* running inside.
+    WholePool(&'a ThreadPool),
+    /// Publish insertions to the pool the caller is already running inside, so
+    /// its other threads can steal them once they have nothing left to claim.
+    InPool,
+}
+
+/// Knobs that let tests reach into the payload-block stage of the build.
+#[derive(Default)]
+pub(crate) struct HnswBuildDebugOptions<'a> {
+    /// Build payload block subgraphs with the legacy segment-sized builder,
+    /// so its output can be compared against the compact one.
+    pub force_legacy_payload_blocks: bool,
+    /// Incremented once per payload block that passes the skip filters, before
+    /// its subgraph is built. On a build that runs to completion those are the
+    /// same set; on one that fails or is cancelled partway this over-counts.
+    pub blocks_built: Option<&'a AtomicUsize>,
+    /// Incremented once per payload block the connectivity shortcut skips.
+    pub blocks_skipped_by_connectivity: Option<&'a AtomicUsize>,
+    /// Incremented once per built block whose vectors were copied into a
+    /// block-local buffer for scoring. Asserted equal to the number of blocks
+    /// built, so a build that silently stopped gathering fails a test rather
+    /// than merely getting slower.
+    pub blocks_gathered: Option<&'a AtomicUsize>,
+    /// Collects the block index each block is filtered under, in call order.
+    /// Both build paths have to number a field's blocks the same way.
+    pub block_indices: Option<&'a Mutex<Vec<usize>>>,
+    /// Overrides the stage gather allowance, which production sizes from the
+    /// pool. A value small enough to decline an ordinary block is the only cheap
+    /// way to reach the contention path: sizing it from the pool means reaching it
+    /// honestly would need a fixture of tens of MiB.
+    pub gather_budget_bytes: Option<usize>,
+    /// Overrides the per-block gather cap. Reaching the oversized path honestly
+    /// would need a fixture with a block of tens of MiB, and that path routes to
+    /// a different counter than an ungatherable storage does - so it needs to be
+    /// reachable to stay that way.
+    pub max_block_gather_bytes: Option<usize>,
+    /// Blocks that could have gathered but did not, once the build is done.
+    pub gather_declined: Option<&'a AtomicUsize>,
+    /// Blocks whose storage can never be gathered, once the build is done.
+    pub gather_unavailable: Option<&'a AtomicUsize>,
+    /// Collects the field of every block the connectivity shortcut skipped.
+    ///
+    /// The aggregate counter cannot express which fields were skipped, and the
+    /// shortcut is deliberately never applied to tenant fields - a guard only a
+    /// per-field record can hold to account.
+    pub skipped_fields: Option<&'a Mutex<Vec<JsonPath>>>,
+    /// Called with the finished graph, before it is serialized.
+    pub inspect_builder: Option<&'a dyn Fn(&GraphLayersBuilder)>,
+}
 
 impl HNSWIndex {
     pub fn build<R: Rng + ?Sized>(
         open_args: HnswIndexOpenArgs<'_>,
         build_args: VectorIndexBuildArgs<'_, R>,
+    ) -> OperationResult<Self> {
+        Self::build_with_debug_options(open_args, build_args, HnswBuildDebugOptions::default())
+    }
+
+    pub(crate) fn build_with_debug_options<R: Rng + ?Sized>(
+        open_args: HnswIndexOpenArgs<'_>,
+        build_args: VectorIndexBuildArgs<'_, R>,
+        debug_options: HnswBuildDebugOptions<'_>,
     ) -> OperationResult<Self> {
         if HnswGraphConfig::get_config_path(open_args.path).exists()
             || GraphLayers::get_path(open_args.path).exists()
@@ -387,11 +456,23 @@ impl HNSWIndex {
             let percolation = 1. - 2. / (average_links_per_0_level_int as f32);
 
             let required_connectivity = if average_links_per_0_level_int >= 4 {
-                let global_graph_connectivity = [
-                    graph_layers_builder.subgraph_connectivity(rng, &all_points, percolation),
-                    graph_layers_builder.subgraph_connectivity(rng, &all_points, percolation),
-                    graph_layers_builder.subgraph_connectivity(rng, &all_points, percolation),
-                ];
+                // Each sample walks the whole segment, so run them concurrently.
+                // Seeds are drawn up front to keep the parent RNG stream
+                // independent of the scheduling order.
+                let seeds: [u64; 3] = std::array::from_fn(|_| rng.random());
+                let global_graph_connectivity = pool.install(|| {
+                    seeds
+                        .into_par_iter()
+                        .map(|seed| {
+                            let mut rng = SmallRng::seed_from_u64(seed);
+                            graph_layers_builder.subgraph_connectivity(
+                                &mut rng,
+                                &all_points,
+                                percolation,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
 
                 debug!("graph connectivity: {global_graph_connectivity:?} @ {percolation}");
 
@@ -412,9 +493,6 @@ impl HNSWIndex {
                 BitVec::repeat(false, total_vector_count)
             };
 
-            let visited_pool = VisitedPool::new();
-            let mut block_filter_list = visited_pool.get(total_vector_count);
-
             #[cfg(feature = "gpu")]
             let mut gpu_insert_context = if let Some(gpu_vectors) = gpu_vectors.as_ref() {
                 Some(GpuInsertContext::new(
@@ -431,103 +509,277 @@ impl HNSWIndex {
             #[cfg(not(feature = "gpu"))]
             let mut gpu_insert_context = None;
 
-            for (index_pos, (field_progress, field)) in indexed_fields.into_iter().enumerate() {
-                field_progress.start();
+            // The compact path builds each block in its own id space, so it
+            // does not pay for a segment-sized builder per block. It cannot
+            // serve the two callers that need segment-wide ids: `m == 0` counts
+            // indexed vectors into a segment-sized bitset, and the GPU builder
+            // is welded to a segment-sized `GraphLayersBuilder`.
+            let use_compact_blocks = config.m > 0
+                && gpu_insert_context.is_none()
+                && !debug_options.force_legacy_payload_blocks;
 
-                debug!("building additional index for field {field}");
+            let visited_pool = VisitedPool::new();
+            let mut block_filter_list =
+                (!use_compact_blocks).then(|| visited_pool.get(total_vector_count));
 
-                let is_tenant = payload_index_ref.is_tenant(&field);
+            // Block-level parallelism needs threads to spare, and keeping the
+            // single-threaded build sequential keeps it reproducible.
+            let parallel_blocks = use_compact_blocks && pool.current_num_threads() > 1;
 
-                // It is expected, that graph will become disconnected less than
-                // $1/m$ points left.
-                // So blocks larger than $1/m$ are not needed.
-                // We add multiplier for the extra safety.
-                const PERCOLATION_MULTIPLIER: usize = 4;
-                let max_block_size = if config.m > 0 {
-                    total_vector_count / average_links_per_0_level_int * PERCOLATION_MULTIPLIER
-                } else {
-                    usize::MAX
+            // It is expected, that graph will become disconnected less than
+            // $1/m$ points left.
+            // So blocks larger than $1/m$ are not needed.
+            // We add multiplier for the extra safety.
+            const PERCOLATION_MULTIPLIER: usize = 4;
+            let max_block_size = if config.m > 0 {
+                total_vector_count / average_links_per_0_level_int * PERCOLATION_MULTIPLIER
+            } else {
+                usize::MAX
+            };
+
+            // One allowance for the whole stage, reserved per copy and scaled by the
+            // pool; see [`GatherBudget`] and [`GATHER_BYTES_PER_THREAD`].
+            let gather_allowance = debug_options.gather_budget_bytes.unwrap_or_else(|| {
+                pool.current_num_threads()
+                    .saturating_mul(GATHER_BYTES_PER_THREAD)
+            });
+            let gather_budget = GatherBudget::new(gather_allowance);
+            let max_block_gather = debug_options
+                .max_block_gather_bytes
+                .unwrap_or(MAX_BLOCK_GATHER_BYTES);
+            // Split by cause
+            let gather_unavailable = AtomicUsize::new(0);
+            let gather_declined = AtomicUsize::new(0);
+
+            if use_compact_blocks {
+                let block_builder = BlockBuilder {
+                    vector_storage: &vector_storage_ref,
+                    quantized_vectors: &quantized_vectors_ref,
+                    graph: &graph_layers_builder,
+                    vec_deleted: deleted_bitslice,
+                    point_deleted: id_tracker_ref.deleted_point_bitslice(),
+                    payload_m,
+                    ef_construct: config.ef_construct,
+                    gather_budget: &gather_budget,
+                    max_block_gather,
+                    blocks_gathered: debug_options.blocks_gathered,
+                    gather_unavailable: &gather_unavailable,
+                    gather_declined: &gather_declined,
+                    stopped,
                 };
 
-                let counter = field_progress.track_progress(None);
+                // Per-field state a block needs, in the field order below.
+                let mut field_filters: Vec<(BlockFilter, Arc<AtomicU64>)> = Vec::new();
+                // `(field position, block index within that field, block)`.
+                let mut block_queue: Vec<(usize, usize, PayloadBlockCondition)> = Vec::new();
 
-                let mut process_block = |payload_block: PayloadBlockCondition| {
-                    check_process_stopped(stopped)?;
+                // Every field's blocks go into one queue, so the parallel run
+                // drains once for the whole segment instead of once per field.
+                //
+                // Fields are visited in the same order as the per-field loop and
+                // their blocks are numbered in generation order, so the RNG
+                // stream, each block's seed, and therefore every skip decision
+                // are the ones the per-field loop would have reached.
+                for (index_pos, (field_progress, field)) in indexed_fields.iter().enumerate() {
+                    field_progress.start();
 
-                    if payload_block.cardinality > max_block_size {
-                        return Ok(());
-                    }
+                    let block_seed_base: u64 = rng.random();
 
-                    let points_to_index = condition_points(
-                        payload_block.condition,
-                        &payload_index_ref,
-                        &vector_storage_ref,
-                        stopped,
-                    )?;
+                    debug!("building additional index for field {field}");
 
-                    // This is a heuristic to skip building graph for mostly deleted blocks.
-                    // It might be, that majority of points do not actually have vectors
-                    // (vectors marked as deleted), so we can avoid building graph for such blocks.
-                    //
-                    // FYI: query heuristic does account
-                    // for deleted vectors via [`adjust_to_available_vectors`]
-                    const DELETED_POINTS_FACTOR: usize = 4; // allow block to have up to 75% of deleted points and still be indexed
+                    let is_tenant = payload_index_ref.is_tenant(field);
+                    let counter = field_progress.track_progress(None);
 
-                    if points_to_index.len() <= full_scan_threshold / DELETED_POINTS_FACTOR {
-                        return Ok(());
-                    }
+                    let before = block_queue.len();
+                    payload_index_ref.with_view(|v| {
+                        v.for_each_payload_block(field, full_scan_threshold, &mut |block| {
+                            block_queue.push((index_pos, block_queue.len() - before, block));
+                            Ok(())
+                        })
+                    })?;
 
-                    if !is_tenant
-                        && index_pos > 0
-                        && let Some(required_connectivity) = required_connectivity
-                    {
-                        // Always build for tenants
-                        let graph_connectivity = graph_layers_builder.subgraph_connectivity(
-                            rng,
-                            &points_to_index,
+                    field_filters.push((
+                        BlockFilter {
+                            field,
+                            payload_index: &payload_index_ref,
+                            vector_storage: &vector_storage_ref,
+                            stopped,
+                            full_scan_threshold,
+                            max_block_size,
+                            check_connectivity: !is_tenant && index_pos > 0,
+                            required_connectivity,
                             percolation,
+                            block_seed_base,
+                            blocks_built: debug_options.blocks_built,
+                            blocks_skipped_by_connectivity: debug_options
+                                .blocks_skipped_by_connectivity,
+                            block_indices: debug_options.block_indices,
+                            skipped_fields: debug_options.skipped_fields,
+                        },
+                        counter,
+                    ));
+                }
+
+                let build_queued = |(field_pos, block_index, block): (
+                    usize,
+                    usize,
+                    PayloadBlockCondition,
+                )|
+                 -> OperationResult<()> {
+                    let (filter, counter) = &field_filters[field_pos];
+                    block_builder.build(
+                        filter,
+                        block_index,
+                        block,
+                        counter,
+                        BlockInsertMode::InPool,
+                    )
+                };
+
+                if parallel_blocks {
+                    // One drain for every block of every field, largest first
+                    // so the longest chains start earliest, and each block's
+                    // remainder published to the pool as soon as its warm-start
+                    // prefix is in.
+                    block_queue.sort_by_key(|(_, _, block)| Reverse(block.cardinality));
+                    pool.install(|| block_queue.into_par_iter().try_for_each(build_queued))?;
+                } else {
+                    // Same order the per-field loop would use, since the queue
+                    // is fields in order and blocks in generation order.
+                    for (field_pos, block_index, block) in block_queue {
+                        let (filter, counter) = &field_filters[field_pos];
+                        block_builder.build(
+                            filter,
+                            block_index,
+                            block,
+                            counter,
+                            BlockInsertMode::WholePool(&pool),
+                        )?;
+                    }
+                }
+
+                drop(field_filters);
+            } else {
+                for (index_pos, (field_progress, field)) in indexed_fields.iter().enumerate() {
+                    field_progress.start();
+
+                    let block_seed_base: u64 = rng.random();
+
+                    debug!("building additional index for field {field}");
+
+                    let is_tenant = payload_index_ref.is_tenant(field);
+
+                    let counter = field_progress.track_progress(None);
+                    let counter = counter.deref();
+
+                    // Numbered the same way the compact path numbers the blocks
+                    // it collects, so for a given block both paths seed the
+                    // connectivity shortcut with the same index and reach the
+                    // same skip decision.
+                    let block_filter = BlockFilter {
+                        field,
+                        payload_index: &payload_index_ref,
+                        vector_storage: &vector_storage_ref,
+                        stopped,
+                        full_scan_threshold,
+                        max_block_size,
+                        check_connectivity: !is_tenant && index_pos > 0,
+                        required_connectivity,
+                        percolation,
+                        block_seed_base,
+                        blocks_built: debug_options.blocks_built,
+                        blocks_skipped_by_connectivity: debug_options
+                            .blocks_skipped_by_connectivity,
+                        block_indices: debug_options.block_indices,
+                        skipped_fields: debug_options.skipped_fields,
+                    };
+
+                    // Which *field* comes first is still up to `indexed_fields`,
+                    // which hands back a `HashMap`.
+                    let mut next_block_index = 0;
+
+                    let mut process_block = |payload_block: PayloadBlockCondition| {
+                        let block_index = next_block_index;
+                        next_block_index += 1;
+
+                        let cardinality = payload_block.cardinality;
+                        let Some(points_to_index) = block_filter.points(
+                            &graph_layers_builder,
+                            block_index,
+                            payload_block,
+                        )?
+                        else {
+                            return Ok(());
+                        };
+                        let block_points = points_to_index.len();
+
+                        // ToDo: reuse graph layer for same payload
+                        let mut additional_graph = GraphLayersBuilder::new_with_params(
+                            total_vector_count,
+                            payload_m,
+                            config.ef_construct,
+                            1,
+                            HNSW_USE_HEURISTIC,
+                            false,
                         );
 
-                        if graph_connectivity >= required_connectivity {
-                            trace!(
-                                "skip building additional HNSW links for {field}, connectivity {graph_connectivity:.4} >= {required_connectivity:.4}"
-                            );
-                            return Ok(());
-                        }
-                        trace!("graph connectivity: {graph_connectivity} for {field}");
-                    }
+                        build_filtered_graph(
+                            id_tracker_ref.deref(),
+                            &vector_storage_ref,
+                            &quantized_vectors_ref,
+                            &mut gpu_insert_context,
+                            &payload_index_ref,
+                            &pool,
+                            stopped,
+                            &mut additional_graph,
+                            points_to_index,
+                            block_filter_list.as_mut().unwrap(),
+                            &mut indexed_vectors_set,
+                            counter,
+                        )?;
+                        graph_layers_builder.merge_from_other(additional_graph);
 
-                    // ToDo: reuse graph layer for same payload
-                    let mut additional_graph = GraphLayersBuilder::new_with_params(
-                        total_vector_count,
-                        payload_m,
-                        config.ef_construct,
-                        1,
-                        HNSW_USE_HEURISTIC,
-                        false,
-                    );
+                        debug!(
+                            "payload block {field} [{cardinality}]: built {block_points} points (legacy)"
+                        );
+                        Ok(())
+                    };
 
-                    build_filtered_graph(
-                        id_tracker_ref.deref(),
+                    payload_index_ref.with_view(|v| {
+                        v.for_each_payload_block(field, full_scan_threshold, &mut process_block)
+                    })?;
+                }
+            }
+
+            // A build where the block-local copy never engaged looks, from the
+            // outside, exactly like one where it did. Say so once, at info, so
+            // the no-op is visible without per-block debug logging.
+            let unavailable = gather_unavailable.load(Ordering::Relaxed);
+            if let Some(out) = debug_options.gather_unavailable {
+                out.fetch_add(unavailable, Ordering::Relaxed);
+            }
+            if unavailable > 0 {
+                log::info!(
+                    "payload-block vector gather unavailable for {unavailable} block(s): {}",
+                    BlockVectors::gather_constraints(
                         &vector_storage_ref,
-                        &quantized_vectors_ref,
-                        &mut gpu_insert_context,
-                        &payload_index_ref,
-                        &pool,
-                        stopped,
-                        &mut additional_graph,
-                        points_to_index,
-                        &mut block_filter_list,
-                        &mut indexed_vectors_set,
-                        &counter,
-                    )?;
-                    graph_layers_builder.merge_from_other(additional_graph);
-                    Ok(())
-                };
-
-                payload_index_ref.with_view(|v| {
-                    v.for_each_payload_block(&field, full_scan_threshold, &mut process_block)
-                })?;
+                        quantized_vectors_ref.as_ref(),
+                        max_block_gather,
+                    ),
+                );
+            }
+            let declined = gather_declined.load(Ordering::Relaxed);
+            if let Some(out) = debug_options.gather_declined {
+                out.fetch_add(declined, Ordering::Relaxed);
+            }
+            if declined > 0 {
+                log::info!(
+                    "payload-block vector gather declined for {declined} block(s): the block \
+                     was over the {} MiB per-block cap, the {} MiB stage allowance was spent by \
+                     other blocks, or the copy found a short read",
+                    max_block_gather / (1024 * 1024),
+                    gather_allowance / (1024 * 1024),
+                );
             }
 
             let indexed_payload_vectors = indexed_vectors_set.count_ones();
@@ -560,6 +812,10 @@ impl HNSWIndex {
             Some(v) => GraphLinksFormatParam::CompressedWithVectors(v),
             None => GraphLinksFormatParam::Compressed,
         };
+
+        if let Some(inspect_builder) = debug_options.inspect_builder {
+            inspect_builder(&graph_layers_builder);
+        }
 
         let graph: GraphLayers =
             graph_layers_builder.into_graph_layers(path, format_param, is_on_disk)?;
@@ -623,6 +879,357 @@ fn condition_points(
         .filter(|&point_id| !deleted_bitslice.get_bit(point_id as usize).unwrap_or(false))
         .collect())
     })
+}
+
+/// Decides which payload blocks of one field are worth indexing.
+///
+/// Kept as a struct rather than a closure so both the compact and the legacy
+/// path can call it: the legacy path holds the graph builder mutably, and a
+/// closure capturing the builder immutably could not coexist with that.
+struct BlockFilter<'a> {
+    field: &'a JsonPath,
+    payload_index: &'a StructPayloadIndex,
+    vector_storage: &'a VectorStorageEnum,
+    stopped: &'a AtomicBool,
+    full_scan_threshold: usize,
+    max_block_size: usize,
+    /// Whether the connectivity shortcut applies to this field at all.
+    check_connectivity: bool,
+    required_connectivity: Option<f32>,
+    percolation: f32,
+    block_seed_base: u64,
+    blocks_built: Option<&'a AtomicUsize>,
+    blocks_skipped_by_connectivity: Option<&'a AtomicUsize>,
+    block_indices: Option<&'a Mutex<Vec<usize>>>,
+    skipped_fields: Option<&'a Mutex<Vec<JsonPath>>>,
+}
+
+impl BlockFilter<'_> {
+    /// Points of `payload_block` worth indexing, or `None` if it is skipped.
+    ///
+    /// `block_index` is the block's position in its field's generation order.
+    /// It seeds the connectivity shortcut, so both build paths have to number
+    /// the blocks of a field the same way to reach the same skip decisions.
+    fn points(
+        &self,
+        graph: &GraphLayersBuilder,
+        block_index: usize,
+        payload_block: PayloadBlockCondition,
+    ) -> OperationResult<Option<Vec<PointOffsetType>>> {
+        check_process_stopped(self.stopped)?;
+
+        if let Some(block_indices) = self.block_indices {
+            block_indices.lock().push(block_index);
+        }
+
+        let field = self.field;
+        let cardinality = payload_block.cardinality;
+        if cardinality > self.max_block_size {
+            debug!(
+                "payload block {field} [{cardinality}]: skip, over {}",
+                self.max_block_size,
+            );
+            return Ok(None);
+        }
+
+        let points_to_index = condition_points(
+            payload_block.condition,
+            self.payload_index,
+            self.vector_storage,
+            self.stopped,
+        )?;
+
+        // This is a heuristic to skip building graph for mostly deleted blocks.
+        // It might be, that majority of points do not actually have vectors
+        // (vectors marked as deleted), so we can avoid building graph for such blocks.
+        //
+        // FYI: query heuristic does account
+        // for deleted vectors via [`adjust_to_available_vectors`]
+        const DELETED_POINTS_FACTOR: usize = 4; // allow block to have up to 75% of deleted points and still be indexed
+
+        if points_to_index.len() <= self.full_scan_threshold / DELETED_POINTS_FACTOR {
+            debug!(
+                "payload block {field} [{cardinality}]: skip, only {} live points",
+                points_to_index.len(),
+            );
+            return Ok(None);
+        }
+
+        if self.check_connectivity
+            && let Some(required_connectivity) = self.required_connectivity
+        {
+            // Seeded per block, so the *sample* does not depend on how the blocks
+            // of this field were scheduled. The graph it samples still does:
+            // under parallel block builds this may see fewer blocks merged than
+            // the sequential path would have, so a block that would have been
+            // skipped can get built. A partially merged graph has strictly fewer
+            // links, so the shortcut can only fail to skip, never falsely
+            // conclude "already connected"
+            let mut block_rng = SmallRng::seed_from_u64(self.block_seed_base ^ block_index as u64);
+            let graph_connectivity =
+                graph.subgraph_connectivity(&mut block_rng, &points_to_index, self.percolation);
+
+            if graph_connectivity >= required_connectivity {
+                trace!(
+                    "skip building additional HNSW links for {field}, connectivity {graph_connectivity:.4} >= {required_connectivity:.4}"
+                );
+                debug!(
+                    "payload block {field} [{cardinality}]: skip, connectivity {graph_connectivity:.4} >= {required_connectivity:.4}"
+                );
+                if let Some(blocks_skipped) = self.blocks_skipped_by_connectivity {
+                    blocks_skipped.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(skipped_fields) = self.skipped_fields {
+                    skipped_fields.lock().push(field.clone());
+                }
+                return Ok(None);
+            }
+            trace!("graph connectivity: {graph_connectivity} for {field}");
+        }
+
+        if let Some(blocks_built) = self.blocks_built {
+            blocks_built.fetch_add(1, Ordering::Relaxed);
+        }
+
+        Ok(Some(points_to_index))
+    }
+}
+
+/// Builds one payload block's subgraph and merges it into the main graph.
+///
+/// Holds everything that is the same for every block of every field, so that the
+/// per-field loop and the unified cross-field queue drive identical per-block
+/// work and only differ in the order they hand blocks over.
+struct BlockBuilder<'a> {
+    vector_storage: &'a VectorStorageEnum,
+    quantized_vectors: &'a Option<QuantizedVectors>,
+    graph: &'a GraphLayersBuilder,
+    vec_deleted: &'a BitSlice,
+    point_deleted: &'a BitSlice,
+    payload_m: HnswM,
+    ef_construct: usize,
+    /// Stage-wide allowance for the block-vector copies, shared by every block in
+    /// the drain and reserved for as long as one block's buffer is alive.
+    gather_budget: &'a GatherBudget,
+    /// Largest buffer one block may hold, [`MAX_BLOCK_GATHER_BYTES`] outside tests.
+    max_block_gather: usize,
+    blocks_gathered: Option<&'a AtomicUsize>,
+    /// Blocks this storage can never be gathered from, reported once per build.
+    gather_unavailable: &'a AtomicUsize,
+    /// Blocks the copy was possible for but did not happen, reported once per
+    /// build. Either the allowance was spent or the copy bailed part way.
+    gather_declined: &'a AtomicUsize,
+    stopped: &'a AtomicBool,
+}
+
+impl BlockBuilder<'_> {
+    /// Build `payload_block` and merge it, unless `filter` skips it.
+    ///
+    /// `block_index` is the block's position in its own field's generation
+    /// order; it seeds the connectivity shortcut, so it has to be the field's
+    /// numbering however the blocks were scheduled.
+    ///
+    /// `insert_mode` says which pool the insertions after the serial warm-start
+    /// prefix are published to - see [`BlockInsertMode`].
+    fn build(
+        &self,
+        filter: &BlockFilter,
+        block_index: usize,
+        payload_block: PayloadBlockCondition,
+        counter: &AtomicU64,
+        insert_mode: BlockInsertMode<'_>,
+    ) -> OperationResult<()> {
+        let field = filter.field;
+        let cardinality = payload_block.cardinality;
+        let Some(points_to_index) = filter.points(self.graph, block_index, payload_block)? else {
+            return Ok(());
+        };
+
+        let block_deleted =
+            block_deleted_flags(&points_to_index, self.vec_deleted, self.point_deleted);
+
+        // Copied once per block and shared by every insertion in it, so the copy
+        // costs one pass over the block against the many searches that read it.
+        let gather_size = BlockVectors::gather_size(
+            points_to_index.len(),
+            self.vector_storage,
+            self.quantized_vectors.as_ref(),
+        );
+        let wanted = gather_size.filter(|&bytes| bytes <= self.max_block_gather);
+
+        let gathered =
+            match wanted.and_then(|bytes| Some((bytes, self.gather_budget.try_reserve(bytes)?))) {
+                // Bound the copy by what was reserved rather than by the cap, so the
+                // buffer can never be larger than the allowance accounting for it.
+                // The two are the same number today - both come from `gather_size` -
+                // and passing it keeps them that way.
+                Some((bytes, reservation)) => BlockVectors::try_gather(
+                    &points_to_index,
+                    self.vector_storage,
+                    self.quantized_vectors.as_ref(),
+                    bytes,
+                )
+                .map(|vectors| (reservation, vectors)),
+                None => None,
+            };
+
+        let scored_from_copy = gathered.as_ref().map(|(_, vectors)| vectors);
+        if scored_from_copy.is_some() {
+            if let Some(blocks_gathered) = self.blocks_gathered {
+                blocks_gathered.fetch_add(1, Ordering::Relaxed);
+            }
+        } else if gather_size.is_some() {
+            // Over the per-block cap, or the allowance was spent, or the copy
+            // bailed part way. All three are about this block, not the storage.
+            self.gather_declined.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.gather_unavailable.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let block_graph = build_filtered_graph_compact(
+            self.vector_storage,
+            self.quantized_vectors,
+            scored_from_copy,
+            true,
+            insert_mode,
+            self.stopped,
+            self.payload_m,
+            self.ef_construct,
+            &points_to_index,
+            &block_deleted,
+            counter,
+        )?;
+
+        // The copy is dead once the block's own graph is built.
+        let was_gathered = gathered.is_some();
+        drop(gathered);
+
+        let links_added = self.graph.merge_block(block_graph, &points_to_index);
+
+        debug!(
+            "payload block {field} [{cardinality}]: built {} points, {links_added} links, \
+             gathered={was_gathered}",
+            points_to_index.len(),
+        );
+        Ok(())
+    }
+}
+
+/// The block's points must be unique.
+fn block_deleted_flags(
+    points_to_index: &[PointOffsetType],
+    vec_deleted: &BitSlice,
+    point_deleted: &BitSlice,
+) -> BitVec {
+    let mut block_deleted = BitVec::repeat(false, points_to_index.len());
+    for (local_id, &global_id) in points_to_index.iter().enumerate() {
+        let live = NotDeletedChecker {
+            point_deleted,
+            vec_deleted,
+        }
+        .check(global_id)
+        .unwrap_or(false);
+        if !live {
+            block_deleted.set(local_id, true);
+        }
+    }
+    block_deleted
+}
+
+/// Build the subgraph of a payload block in its own id space.
+///
+/// Points are numbered `0..points_to_index.len()`, in `points_to_index` order,
+/// which keeps the builder proportional to the block instead of to the whole
+/// segment. Every candidate reachable in such a graph is a block member by
+/// construction, so unlike [`build_filtered_graph`] this needs no filter
+/// context to keep the search inside the block.
+///
+/// `insert_mode` decides how insertions after the warm-start prefix are
+/// scheduled - see [`BlockInsertMode`].
+#[allow(clippy::too_many_arguments)]
+fn build_filtered_graph_compact(
+    vector_storage: &VectorStorageEnum,
+    quantized_vectors: &Option<QuantizedVectors>,
+    block_vectors: Option<&BlockVectors>,
+    internal_from_block: bool,
+    insert_mode: BlockInsertMode<'_>,
+    stopped: &AtomicBool,
+    hnsw_m: HnswM,
+    ef_construct: usize,
+    points_to_index: &[PointOffsetType],
+    block_deleted: &BitSlice,
+    counter: &AtomicU64,
+) -> OperationResult<GraphLayersBuilder> {
+    let block_graph = GraphLayersBuilder::new_with_params(
+        points_to_index.len(),
+        hnsw_m,
+        ef_construct,
+        1,
+        HNSW_USE_HEURISTIC,
+        false,
+    );
+
+    let insert_point = |local_id: PointOffsetType| {
+        check_process_stopped(stopped)?;
+
+        // This hardware counter can be discarded, since it is only used for internal operations
+        let internal_hardware_counter = HardwareCounterCell::disposable();
+
+        let points_scorer = FilteredScorer::new_block_scorer(
+            points_to_index[local_id as usize],
+            points_to_index,
+            vector_storage,
+            quantized_vectors.as_ref(),
+            block_vectors,
+            internal_from_block,
+            block_deleted,
+            internal_hardware_counter,
+        )?;
+
+        block_graph.link_new_point(local_id, points_scorer);
+
+        counter.fetch_add(1, Ordering::Relaxed);
+
+        Ok::<_, OperationError>(())
+    };
+
+    let block_len = points_to_index.len() as PointOffsetType;
+    let first_points = block_len.min(SINGLE_THREADED_HNSW_BUILD_THRESHOLD as PointOffsetType);
+
+    // First index points in single thread so ensure warm start for parallel indexing process
+    for local_id in 0..first_points {
+        insert_point(local_id)?;
+    }
+    // Once initial structure is built, index remaining points in parallel
+    // So that each thread will insert points in different parts of the graph,
+    // it is less likely that they will compete for the same locks
+    if block_len > first_points {
+        match insert_mode {
+            BlockInsertMode::WholePool(pool) => {
+                pool.install(|| {
+                    (first_points..block_len)
+                        .into_par_iter()
+                        .try_for_each(insert_point)
+                })?;
+            }
+            // Already inside the pool, so publishing the range directly hands it
+            // to exactly that pool's threads - and only to those with nothing
+            // left to claim, since rayon takes local work first.
+            BlockInsertMode::InPool => {
+                debug_assert!(
+                    rayon::current_thread_index().is_some(),
+                    "InPool publishes to the caller's pool, so it must be called \
+                     from inside one - otherwise the work lands on rayon's global \
+                     pool and ignores the build's CPU permit",
+                );
+                (first_points..block_len)
+                    .into_par_iter()
+                    .try_for_each(insert_point)?;
+            }
+        }
+    }
+
+    Ok(block_graph)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -713,4 +1320,57 @@ fn build_filtered_graph(
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use common::bitvec::BitVec;
+
+    use super::*;
+
+    /// A block point is flagged when either bitslice calls it deleted, and the
+    /// flags are indexed by *local* id while the bitslices are indexed by global
+    /// id - the translation is the whole job.
+    ///
+    /// Untestable until the function stopped asserting its own output was empty.
+    #[test]
+    fn block_deleted_flags_translate_global_deletions_to_local_ids() {
+        let points: Vec<PointOffsetType> = vec![5, 7, 9, 11];
+
+        let mut vec_deleted = BitVec::repeat(false, 16);
+        vec_deleted.set(7, true);
+        let mut point_deleted = BitVec::repeat(false, 16);
+        point_deleted.set(11, true);
+
+        let flags = block_deleted_flags(&points, &vec_deleted, &point_deleted);
+
+        assert_eq!(flags.len(), points.len());
+        // local 1 is global 7 (vector deleted), local 3 is global 11 (point
+        // deleted); the other two are live.
+        assert!(!flags[0], "global 5 is live");
+        assert!(flags[1], "global 7 has a deleted vector");
+        assert!(!flags[2], "global 9 is live");
+        assert!(flags[3], "global 11 is a deleted point");
+    }
+
+    #[test]
+    fn block_deleted_flags_are_all_clear_when_nothing_is_deleted() {
+        let points: Vec<PointOffsetType> = vec![0, 1, 2, 3];
+        let live = BitVec::repeat(false, 8);
+        assert_eq!(block_deleted_flags(&points, &live, &live).count_ones(), 0);
+    }
+
+    /// A point the bitslices do not cover cannot be shown to be live, and the safe
+    /// reading of that is "deleted": giving it links would link into a vector the
+    /// storage may not have.
+    #[test]
+    fn block_deleted_flags_treat_out_of_range_points_as_deleted() {
+        let points: Vec<PointOffsetType> = vec![1, 99];
+        let live = BitVec::repeat(false, 8);
+
+        let flags = block_deleted_flags(&points, &live, &live);
+
+        assert!(!flags[0], "global 1 is covered and live");
+        assert!(flags[1], "global 99 is past both bitslices");
+    }
 }
