@@ -182,40 +182,64 @@ impl Dispatcher {
 
             let op = match operation {
                 CollectionMetaOperations::CreateCollection(mut op) => {
+                    // Only resolve the shard distribution if it is not already set
                     if !op.is_distribution_set() {
-                        match op.create_collection.sharding_method.unwrap_or_default() {
-                            ShardingMethod::Auto => {
-                                // Suggest even distribution of shards across nodes
-                                let number_of_peers = state.0.peer_count();
-
-                                let collection_defaults =
-                                    self.toc.storage_config.collection.as_ref();
-
-                                let shard_distribution = self.toc.suggest_shard_distribution(
-                                    &op,
-                                    collection_defaults,
-                                    number_of_peers,
-                                );
-
-                                // Expect all replicas to become active eventually
-                                for (shard_id, peer_ids) in &shard_distribution.distribution {
-                                    for peer_id in peer_ids {
-                                        expect_operations.push(
-                                            ConsensusOperations::initialize_replica(
-                                                op.collection_name.clone(),
-                                                *shard_id,
-                                                *peer_id,
-                                            ),
-                                        );
-                                    }
+                        if let Some(placement) = &op.create_collection.shard_placement {
+                            let explicit =
+                                crate::content_manager::shard_distribution::resolve_explicit_placement(
+                                    placement,
+                                    op.create_collection.shard_number,
+                                    op.create_collection.replication_factor,
+                                    op.create_collection.sharding_method.unwrap_or_default(),
+                                    &state.0.peer_address_by_id(),
+                                )?;
+                            for (shard_id, peer_ids) in &explicit.distribution {
+                                for peer_id in peer_ids {
+                                    expect_operations.push(
+                                        ConsensusOperations::initialize_replica(
+                                            op.collection_name.clone(),
+                                            *shard_id,
+                                            *peer_id,
+                                        ),
+                                    );
                                 }
-
-                                op.set_distribution(shard_distribution);
                             }
-                            ShardingMethod::Custom => {
-                                // If custom sharding is used - we don't create any shards in advance
-                                let empty_distribution = ShardDistributionProposal::empty();
-                                op.set_distribution(empty_distribution);
+                            op.set_distribution(explicit);
+                        } else {
+                            match op.create_collection.sharding_method.unwrap_or_default() {
+                                ShardingMethod::Auto => {
+                                    // Suggest even distribution of shards across nodes
+                                    let number_of_peers = state.0.peer_count();
+
+                                    let collection_defaults =
+                                        self.toc.storage_config.collection.as_ref();
+
+                                    let shard_distribution = self.toc.suggest_shard_distribution(
+                                        &op,
+                                        collection_defaults,
+                                        number_of_peers,
+                                    );
+
+                                    // Expect all replicas to become active eventually
+                                    for (shard_id, peer_ids) in &shard_distribution.distribution {
+                                        for peer_id in peer_ids {
+                                            expect_operations.push(
+                                                ConsensusOperations::initialize_replica(
+                                                    op.collection_name.clone(),
+                                                    *shard_id,
+                                                    *peer_id,
+                                                ),
+                                            );
+                                        }
+                                    }
+
+                                    op.set_distribution(shard_distribution);
+                                }
+                                ShardingMethod::Custom => {
+                                    // If custom sharding is used - we don't create any shards in advance
+                                    let empty_distribution = ShardDistributionProposal::empty();
+                                    op.set_distribution(empty_distribution);
+                                }
                             }
                         }
                     }
