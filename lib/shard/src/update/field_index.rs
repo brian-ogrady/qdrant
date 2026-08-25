@@ -39,8 +39,19 @@ pub fn create_field_index(
         // `SegmentHolder::with_flush_serialized`). Skipped for idempotent
         // ensure-calls (index already present with an identical schema), which must
         // stay cheap; those resolve to `AlreadyExists` in the build below.
-        let already_indexed =
-            write_segment.get_indexed_fields().get(field_name) == Some(field_schema);
+        // Resolved-equivalence, not raw equality: a persisted `on_disk: true` and a requested
+        // `memory: "cold"` are the same index (the server rebuilds for neither), so treat the
+        // field as already indexed and skip the flush. Raw `==` would flush on every
+        // ensure-call and WAL replay for a spelling-divergent schema, forever.
+        let already_indexed = write_segment
+            .get_indexed_fields()
+            .get(field_name)
+            .is_some_and(|current| {
+                segment::index::field_index::schema_transition::no_change_needed(
+                    current,
+                    field_schema,
+                )
+            });
         if !already_indexed {
             segments.with_flush_serialized(|| write_segment.flush(true))?;
         }

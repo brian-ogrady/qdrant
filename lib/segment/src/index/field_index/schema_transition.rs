@@ -2,13 +2,21 @@
 //! schema and the newly requested one.
 //!
 //! Used by `StructPayloadIndex::set_indexed` to detect the case where the
-//! only difference is the `on_disk` flag. For non-appendable segments this
+//! only difference is the memory placement. For non-appendable segments this
 //! lets us swap the in-memory wrapper variant in place instead of dropping
 //! and rebuilding the entire field index from payload storage.
 //!
-//! Each per-kind arm normalizes `on_disk` on a clone and compares the rest
-//! via the derived `PartialEq`, so a newly added field is accounted for
-//! automatically: any difference outside `on_disk` yields `Incompatible`.
+//! Placement is compared *resolved* (`memory_placement()`, which reconciles the
+//! new `memory` parameter with the deprecated `on_disk` flag), never field by
+//! field. Two spellings of one placement — `on_disk: true` vs `memory: "cold"`,
+//! `on_disk: false` vs `memory: "pinned"`, or an absent flag vs its explicit
+//! default — are `Identical`: the index bytes and wrapper are the same either
+//! way, and classifying them as anything else would rebuild an index (via the
+//! appendable drop-and-rebuild path) over a pure change of notation.
+//!
+//! Each per-kind arm blanks both placement fields on clones and compares the
+//! rest via the derived `PartialEq`, so a newly added field is accounted for
+//! automatically: any difference outside the placement yields `Incompatible`.
 
 // Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
 // handled here for backward compatibility with the new `memory` parameter
@@ -18,15 +26,24 @@ use crate::types::{PayloadFieldSchema, PayloadSchemaParams};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaTransition {
-    /// The two schemas are functionally identical (modulo `FieldType` vs
+    /// The two schemas are functionally identical: everything outside the
+    /// placement matches, and the *resolved* placements are equal — even when
+    /// the raw `on_disk`/`memory` spellings differ (modulo `FieldType` vs
     /// fully-expanded `FieldParams`).
     Identical,
-    /// The two schemas differ only in their `on_disk` flag. Eligible for the
-    /// in-place swap fast path on non-appendable segments.
+    /// The two schemas differ only in their resolved memory placement.
     OnlyOnDiskFlipped { new_on_disk: bool },
     /// The two schemas differ in a way that requires the legacy
     /// drop-and-rebuild path.
     Incompatible,
+}
+
+/// Returns `true` if the existing index already matches the requested schema.
+///
+/// Equivalent placement settings, such as `on_disk: true` and `memory: "cold"`, are treated as
+/// a match so callers do not rebuild an unchanged index.
+pub fn no_change_needed(current: &PayloadFieldSchema, requested: &PayloadFieldSchema) -> bool {
+    matches!(classify(current, requested), SchemaTransition::Identical)
 }
 
 pub fn classify(old: &PayloadFieldSchema, new: &PayloadFieldSchema) -> SchemaTransition {
@@ -35,50 +52,51 @@ pub fn classify(old: &PayloadFieldSchema, new: &PayloadFieldSchema) -> SchemaTra
     let old = &*old;
     let new = &*new;
 
-    if old == new {
+    if !equal_outside_placement(old, new) {
+        return SchemaTransition::Incompatible;
+    }
+
+    if old.memory_placement() == new.memory_placement() {
         return SchemaTransition::Identical;
     }
 
-    if only_on_disk_differs(old, new) {
-        return SchemaTransition::OnlyOnDiskFlipped {
-            new_on_disk: new.is_on_disk(),
-        };
+    SchemaTransition::OnlyOnDiskFlipped {
+        new_on_disk: new.is_on_disk(),
     }
-
-    SchemaTransition::Incompatible
 }
 
-fn only_on_disk_differs(old: &PayloadSchemaParams, new: &PayloadSchemaParams) -> bool {
+fn equal_outside_placement(old: &PayloadSchemaParams, new: &PayloadSchemaParams) -> bool {
     use PayloadSchemaParams as P;
 
-    // Compare `on_disk` at the `Option<bool>` level: `None` vs `Some(false)`
-    // both mean "false" yet the persisted value differs, so it still counts as
-    // a flip. Every other field goes through the derived `PartialEq` after
-    // normalizing `on_disk` on a clone — a newly added field is therefore
+    // Blank both placement spellings on clones of both sides and compare the
+    // rest through the derived `PartialEq` — a newly added field is therefore
     // accounted for automatically (any difference makes this `false`, i.e.
-    // `Incompatible`, the safe default).
-    macro_rules! only_on_disk {
-        ($a:expr, $b:expr) => {
-            $a.on_disk != $b.on_disk && {
-                let mut normalized = $a.clone();
-                normalized.on_disk = $b.on_disk;
-                normalized == *$b
-            }
-        };
+    // `Incompatible`, the safe default). The placement itself is compared
+    // separately, resolved, in `classify`.
+    macro_rules! rest_equal {
+        ($a:expr, $b:expr) => {{
+            let mut a = $a.clone();
+            let mut b = $b.clone();
+            a.on_disk = None;
+            a.memory = None;
+            b.on_disk = None;
+            b.memory = None;
+            a == b
+        }};
     }
 
     match (old, new) {
-        (P::Keyword(a), P::Keyword(b)) => only_on_disk!(a, b),
-        (P::Integer(a), P::Integer(b)) => only_on_disk!(a, b),
-        (P::Float(a), P::Float(b)) => only_on_disk!(a, b),
-        (P::Geo(a), P::Geo(b)) => only_on_disk!(a, b),
-        (P::Text(a), P::Text(b)) => only_on_disk!(a, b),
-        (P::Bool(a), P::Bool(b)) => only_on_disk!(a, b),
-        (P::Datetime(a), P::Datetime(b)) => only_on_disk!(a, b),
-        (P::Uuid(a), P::Uuid(b)) => only_on_disk!(a, b),
-        // Cross-kind pairs cannot be "only on_disk differs". Listed
-        // exhaustively (rather than `_ =>`) so a new `PayloadSchemaParams`
-        // variant triggers a compile error here.
+        (P::Keyword(a), P::Keyword(b)) => rest_equal!(a, b),
+        (P::Integer(a), P::Integer(b)) => rest_equal!(a, b),
+        (P::Float(a), P::Float(b)) => rest_equal!(a, b),
+        (P::Geo(a), P::Geo(b)) => rest_equal!(a, b),
+        (P::Text(a), P::Text(b)) => rest_equal!(a, b),
+        (P::Bool(a), P::Bool(b)) => rest_equal!(a, b),
+        (P::Datetime(a), P::Datetime(b)) => rest_equal!(a, b),
+        (P::Uuid(a), P::Uuid(b)) => rest_equal!(a, b),
+        // Cross-kind pairs are never compatible. Listed exhaustively (rather
+        // than `_ =>`) so a new `PayloadSchemaParams` variant triggers a
+        // compile error here.
         (P::Keyword(_), _)
         | (P::Integer(_), _)
         | (P::Float(_), _)
@@ -99,7 +117,7 @@ mod tests {
         KeywordIndexParams, KeywordIndexType, TextIndexParams, TextIndexType, TokenizerType,
         UuidIndexParams, UuidIndexType,
     };
-    use crate::types::PayloadSchemaType;
+    use crate::types::{Memory, PayloadSchemaType};
 
     fn wrap(p: PayloadSchemaParams) -> PayloadFieldSchema {
         PayloadFieldSchema::FieldParams(p)
@@ -372,18 +390,89 @@ mod tests {
             SchemaTransition::OnlyOnDiskFlipped { new_on_disk: true },
         );
 
-        // None vs Some(false) — both mean "false", so they are Identical.
-        // The field-level comparison (`Option<bool>`) sees them as different,
-        // but `is_on_disk()` reads `unwrap_or_default()` so they're semantically equal.
-        //
-        // We choose to surface this as `OnlyOnDiskFlipped { new_on_disk: false }` rather than
-        // Identical, because the persisted on_disk value differs (None vs Some(false)) and the
-        // caller may want the persisted value updated. The swap itself is a no-op in that case.
+        // None vs Some(false) — both resolve to the same placement, so they are
+        // Identical. Classifying this as a flip used to send *appendable* segments
+        // through the drop-and-rebuild path over a pure change of notation
+        // (`drop_index_if_incompatible` drops on any flip for Gridstore); the
+        // persisted spelling staying stale is the strictly cheaper outcome.
         let none = wrap(keyword(None, None));
         let off = wrap(keyword(Some(false), None));
+        assert_eq!(classify(&none, &off), SchemaTransition::Identical);
+    }
+
+    fn keyword_memory(memory: Option<Memory>) -> PayloadSchemaParams {
+        PayloadSchemaParams::Keyword(KeywordIndexParams {
+            memory,
+            r#type: KeywordIndexType::Keyword,
+            is_tenant: None,
+            on_disk: None,
+            enable_hnsw: None,
+            prefix: None,
+        })
+    }
+
+    /// The 1.19 `memory` parameter and the deprecated `on_disk` flag are two
+    /// spellings of one placement; classify must compare them resolved, or a
+    /// collection config restated in the new spelling rebuilds every field
+    /// index over nothing.
+    #[test]
+    fn equivalent_placement_spellings_are_identical() {
+        // on_disk: true == memory: cold
         assert_eq!(
-            classify(&none, &off),
+            classify(
+                &wrap(keyword(Some(true), None)),
+                &wrap(keyword_memory(Some(Memory::Cold))),
+            ),
+            SchemaTransition::Identical,
+        );
+        // on_disk: false == memory: pinned (the in-RAM field index is a heap structure)
+        assert_eq!(
+            classify(
+                &wrap(keyword(Some(false), None)),
+                &wrap(keyword_memory(Some(Memory::Pinned))),
+            ),
+            SchemaTransition::Identical,
+        );
+        // absent == the explicit default
+        assert_eq!(
+            classify(
+                &wrap(keyword(None, None)),
+                &wrap(keyword_memory(Some(Memory::Pinned))),
+            ),
+            SchemaTransition::Identical,
+        );
+    }
+
+    #[test]
+    fn a_real_placement_change_via_memory_is_a_flip() {
+        assert_eq!(
+            classify(
+                &wrap(keyword_memory(Some(Memory::Pinned))),
+                &wrap(keyword_memory(Some(Memory::Cold))),
+            ),
+            SchemaTransition::OnlyOnDiskFlipped { new_on_disk: true },
+        );
+        // Mixed spellings, real change: on_disk: true -> memory: pinned.
+        assert_eq!(
+            classify(
+                &wrap(keyword(Some(true), None)),
+                &wrap(keyword_memory(Some(Memory::Pinned))),
+            ),
             SchemaTransition::OnlyOnDiskFlipped { new_on_disk: false },
+        );
+    }
+
+    #[test]
+    fn memory_spelling_with_another_change_is_incompatible() {
+        // Placement expressed via `memory`, but is_tenant differs too.
+        let a = wrap(keyword(Some(true), Some(true)));
+        let mut b_params = keyword_memory(Some(Memory::Cold));
+        if let PayloadSchemaParams::Keyword(k) = &mut b_params {
+            k.is_tenant = Some(false);
+        }
+        assert_eq!(
+            classify(&a, &wrap(b_params)),
+            SchemaTransition::Incompatible
         );
     }
 }

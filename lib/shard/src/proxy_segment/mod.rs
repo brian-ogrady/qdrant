@@ -162,7 +162,15 @@ impl ProxySegment {
         for (expected_field, expected_schema) in &expected_indexes {
             let existing_schema = existing_indexes.get(expected_field);
 
-            if existing_schema != Some(expected_schema) {
+            // Resolved-equivalence: a spelling-only difference (`on_disk` vs `memory`) is the
+            // same index, so don't drop-and-recreate over pure notation.
+            let needs_change = existing_schema.is_none_or(|current| {
+                !segment::index::field_index::schema_transition::no_change_needed(
+                    current,
+                    expected_schema,
+                )
+            });
+            if needs_change {
                 if existing_schema.is_some() {
                     segment_to_update
                         .get()
