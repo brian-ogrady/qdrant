@@ -12,11 +12,10 @@ use segment::common::operation_error::{OperationError, OperationResult};
 use segment::common::operation_time_statistics::OperationDurationsAggregator;
 use segment::entry::ReadSegmentEntry;
 use segment::index::hnsw_index::get_num_indexing_threads;
-use segment::index::sparse_index::sparse_index_config::SparseIndexType;
 use segment::segment::Segment;
 use segment::segment_constructor::build_segment;
 use segment::segment_constructor::segment_builder::SegmentBuilder;
-use segment::types::{HnswGlobalConfig, Indexes, Memory, VectorNameBuf, VectorStorageType};
+use segment::types::{HnswGlobalConfig, VectorNameBuf};
 use uuid::Uuid;
 
 use super::config::SegmentOptimizerConfig;
@@ -26,8 +25,6 @@ use crate::optimize::{OptimizationPaths, OptimizationStrategy, execute_optimizat
 use crate::segment_holder::locked::LockedSegmentHolder;
 use crate::segment_holder::{SegmentHolder, SegmentId};
 use crate::segment_manifest::NewSegmentToken;
-
-const BYTES_IN_KB: usize = 1024;
 
 /// Resolves per-vector HNSW max_indexing_threads (0 = auto) and returns the actual thread count.
 pub fn max_num_indexing_threads(segment_optimizer_config: &SegmentOptimizerConfig) -> usize {
@@ -210,144 +207,11 @@ pub trait SegmentOptimizer: Sync {
             .copied()
             .unwrap_or(0);
 
-        let thresholds = self.threshold_config();
-        let segment_optimizer_config = self.segment_optimizer_config();
-
-        let threshold_is_indexed = maximal_vector_store_size_bytes
-            >= thresholds.indexing_threshold_kb.saturating_mul(BYTES_IN_KB);
-
-        let threshold_is_on_disk = maximal_vector_store_size_bytes
-            >= thresholds.memmap_threshold_kb.saturating_mul(BYTES_IN_KB);
-
-        let mut vector_data = segment_optimizer_config.plain_dense_vector_config.clone();
-        let mut sparse_vector_data = segment_optimizer_config.plain_sparse_vector_config.clone();
-
-        // If indexing, change to HNSW index and quantization
-        // We must always create an HNSW index if we have deferred points to be able to promote them
-        if threshold_is_indexed || any_has_deferred {
-            if !threshold_is_indexed {
-                log::info!(
-                    "Segment has deferred points, but doesn't exceed indexing threshold. It will be optimized with HNSW index and quantization."
-                );
-            }
-            vector_data.iter_mut().for_each(|(vector_name, config)| {
-                if let Some(vector_cfg) = segment_optimizer_config.dense_vector.get(vector_name) {
-                    // Assign HNSW index
-                    config.index = Indexes::Hnsw(vector_cfg.hnsw_config);
-                    // Assign quantization config
-                    config.quantization_config = vector_cfg.quantization_config.clone();
-                }
-            });
-        }
-
-        // We want to use single-file mmap in the following cases:
-        // - It is explicitly configured by `mmap_threshold` -> threshold_is_on_disk=true
-        // - The segment is indexed and configured on disk
-        //   -> threshold_is_indexed=true && requested placement is cold
-        if threshold_is_on_disk || threshold_is_indexed {
-            vector_data.iter_mut().for_each(|(vector_name, config)| {
-                // Requested memory placement: explicit `memory`, or the deprecated `on_disk`
-                let config_memory = segment_optimizer_config
-                    .dense_vector
-                    .get(vector_name)
-                    .and_then(|cfg| {
-                        Memory::resolve_or_warn(
-                            cfg.memory,
-                            cfg.on_disk.map(Memory::from_on_disk),
-                            &format_args!("dense vector `{vector_name}`"),
-                        )
-                    });
-
-                match config_memory {
-                    // Both agree, but prefer mmap storage type
-                    Some(Memory::Cold) => config.storage_type = VectorStorageType::Mmap,
-                    // `pinned` is not supported for dense vector storage (rejected by API
-                    // validation); defensively treated as the closest supported placement
-                    Some(Memory::Cached) | Some(Memory::Pinned) => {
-                        if common::flags::feature_flags().single_file_mmap_vector_storage {
-                            config.storage_type = VectorStorageType::InRamMmap;
-                        }
-                        // requested in-RAM placement wins, do nothing
-                    }
-                    None => {
-                        if threshold_is_on_disk {
-                            // Mmap threshold wins
-                            config.storage_type = VectorStorageType::Mmap
-                        } else if common::flags::feature_flags().single_file_mmap_vector_storage {
-                            config.storage_type = VectorStorageType::InRamMmap;
-                        }
-                    }
-                }
-
-                // If we explicitly configure the placement, but the segment storage type uses
-                // something that doesn't match, warn about it
-                if let Some(config_memory) = config_memory
-                    && config_memory.is_on_disk() != config.storage_type.is_on_disk()
-                {
-                    log::warn!(
-                        "Collection config for vector {vector_name} has memory placement {config_memory:?} configured, but storage type for segment doesn't match it"
-                    );
-                }
-            });
-        }
-
-        sparse_vector_data
-            .iter_mut()
-            .for_each(|(vector_name, config)| {
-                // Requested memory placement: explicit `memory`, or the deprecated `on_disk`
-                let config_memory = segment_optimizer_config
-                    .sparse_vector
-                    .get(vector_name)
-                    .and_then(|cfg| {
-                        Memory::resolve_or_warn(
-                            cfg.memory,
-                            cfg.on_disk.map(Memory::from_on_disk_heap),
-                            &format_args!("sparse vector `{vector_name}`"),
-                        )
-                    });
-
-                let requested_memory = config_memory
-                    .unwrap_or_else(|| Memory::from_on_disk_heap(threshold_is_on_disk));
-
-                // If mmap OR index is exceeded
-                let is_big = threshold_is_on_disk || threshold_is_indexed;
-
-                let index_type = if is_big {
-                    match requested_memory {
-                        // Both cold and cached are backed by the mmap index; the requested
-                        // placement is kept in the index config to drive cache population
-                        Memory::Cold | Memory::Cached => SparseIndexType::Mmap,
-                        Memory::Pinned => SparseIndexType::ImmutableRam,
-                    }
-                } else {
-                    SparseIndexType::MutableRam
-                };
-
-                config.index.index_type = index_type;
-                // Persist only the explicitly requested `memory` parameter: the structural
-                // decision is carried by `index_type`, and only the cold/cached distinction
-                // (reachable solely through the explicit parameter) needs the extra field.
-                // Legacy-only configurations thus keep a byte-identical index config,
-                // which older Qdrant versions can load without any unknown fields.
-                config.index.memory = segment_optimizer_config
-                    .sparse_vector
-                    .get(vector_name)
-                    .and_then(|cfg| cfg.memory);
-                // Same reasoning as `memory` just above, applied in the other direction:
-                // `wand_pruning` is read only by the mutable RAM index, so persisting it into a
-                // compressed one records a setting that index will never consult and contradicts
-                // the "only MutableRam is affected" invariant its own doc states. Clearing it also
-                // keeps a legacy-only compressed index config byte-identical for older versions.
-                if index_type != SparseIndexType::MutableRam {
-                    config.index.wand_pruning = None;
-                }
-            });
-
-        let optimized_config = segment::types::SegmentConfig {
-            vector_data,
-            sparse_vector_data,
-            payload_storage_type: segment_optimizer_config.payload_storage_type,
-        };
+        let optimized_config = self.segment_optimizer_config().optimized_segment_config(
+            self.threshold_config(),
+            maximal_vector_store_size_bytes,
+            any_has_deferred,
+        );
 
         SegmentBuilder::new(
             self.temp_path(),
