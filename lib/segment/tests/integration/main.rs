@@ -20,6 +20,7 @@ mod multivector_quantization_test;
 mod nested_filtering_test;
 mod payload_index_test;
 mod scroll_filtering_test;
+mod segment_builder_points_test;
 mod segment_builder_test;
 mod segment_on_disk_snapshot;
 mod segment_tests;

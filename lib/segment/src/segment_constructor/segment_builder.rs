@@ -31,6 +31,11 @@ use super::{
 };
 use crate::common::error_logging::LogError;
 use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
+use crate::data_types::named_vectors::NamedVectors;
+use crate::data_types::primitive::PrimitiveVectorElement;
+use crate::data_types::vectors::{
+    VectorElementType, VectorElementTypeByte, VectorElementTypeHalf, VectorInternal, VectorRef,
+};
 use crate::entry::entry_point::StorageSegmentEntry as _;
 use crate::id_tracker::compressed::compressed_point_mappings::CompressedPointMappings;
 use crate::id_tracker::disk_id_tracker::DiskIdTracker;
@@ -49,13 +54,15 @@ use crate::segment_constructor::{
     VectorIndexBuildArgs, VectorIndexOpenArgs, build_vector_index, load_segment,
 };
 use crate::types::{
-    CompactExtendedPointId, ExtendedPointId, HnswGlobalConfig, PayloadFieldSchema, PayloadKeyType,
-    SegmentConfig, SegmentState, SeqNumberType, VectorNameBuf,
+    CompactExtendedPointId, ExtendedPointId, HnswGlobalConfig, Payload, PayloadFieldSchema,
+    PayloadKeyType, SegmentConfig, SegmentState, SeqNumberType, VectorNameBuf,
 };
 use crate::vector_storage::quantized::quantized_vectors::{
     QuantizedVectors, QuantizedVectorsStorageType,
 };
-use crate::vector_storage::{VectorStorage, VectorStorageEnum, VectorStorageRead};
+use crate::vector_storage::{
+    DenseVectorStorage, SparseVectorStorage, VectorStorage, VectorStorageEnum, VectorStorageRead,
+};
 
 /// Structure for constructing segment out of several other segments
 pub struct SegmentBuilder {
@@ -84,6 +91,177 @@ pub struct SegmentBuilder {
 struct VectorData {
     vector_storage: VectorStorageEnum,
     old_indices: Vec<Arc<AtomicRefCell<VectorIndexEnum>>>,
+}
+
+/// Point format for [`SegmentBuilder::update_from_points`], mimicking the standard upsert format.
+pub struct PointToInsert<'a> {
+    pub external_id: ExtendedPointId,
+    // Within a given SegmentBuilder, `version` determines which copy of a repeated external ID wins;
+    // it does not deduplicate the same ID across independently built segments.
+    pub version: SeqNumberType,
+    pub vectors: NamedVectors<'a>,
+    pub payload: Option<Payload>,
+}
+
+/// Append one batch's vectors for `name` into `target`, in batch order.
+/// If a point is missing a named vector, write a default placeholder and
+/// mark it deleted, matching [`VectorIndex::update_vector`]'s behavior.
+fn ingest_from_points(
+    target: &mut VectorStorageEnum,
+    name: &crate::types::VectorName,
+    batch: &[PointToInsert<'_>],
+    default: &VectorInternal,
+    stopped: &AtomicBool,
+) -> OperationResult<std::ops::Range<PointOffsetType>> {
+    fn dense_iter<'a, T: PrimitiveVectorElement>(
+        batch: &'a [PointToInsert<'_>],
+        name: &'a crate::types::VectorName,
+        default: &'a [VectorElementType],
+    ) -> impl Iterator<Item = (Cow<'a, [T]>, bool)> {
+        batch
+            .iter()
+            .map(move |point| match point.vectors.get(name) {
+                Some(VectorRef::Dense(values)) => {
+                    (T::slice_from_float_cow(Cow::Borrowed(values)), false)
+                }
+                _ => (T::slice_from_float_cow(Cow::Borrowed(default)), true),
+            })
+    }
+
+    fn sparse_iter<'a>(
+        batch: &'a [PointToInsert<'_>],
+        name: &'a crate::types::VectorName,
+        default: &'a sparse::common::sparse_vector::SparseVector,
+    ) -> impl Iterator<Item = (Cow<'a, sparse::common::sparse_vector::SparseVector>, bool)> {
+        batch
+            .iter()
+            .map(move |point| match point.vectors.get(name) {
+                Some(VectorRef::Sparse(vector)) => (Cow::Borrowed(vector), false),
+                _ => (Cow::Borrowed(default), true),
+            })
+    }
+
+    fn dense_default(default: &VectorInternal) -> OperationResult<&[VectorElementType]> {
+        match default {
+            VectorInternal::Dense(values) => Ok(values.as_slice()),
+            other @ (VectorInternal::Sparse(_) | VectorInternal::MultiDense(_)) => {
+                Err(OperationError::service_error(format!(
+                    "dense storage produced a non-dense default vector: {other:?}",
+                )))
+            }
+        }
+    }
+
+    fn sparse_default(
+        default: &VectorInternal,
+    ) -> OperationResult<&sparse::common::sparse_vector::SparseVector> {
+        match default {
+            VectorInternal::Sparse(vector) => Ok(vector),
+            other @ (VectorInternal::Dense(_) | VectorInternal::MultiDense(_)) => {
+                Err(OperationError::service_error(format!(
+                    "sparse storage produced a non-sparse default vector: {other:?}",
+                )))
+            }
+        }
+    }
+
+    match target {
+        VectorStorageEnum::DenseVolatile(t) => t.update_from(
+            &mut dense_iter::<VectorElementType>(batch, name, dense_default(default)?),
+            stopped,
+        ),
+        #[cfg(test)]
+        VectorStorageEnum::DenseVolatileByte(t) => t.update_from(
+            &mut dense_iter::<VectorElementTypeByte>(batch, name, dense_default(default)?),
+            stopped,
+        ),
+        #[cfg(test)]
+        VectorStorageEnum::DenseVolatileHalf(t) => t.update_from(
+            &mut dense_iter::<VectorElementTypeHalf>(batch, name, dense_default(default)?),
+            stopped,
+        ),
+        VectorStorageEnum::DenseMemmap(t) => t.update_from(
+            &mut dense_iter::<VectorElementType>(batch, name, dense_default(default)?),
+            stopped,
+        ),
+        VectorStorageEnum::DenseMemmapByte(t) => t.update_from(
+            &mut dense_iter::<VectorElementTypeByte>(batch, name, dense_default(default)?),
+            stopped,
+        ),
+        VectorStorageEnum::DenseMemmapHalf(t) => t.update_from(
+            &mut dense_iter::<VectorElementTypeHalf>(batch, name, dense_default(default)?),
+            stopped,
+        ),
+        #[cfg(target_os = "linux")]
+        VectorStorageEnum::DenseUring(t) => t.update_from(
+            &mut dense_iter::<VectorElementType>(batch, name, dense_default(default)?),
+            stopped,
+        ),
+        #[cfg(target_os = "linux")]
+        VectorStorageEnum::DenseUringByte(t) => t.update_from(
+            &mut dense_iter::<VectorElementTypeByte>(batch, name, dense_default(default)?),
+            stopped,
+        ),
+        #[cfg(target_os = "linux")]
+        VectorStorageEnum::DenseUringHalf(t) => t.update_from(
+            &mut dense_iter::<VectorElementTypeHalf>(batch, name, dense_default(default)?),
+            stopped,
+        ),
+        VectorStorageEnum::DenseAppendableMemmap(t) => t.update_from(
+            &mut dense_iter::<VectorElementType>(batch, name, dense_default(default)?),
+            stopped,
+        ),
+        VectorStorageEnum::DenseAppendableMemmapByte(t) => t.update_from(
+            &mut dense_iter::<VectorElementTypeByte>(batch, name, dense_default(default)?),
+            stopped,
+        ),
+        VectorStorageEnum::DenseAppendableMemmapHalf(t) => t.update_from(
+            &mut dense_iter::<VectorElementTypeHalf>(batch, name, dense_default(default)?),
+            stopped,
+        ),
+        VectorStorageEnum::SparseVolatile(t) => t.update_from(
+            &mut sparse_iter(batch, name, sparse_default(default)?),
+            stopped,
+        ),
+        VectorStorageEnum::SparseMmap(t) => t.update_from(
+            &mut sparse_iter(batch, name, sparse_default(default)?),
+            stopped,
+        ),
+        // Turbo-datatype storages take native turbo bytes on this path; encoding f32 input
+        // belongs to their insert path, which the bulk builder does not use. TurboQuant via
+        // `quantization_config` (f32/f16 storage, quantized in `build`) is unaffected.
+        VectorStorageEnum::DenseTurboMemmap(_)
+        | VectorStorageEnum::DenseTurboAppendableMemmap(_) => {
+            Err(OperationError::service_error(format!(
+                "vector '{name}': bulk ingest into a `turbo4`-datatype storage is not supported \
+                 yet; declare TurboQuant through `quantization_config` instead, or build through \
+                 the staging-shard route",
+            )))
+        }
+        #[cfg(target_os = "linux")]
+        VectorStorageEnum::DenseTurboUring(_) => Err(OperationError::service_error(format!(
+            "vector '{name}': bulk ingest into a `turbo4`-datatype storage is not supported \
+             yet; declare TurboQuant through `quantization_config` instead, or build through \
+             the staging-shard route",
+        ))),
+        VectorStorageEnum::MultiDenseVolatile(_)
+        | VectorStorageEnum::MultiDenseAppendableMemmap(_)
+        | VectorStorageEnum::MultiDenseAppendableMemmapByte(_)
+        | VectorStorageEnum::MultiDenseAppendableMemmapHalf(_)
+        | VectorStorageEnum::MultiDenseTurbo(_) => Err(OperationError::service_error(format!(
+            "vector '{name}': bulk ingest into multi-dense storages is not supported yet",
+        ))),
+        #[cfg(test)]
+        VectorStorageEnum::MultiDenseVolatileByte(_)
+        | VectorStorageEnum::MultiDenseVolatileHalf(_) => Err(OperationError::service_error(
+            format!("vector '{name}': bulk ingest into multi-dense storages is not supported yet",),
+        )),
+        VectorStorageEnum::EmptyDense(_) | VectorStorageEnum::EmptySparse(_) => {
+            Err(OperationError::service_error(format!(
+                "vector '{name}': cannot bulk ingest into a placeholder (empty) storage",
+            )))
+        }
+    }
 }
 
 impl SegmentBuilder {
@@ -523,6 +701,200 @@ impl SegmentBuilder {
         }
 
         Ok(true)
+    }
+
+    /// Build a new segment directly from incoming points,
+    /// returning the number of distinct points written
+    /// Intended for bulk ingestion, where creating an appendable segment
+    /// first would waste computation building mutable indexes that the
+    /// final segment immediately replaces. This method writes point
+    /// data in batches; [`Self::build`] creates the final indexes afterwards.
+    pub fn update_from_points<'a>(
+        &mut self,
+        points: impl IntoIterator<Item = OperationResult<PointToInsert<'a>>>,
+        batch_points: usize,
+        stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<usize> {
+        if batch_points == 0 {
+            return Err(OperationError::service_error(
+                "batch_points must be at least 1",
+            ));
+        }
+
+        // Cache one default vector per configured name. Missing vectors reuse it instead of
+        // allocating a placeholder for every point that omits that name.
+        let defaults: HashMap<VectorNameBuf, VectorInternal> = self
+            .vector_data
+            .iter()
+            .map(|(name, data)| (name.clone(), data.vector_storage.default_vector()))
+            .collect();
+
+        // Start after the existing storage rows. Every vector storage must have the same row count,
+        // because one internal ID refers to the same point across all of them.
+        //
+        // Use storage row counts to determine the next internal ID. Repeated external IDs can leave
+        // old rows in storage even though the tracker keeps only the current ID-to-row link.
+        let mut next_internal: Option<PointOffsetType> = None;
+        for (name, data) in &self.vector_data {
+            let rows = data.vector_storage.total_vector_count() as PointOffsetType;
+            match next_internal {
+                None => next_internal = Some(rows),
+                Some(expected) if expected == rows => {}
+                Some(expected) => {
+                    return Err(OperationError::service_error(format!(
+                        "vector '{name}' holds {rows} rows but the other storages hold \
+                         {expected}; the builder's storages are out of step",
+                    )));
+                }
+            }
+        }
+
+        // A segment needs at least one configured vector field to assign internal IDs.
+        let mut next_internal = next_internal.ok_or_else(|| {
+            OperationError::service_error(
+                "cannot insert points into a segment that configures no vectors",
+            )
+        })?;
+
+        let mut points = points.into_iter();
+        let mut batch: Vec<PointToInsert<'a>> = Vec::with_capacity(batch_points);
+        let mut inserted = 0;
+
+        loop {
+            check_process_stopped(stopped)?;
+
+            batch.clear();
+            while batch.len() < batch_points {
+                match points.next() {
+                    Some(point) => batch.push(point?),
+                    None => break,
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+
+            inserted +=
+                self.absorb_batch(&mut batch, next_internal, &defaults, stopped, hw_counter)?;
+            next_internal += batch.len() as PointOffsetType;
+        }
+
+        Ok(inserted)
+    }
+
+    /// Write one batch into the storages and the id tracker. First write the vectors.
+    /// Then use the same internal IDs to record each point's ID mapping and payload.
+    fn absorb_batch(
+        &mut self,
+        batch: &mut [PointToInsert<'_>],
+        range_start: PointOffsetType,
+        defaults: &HashMap<VectorNameBuf, VectorInternal>,
+        stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<usize> {
+        // Validate and preprocess every vector before writing the batch,
+        // including cosine normalization
+        for point in batch.iter_mut() {
+            crate::common::check_named_vectors(&point.vectors, &self.segment_config)?;
+            let segment_config = &self.segment_config;
+            point.vectors.preprocess(|name| {
+                segment_config
+                    .vector_data
+                    .get(name)
+                    .expect("dense vector name was just validated against the segment config")
+            });
+        }
+
+        // Expected internal ID range for this batch.
+        let range = range_start..range_start + batch.len() as PointOffsetType;
+
+        for (name, vector_data) in self.vector_data.iter_mut() {
+            check_process_stopped(stopped)?;
+
+            let default = defaults.get(name).ok_or_else(|| {
+                OperationError::service_error(format!(
+                    "no default vector prepared for '{name}'; the builder's vector set changed \
+                     mid-run",
+                ))
+            })?;
+
+            let written = ingest_from_points(
+                &mut vector_data.vector_storage,
+                name,
+                batch,
+                default,
+                stopped,
+            )?;
+
+            // All vector fields in this batch must write the same internal-ID range so their rows stay
+            // aligned with each other and with the ID tracker.
+            if written != range {
+                return Err(OperationError::service_error(format!(
+                    "vector '{name}' wrote internal ids {written:?} but the batch occupies \
+                     {range:?}; the batch was not applied uniformly",
+                )));
+            }
+        }
+        let mut inserted = 0;
+
+        // Resolve duplicate external IDs. Keep the row with the newest version and mark the losing
+        // row's vectors deleted; keep the row itself so all vector storages stay aligned.
+        for (internal_id, point) in range.zip(batch.iter()) {
+            check_process_stopped(stopped)?;
+
+            self.version = cmp::max(self.version, point.version);
+
+            let superseded = match self
+                .id_tracker
+                .internal_id_with_behavior(point.external_id, DeferredBehavior::WithDeferred)
+            {
+                Some(existing) => {
+                    let existing_version = self
+                        .id_tracker
+                        .internal_version(existing)
+                        .unwrap_or_default();
+
+                    if existing_version <= point.version {
+                        self.id_tracker.drop(point.external_id)?;
+                        self.id_tracker.set_link(point.external_id, internal_id)?;
+                        self.id_tracker
+                            .set_internal_version(internal_id, point.version)?;
+                        self.payload_storage.clear(existing, hw_counter)?;
+                        Some(existing)
+                    } else {
+                        // The copy already stored is newer, so this one is dead on arrival.
+                        Some(internal_id)
+                    }
+                }
+                None => {
+                    self.id_tracker.set_link(point.external_id, internal_id)?;
+                    self.id_tracker
+                        .set_internal_version(internal_id, point.version)?;
+                    inserted += 1;
+                    None
+                }
+            };
+
+            if let Some(dead) = superseded {
+                for vector_data in self.vector_data.values_mut() {
+                    vector_data.vector_storage.delete_vector(dead)?;
+                }
+            }
+
+            // Skip the payload write when this copy lost, so it cannot overwrite the winner's.
+            if superseded == Some(internal_id) {
+                continue;
+            }
+
+            if let Some(payload) = &point.payload
+                && !payload.is_empty()
+            {
+                self.payload_storage.set(internal_id, payload, hw_counter)?;
+            }
+        }
+
+        Ok(inserted)
     }
 
     /// Test wrapper for [`SegmentBuilder::build`].
