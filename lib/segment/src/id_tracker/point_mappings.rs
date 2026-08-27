@@ -18,12 +18,13 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom as _;
 use uuid::Uuid;
 
+use crate::id_tracker::external_id_filter::ExternalIdFilter;
 use crate::types::PointIdType;
 
 /// Used endianness for storing PointMapping-files.
 pub type FileEndianess = LittleEndian;
 
-#[derive(Clone, PartialEq, Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct PointMappings {
     /// `deleted` specifies which points of internal_to_external was deleted.
     /// It is possible that `deleted` can be longer or shorter than `internal_to_external`.
@@ -66,6 +67,47 @@ pub struct PointMappings {
     /// Number of deleted deferred points. Maintained incrementally so we can
     /// derive the visible deferred count without re-scanning the deleted bitslice.
     deferred_deleted_count: usize,
+
+    /// Blocked Bloom pre-screen over the external ids held in the four maps
+    /// above. A `false` from it means the id is definitely absent, letting
+    /// `internal_id_with_behavior` skip both `BTreeMap` walks; a `true` is
+    /// only a hint and still resolves through the maps.
+    ///
+    /// Derived state, not logical state: it is rebuilt at construction, never
+    /// persisted, and deliberately keeps stale bits for dropped points (see
+    /// [`ExternalIdFilter`]). Excluded from [`PartialEq`] for that reason.
+    external_filter: ExternalIdFilter,
+}
+
+impl PartialEq for PointMappings {
+    /// Compares logical state only. `external_filter` is excluded: its bits
+    /// record every key ever inserted and are never cleared, so two identical
+    /// mappings can hold different bits depending on what was deleted.
+    fn eq(&self, other: &Self) -> bool {
+        // Destructured so that adding a field is a compile error here rather
+        // than a silently-ignored term.
+        let Self {
+            deleted,
+            internal_to_external,
+            external_to_internal_num,
+            external_to_internal_uuid,
+            external_to_internal_num_deferred,
+            external_to_internal_uuid_deferred,
+            shadowed,
+            deferred_internal_id,
+            deferred_deleted_count,
+            external_filter: _,
+        } = self;
+        *deleted == other.deleted
+            && *internal_to_external == other.internal_to_external
+            && *external_to_internal_num == other.external_to_internal_num
+            && *external_to_internal_uuid == other.external_to_internal_uuid
+            && *external_to_internal_num_deferred == other.external_to_internal_num_deferred
+            && *external_to_internal_uuid_deferred == other.external_to_internal_uuid_deferred
+            && *shadowed == other.shadowed
+            && *deferred_internal_id == other.deferred_internal_id
+            && *deferred_deleted_count == other.deferred_deleted_count
+    }
 }
 
 impl PointMappings {
@@ -133,6 +175,12 @@ impl PointMappings {
                 }
             })
             .unwrap_or(0);
+        let external_filter = Self::build_filter(
+            &external_to_internal_num,
+            &external_to_internal_uuid,
+            &external_to_internal_num_deferred,
+            &external_to_internal_uuid_deferred,
+        );
         Self {
             deleted,
             internal_to_external,
@@ -143,7 +191,33 @@ impl PointMappings {
             shadowed,
             deferred_internal_id,
             deferred_deleted_count,
+            external_filter,
         }
+    }
+
+    /// Seed the pre-screen from a live key set.
+    ///
+    /// Only used at construction. There is no incremental rebuild: `set_link`
+    /// keeps the filter current, and `drop` intentionally leaves stale bits
+    /// behind rather than maintaining a removal path.
+    fn build_filter(
+        num: &BTreeMap<u64, PointOffsetType>,
+        uuid: &BTreeMap<Uuid, PointOffsetType>,
+        num_deferred: &BTreeMap<u64, PointOffsetType>,
+        uuid_deferred: &BTreeMap<Uuid, PointOffsetType>,
+    ) -> ExternalIdFilter {
+        let live = num.len() + uuid.len() + num_deferred.len() + uuid_deferred.len();
+        // `for_new_mapping` honours the toggle: switched off it yields a filter
+        // that screens nothing, and the inserts below become no-ops.
+        let mut filter =
+            ExternalIdFilter::for_new_mapping(ExternalIdFilter::rebuild_capacity(live));
+        for key in num.keys().chain(num_deferred.keys()) {
+            filter.insert(&PointIdType::NumId(*key));
+        }
+        for key in uuid.keys().chain(uuid_deferred.keys()) {
+            filter.insert(&PointIdType::Uuid(*key));
+        }
+        filter
     }
 
     /// ToDo: this function is temporary and should be removed before PR is merged
@@ -194,6 +268,16 @@ impl PointMappings {
         external_id: &PointIdType,
         deferred_behavior: common::types::DeferredBehavior,
     ) -> Option<PointOffsetType> {
+        // Return none if external filter (bloom filter) confirms
+        // it's not present, preventing a lookup in the BTree.
+        if !self.external_filter.maybe_contains(external_id) {
+            debug_assert!(
+                self.internal_id_active(external_id).is_none()
+                    && self.internal_id_deferred(external_id).is_none(),
+                "external id filter reported a false negative for {external_id}",
+            );
+            return None;
+        }
         if deferred_behavior.with_deferred_points() {
             self.internal_id_deferred(external_id)
                 .or_else(|| self.internal_id_active(external_id))
@@ -521,6 +605,11 @@ impl PointMappings {
         external_id: PointIdType,
         internal_id: PointOffsetType,
     ) -> Option<PointOffsetType> {
+        // Update the external id filter to reflect the new mapping first,
+        // preserving the invariant that a `false` from the filter means
+        // the external id is definitely absent from the maps.
+        self.external_filter.insert(&external_id);
+
         let is_deferred = self
             .deferred_internal_id
             .is_some_and(|cutoff| internal_id >= cutoff);
@@ -624,6 +713,18 @@ impl PointMappings {
         self.internal_to_external[internal_id_usize] = external_id;
         self.deleted.set(internal_id_usize, false);
 
+        // Rebuilt from the maps once the filter outgrows its sizing. Deferred
+        // to here so the maps already reflect this write, and so a rebuild
+        // also sheds the stale bits left behind by `drop`.
+        if self.external_filter.is_saturated() {
+            self.external_filter = Self::build_filter(
+                &self.external_to_internal_num,
+                &self.external_to_internal_uuid,
+                &self.external_to_internal_num_deferred,
+                &self.external_to_internal_uuid_deferred,
+            );
+        }
+
         same_track_prior
     }
 
@@ -714,6 +815,12 @@ impl PointMappings {
             })
             .collect();
 
+        let external_filter = Self::build_filter(
+            &external_to_internal_num,
+            &external_to_internal_uuid,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
         Self {
             deleted,
             internal_to_external,
@@ -724,6 +831,7 @@ impl PointMappings {
             shadowed: BitVec::new(),
             deferred_internal_id: None,
             deferred_deleted_count: 0,
+            external_filter,
         }
     }
 
@@ -752,6 +860,7 @@ impl PointMappings {
             shadowed,
             deferred_internal_id: _,
             deferred_deleted_count: _,
+            external_filter,
         } = self;
 
         let deleted_bytes = deleted.capacity().div_ceil(u8::BITS as usize);
@@ -773,7 +882,12 @@ impl PointMappings {
         let uuid_map_bytes = (external_to_internal_uuid.len()
             + external_to_internal_uuid_deferred.len())
             * uuid_entry_size;
-        deleted_bytes + shadowed_bytes + internal_to_external_bytes + num_map_bytes + uuid_map_bytes
+        deleted_bytes
+            + shadowed_bytes
+            + internal_to_external_bytes
+            + num_map_bytes
+            + uuid_map_bytes
+            + external_filter.ram_usage_bytes()
     }
 }
 
@@ -1035,5 +1149,448 @@ mod set_link_shadow_tests {
              (latest) internal id, consistent with internal_id_with_behavior and \
              iter_internal_with_behavior; it instead yields the stale active slot 2",
         );
+    }
+}
+
+#[cfg(test)]
+mod external_filter_tests {
+    use common::types::DeferredBehavior;
+    use rand::SeedableRng as _;
+
+    use super::*;
+
+    fn fresh() -> PointMappings {
+        PointMappings::new(
+            BitVec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            None,
+        )
+    }
+
+    /// Dropping a point leaves its bit set, so the pre-screen answers "maybe"
+    /// for an id that is gone. The map lookup behind it must still say `None`
+    /// — this is precisely why `drop` needs no filter maintenance.
+    #[test]
+    fn dropped_point_survives_as_a_false_positive_and_still_resolves_to_none() {
+        let mut mappings = fresh();
+        let point_id = PointIdType::NumId(42);
+
+        mappings.set_link(point_id, 0);
+        assert_eq!(
+            mappings.internal_id_with_behavior(&point_id, DeferredBehavior::WithDeferred),
+            Some(0),
+        );
+
+        mappings.drop(point_id);
+
+        assert!(
+            mappings.external_filter.maybe_contains(&point_id),
+            "drop is expected to leave a stale bit behind",
+        );
+        assert_eq!(
+            mappings.internal_id_with_behavior(&point_id, DeferredBehavior::WithDeferred),
+            None,
+        );
+    }
+
+    /// Two mappings in identical logical state must compare equal even when
+    /// their filters differ, which happens whenever one of them reached that
+    /// state via a drop. Reload round-trip assertions depend on this.
+    #[test]
+    fn filter_contents_do_not_affect_equality() {
+        // Asserts a filter actually screens, so it must pin the toggle rather
+        // than trust the ambient default.
+        let _guard = crate::id_tracker::external_id_filter::ToggleGuard::set(true);
+        // Reached by replay: links 2, drops it, then links 1 — so the filter
+        // carries a stale bit for 2.
+        let mut replayed = fresh();
+        replayed.set_link(PointIdType::NumId(2), 1);
+        replayed.drop(PointIdType::NumId(2));
+        replayed.set_link(PointIdType::NumId(1), 0);
+
+        // Reached by construction from the resulting maps — filter holds 1 only.
+        let mut deleted = BitVec::repeat(true, 2);
+        deleted.set(0, false);
+        let loaded = PointMappings::new(
+            deleted,
+            vec![PointIdType::NumId(1), PointIdType::NumId(u64::MAX)],
+            BTreeMap::from([(1, 0)]),
+            BTreeMap::new(),
+            None,
+        );
+
+        assert!(
+            replayed
+                .external_filter
+                .maybe_contains(&PointIdType::NumId(2)),
+            "precondition: the two filters must actually differ",
+        );
+        assert!(
+            !loaded
+                .external_filter
+                .maybe_contains(&PointIdType::NumId(2))
+        );
+        assert_eq!(replayed, loaded);
+    }
+
+    /// The pre-screen must not hide a live point from either deferred mode.
+    #[test]
+    fn shadowed_point_is_visible_through_the_filter_in_both_modes() {
+        let mut mappings = PointMappings::new(
+            BitVec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Some(5),
+        );
+        let point_id = PointIdType::NumId(7);
+
+        mappings.set_link(point_id, 2);
+        mappings.set_link(point_id, 9);
+
+        assert_eq!(
+            mappings.internal_id_with_behavior(&point_id, DeferredBehavior::VisibleOnly),
+            Some(2),
+        );
+        assert_eq!(
+            mappings.internal_id_with_behavior(&point_id, DeferredBehavior::WithDeferred),
+            Some(9),
+        );
+    }
+
+    /// Replaying a change log is how the filter is rebuilt on restart. A log
+    /// containing drops and re-inserts must leave every live key resolvable —
+    /// the drops must not leave a hole the filter screens out.
+    #[test]
+    fn replayed_log_with_drops_and_reinserts_resolves_every_live_key() {
+        // The exact call sequence `read_mappings` makes when replaying.
+        let mut replayed = fresh();
+        let mut expected = Vec::new();
+        for i in 0..2_000u64 {
+            replayed.set_link(PointIdType::NumId(i), i as PointOffsetType);
+        }
+        for i in 0..2_000u64 {
+            if i % 3 == 0 {
+                replayed.drop(PointIdType::NumId(i));
+            } else {
+                expected.push(i);
+            }
+        }
+        // Re-insert a third of the dropped ids at fresh slots, as an upsert of a
+        // previously deleted point would.
+        for i in (0..2_000u64).filter(|i| i % 3 == 0).take(200) {
+            replayed.set_link(PointIdType::NumId(i), (10_000 + i) as PointOffsetType);
+            expected.push(i);
+        }
+
+        for i in expected {
+            let point_id = PointIdType::NumId(i);
+            assert!(
+                replayed.external_filter.maybe_contains(&point_id),
+                "filter lost live key {i} during replay",
+            );
+            assert!(
+                replayed
+                    .internal_id_with_behavior(&point_id, DeferredBehavior::WithDeferred)
+                    .is_some(),
+                "live key {i} unresolvable after replay",
+            );
+        }
+    }
+
+    /// A replay long enough to cross the growth threshold rebuilds the filter
+    /// mid-stream. Every key inserted before the rebuild must survive it.
+    #[test]
+    fn growth_during_replay_preserves_earlier_keys() {
+        let mut replayed = fresh();
+        let count = 40_000u64; // comfortably past MIN_CAPACITY
+        for i in 0..count {
+            replayed.set_link(PointIdType::NumId(i), i as PointOffsetType);
+        }
+        for i in 0..count {
+            let point_id = PointIdType::NumId(i);
+            assert!(
+                replayed.external_filter.maybe_contains(&point_id),
+                "key {i} lost across a mid-replay rebuild",
+            );
+            assert_eq!(
+                replayed.internal_id_with_behavior(&point_id, DeferredBehavior::WithDeferred),
+                Some(i as PointOffsetType),
+            );
+        }
+    }
+
+    /// Loading a segment that has a deferred cutoff partitions the single
+    /// persisted map into active and deferred tracks. Keys that land on the
+    /// deferred side must still be in the filter, or they become invisible.
+    #[test]
+    fn keys_partitioned_into_the_deferred_track_stay_in_the_filter() {
+        let cutoff: PointOffsetType = 50;
+        let count = 100u64;
+        // One persisted map spanning both sides of the cutoff, as on disk.
+        let num_map: BTreeMap<u64, PointOffsetType> =
+            (0..count).map(|i| (i, i as PointOffsetType)).collect();
+        let mut deleted = BitVec::repeat(false, count as usize);
+        deleted.set(0, false);
+        let internal_to_external: Vec<PointIdType> = (0..count).map(PointIdType::NumId).collect();
+
+        let mappings = PointMappings::new(
+            deleted,
+            internal_to_external,
+            num_map,
+            BTreeMap::new(),
+            Some(cutoff),
+        );
+
+        for i in 0..count {
+            let point_id = PointIdType::NumId(i);
+            assert!(
+                mappings.external_filter.maybe_contains(&point_id),
+                "key {i} lost during the deferred partition at load",
+            );
+            // Deferred keys are hidden from VisibleOnly by design, but must be
+            // reachable with deferred points included.
+            assert_eq!(
+                mappings.internal_id_with_behavior(&point_id, DeferredBehavior::WithDeferred),
+                Some(i as PointOffsetType),
+                "key {i} unresolvable after the deferred partition",
+            );
+        }
+    }
+
+    /// A shadowed point holds an active and a deferred head under one external
+    /// id. One filter entry has to serve both tracks.
+    #[test]
+    fn shadowed_pairs_survive_a_rebuild() {
+        let mut mappings = PointMappings::new(
+            BitVec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Some(20_000),
+        );
+        // Enough writes to force at least one rebuild while shadowed pairs exist.
+        for i in 0..10_000u64 {
+            mappings.set_link(PointIdType::NumId(i), i as PointOffsetType);
+        }
+        for i in 0..10_000u64 {
+            mappings.set_link(PointIdType::NumId(i), (20_000 + i) as PointOffsetType);
+        }
+
+        for i in 0..10_000u64 {
+            let point_id = PointIdType::NumId(i);
+            assert!(mappings.external_filter.maybe_contains(&point_id));
+            assert_eq!(
+                mappings.internal_id_with_behavior(&point_id, DeferredBehavior::VisibleOnly),
+                Some(i as PointOffsetType),
+                "active head of shadowed point {i} lost",
+            );
+            assert_eq!(
+                mappings.internal_id_with_behavior(&point_id, DeferredBehavior::WithDeferred),
+                Some((20_000 + i) as PointOffsetType),
+                "deferred head of shadowed point {i} lost",
+            );
+        }
+    }
+
+    /// Every id reachable through the maps must be reachable through the
+    /// filter, across a randomised mapping.
+    #[test]
+    fn no_false_negatives_across_a_random_mapping() {
+        let mut rand = StdRng::seed_from_u64(0xBEEF);
+        let mappings = PointMappings::random(&mut rand, 10_000);
+
+        for (external_id, internal_id) in mappings.iter_from(None) {
+            assert_eq!(
+                mappings.internal_id_with_behavior(&external_id, DeferredBehavior::WithDeferred),
+                Some(internal_id),
+                "filter hid live point {external_id}",
+            );
+        }
+    }
+}
+
+/// Adversarial checks: randomised differential testing against the unfiltered
+/// path, plus the pathological inputs the filter's sizing arithmetic could
+/// mishandle.
+#[cfg(test)]
+mod adversarial_tests {
+    use common::types::DeferredBehavior;
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+
+    use super::*;
+    use crate::id_tracker::external_id_filter::{ExternalIdFilter, ToggleGuard};
+
+    /// A scripted, deliberately hostile operation sequence: colliding ids, a
+    /// mix of numeric and UUID keys, drops of live and already-dead points,
+    /// re-links of the same external id to new and identical slots, and slot
+    /// reuse. Applied identically with the filter on and off; every lookup and
+    /// the entire resulting state must agree.
+    fn hostile_sequence(mappings: &mut PointMappings, seed: u64, ops: usize) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        // Small id space on purpose, so collisions and reuse actually happen.
+        let id_space = 512u64;
+        for _ in 0..ops {
+            let raw = rng.random_range(0..id_space);
+            let point_id = if raw % 3 == 0 {
+                PointIdType::Uuid(Uuid::from_u128(u128::from(raw)))
+            } else {
+                PointIdType::NumId(raw)
+            };
+            match rng.random_range(0..10u32) {
+                0..=5 => {
+                    let internal = rng.random_range(0..(id_space as PointOffsetType * 2));
+                    mappings.set_link(point_id, internal);
+                }
+                6..=8 => {
+                    mappings.drop(point_id);
+                }
+                _ => {
+                    // Re-link to a slot that is very likely already occupied.
+                    let internal = rng.random_range(0..16) as PointOffsetType;
+                    mappings.set_link(point_id, internal);
+                }
+            }
+        }
+    }
+
+    fn snapshot(
+        m: &PointMappings,
+    ) -> Vec<(
+        PointIdType,
+        Option<PointOffsetType>,
+        Option<PointOffsetType>,
+    )> {
+        let mut out = Vec::new();
+        for raw in 0..512u64 {
+            for point_id in [
+                PointIdType::NumId(raw),
+                PointIdType::Uuid(Uuid::from_u128(u128::from(raw))),
+            ] {
+                out.push((
+                    point_id,
+                    m.internal_id_with_behavior(&point_id, DeferredBehavior::VisibleOnly),
+                    m.internal_id_with_behavior(&point_id, DeferredBehavior::WithDeferred),
+                ));
+            }
+        }
+        out
+    }
+
+    fn build(cutoff: Option<PointOffsetType>, seed: u64, ops: usize) -> PointMappings {
+        let mut m = PointMappings::new(
+            BitVec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            cutoff,
+        );
+        hostile_sequence(&mut m, seed, ops);
+        m
+    }
+
+    /// The core adversarial property: the filter must be invisible under any
+    /// operation sequence, with and without a deferred cutoff.
+    #[test]
+    fn randomised_differential_filter_on_vs_off() {
+        for cutoff in [None, Some(64), Some(1)] {
+            for seed in 0..12u64 {
+                let with = {
+                    let _g = ToggleGuard::set(true);
+                    build(cutoff, seed, 4000)
+                };
+                let without = {
+                    let _g = ToggleGuard::set(false);
+                    build(cutoff, seed, 4000)
+                };
+                assert_eq!(
+                    snapshot(&with),
+                    snapshot(&without),
+                    "lookups diverged (cutoff={cutoff:?}, seed={seed})",
+                );
+                assert_eq!(
+                    with, without,
+                    "state diverged (cutoff={cutoff:?}, seed={seed})"
+                );
+                assert_eq!(
+                    with.iter_from(None).collect::<Vec<_>>(),
+                    without.iter_from(None).collect::<Vec<_>>(),
+                    "iteration diverged (cutoff={cutoff:?}, seed={seed})",
+                );
+            }
+        }
+    }
+
+    /// Repeatedly upserting the same few points inflates the filter's insert
+    /// counter without growing the live set. That must not spiral into a
+    /// rebuild storm.
+    #[test]
+    fn repeated_updates_do_not_storm_rebuilds() {
+        let _g = ToggleGuard::set(true);
+        let mut m = PointMappings::new(
+            BitVec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            None,
+        );
+        for i in 0..64u64 {
+            m.set_link(PointIdType::NumId(i), i as PointOffsetType);
+        }
+        let before = m.external_filter.ram_usage_bytes();
+        // 200k updates over a live set of 64.
+        for round in 0..200_000u64 {
+            let i = round % 64;
+            m.set_link(PointIdType::NumId(i), i as PointOffsetType);
+        }
+        let after = m.external_filter.ram_usage_bytes();
+        assert_eq!(
+            before, after,
+            "filter grew despite a constant live set — sizing tracks inserts, not keys",
+        );
+        for i in 0..64u64 {
+            assert_eq!(
+                m.internal_id_with_behavior(&PointIdType::NumId(i), DeferredBehavior::WithDeferred),
+                Some(i as PointOffsetType),
+            );
+        }
+    }
+
+    /// Flipping the toggle mid-life must never break a mapping that already
+    /// has an enabled filter, nor one that does not.
+    #[test]
+    fn toggle_flip_midlife_is_safe() {
+        let mut enabled_then_off = {
+            let _g = ToggleGuard::set(true);
+            build(None, 7, 2000)
+        };
+        {
+            let _g = ToggleGuard::set(false);
+            // Keep mutating after the toggle flipped; a rebuild here would
+            // swap in a disabled filter, which must still be correct.
+            hostile_sequence(&mut enabled_then_off, 8, 20_000);
+        }
+        let reference = {
+            let _g = ToggleGuard::set(false);
+            let mut m = build(None, 7, 2000);
+            hostile_sequence(&mut m, 8, 20_000);
+            m
+        };
+        assert_eq!(snapshot(&enabled_then_off), snapshot(&reference));
+    }
+
+    /// Absurd sizing inputs must not overflow or attempt an insane allocation.
+    /// `rebuild_capacity` saturates, but `with_capacity` then multiplies by
+    /// BITS_PER_KEY.
+    #[test]
+    fn absurd_capacity_is_handled() {
+        let huge = ExternalIdFilter::rebuild_capacity(usize::MAX);
+        assert!(huge > 0);
+        // The realistic ceiling: more keys than any machine can hold.
+        let filter = ExternalIdFilter::with_capacity(1 << 32);
+        assert!(filter.ram_usage_bytes() > 0);
     }
 }
