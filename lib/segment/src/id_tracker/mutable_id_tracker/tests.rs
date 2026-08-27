@@ -828,3 +828,255 @@ fn shadow_visible_head_survives_mapping_flush_reload() {
     assert_eq!(id_tracker.external_id(2), Some(p7));
     assert!(!id_tracker.is_deleted_point(2));
 }
+
+/// The external-id filter is never persisted; it is rebuilt by replaying the
+/// mappings log through `set_link`. Exercise that for real — write a log
+/// containing drops and re-inserts, reopen, and confirm every live point still
+/// resolves. A filter that lost a key here would make committed points
+/// invisible after a restart.
+#[test]
+fn filter_rebuilds_across_a_real_reopen() {
+    use common::types::DeferredBehavior;
+
+    let dir = Builder::new().prefix("id_tracker_dir").tempdir().unwrap();
+
+    let mut expected: Vec<(PointIdType, PointOffsetType)> = Vec::new();
+    {
+        let mut tracker = MutableIdTracker::open(dir.path(), None).unwrap();
+        // Enough points to cross the filter's growth threshold during replay.
+        for i in 0..20_000u64 {
+            let point_id = PointIdType::NumId(i);
+            tracker.set_link(point_id, i as PointOffsetType).unwrap();
+            tracker
+                .set_internal_version(i as PointOffsetType, 1)
+                .unwrap();
+        }
+        // Drop a slice of them.
+        for i in (0..20_000u64).step_by(7) {
+            tracker.drop(PointIdType::NumId(i)).unwrap();
+        }
+        // Re-insert some of the dropped ids at fresh slots.
+        for (n, i) in (0..20_000u64).step_by(7).take(500).enumerate() {
+            let internal_id = (100_000 + n) as PointOffsetType;
+            tracker
+                .set_link(PointIdType::NumId(i), internal_id)
+                .unwrap();
+            tracker.set_internal_version(internal_id, 2).unwrap();
+        }
+
+        for i in 0..20_000u64 {
+            let point_id = PointIdType::NumId(i);
+            if let Some(internal_id) =
+                tracker.internal_id_with_behavior(point_id, DeferredBehavior::WithDeferred)
+            {
+                expected.push((point_id, internal_id));
+            }
+        }
+
+        tracker.mapping_flusher()().unwrap();
+        tracker.versions_flusher()().unwrap();
+    }
+
+    let reloaded = MutableIdTracker::open(dir.path(), None).unwrap();
+    assert!(!expected.is_empty());
+    for (point_id, internal_id) in expected {
+        assert_eq!(
+            reloaded.internal_id_with_behavior(point_id, DeferredBehavior::WithDeferred),
+            Some(internal_id),
+            "point {point_id} became unresolvable after reopen",
+        );
+    }
+}
+
+/// The pre-screen must be observationally invisible. With it on and off, the
+/// same operation sequence has to produce a *logically identical* tracker —
+/// every mapping in both directions, every version, every deletion flag, the
+/// full iteration order, and the persisted bytes — not merely the same amount
+/// of data. Any divergence would mean an A/B run measured two different things.
+#[test]
+fn filter_toggle_is_logically_identical() {
+    use std::collections::BTreeMap;
+
+    use common::types::DeferredBehavior;
+
+    use crate::id_tracker::external_id_filter::{self, ToggleGuard};
+
+    /// Everything observable about a tracker.
+    #[derive(PartialEq)]
+    struct Snapshot {
+        total_points: usize,
+        available_points: usize,
+        deleted_points: usize,
+        /// external -> internal for every id probed, present or not.
+        forward: Vec<(PointIdType, Option<PointOffsetType>)>,
+        /// internal -> (external, version, deleted) for every slot.
+        reverse: Vec<(
+            PointOffsetType,
+            Option<PointIdType>,
+            Option<SeqNumberType>,
+            bool,
+        )>,
+        /// Full ordered iteration, which the optimizer's merge depends on.
+        iteration: Vec<(PointIdType, PointOffsetType)>,
+        /// Persisted file contents, keyed by file name.
+        files: BTreeMap<String, Vec<u8>>,
+        ram: usize,
+    }
+
+    fn run(dir: &std::path::Path) -> Snapshot {
+        let mut tracker = MutableIdTracker::open(dir, None).unwrap();
+        for i in 0..15_000u64 {
+            tracker
+                .set_link(PointIdType::NumId(i), i as PointOffsetType)
+                .unwrap();
+            tracker
+                .set_internal_version(i as PointOffsetType, i + 1)
+                .unwrap();
+        }
+        for i in (0..15_000u64).step_by(5) {
+            tracker.drop(PointIdType::NumId(i)).unwrap();
+        }
+        for (n, i) in (0..15_000u64).step_by(5).take(400).enumerate() {
+            let internal_id = (50_000 + n) as PointOffsetType;
+            tracker
+                .set_link(PointIdType::NumId(i), internal_id)
+                .unwrap();
+            tracker
+                .set_internal_version(internal_id, 900_000 + i)
+                .unwrap();
+        }
+        for i in 0..500u64 {
+            let point_id = PointIdType::Uuid(uuid::Uuid::from_u128(u128::from(i)));
+            let internal_id = (80_000 + i) as PointOffsetType;
+            tracker.set_link(point_id, internal_id).unwrap();
+            tracker
+                .set_internal_version(internal_id, 700_000 + i)
+                .unwrap();
+        }
+
+        let mut forward = Vec::new();
+        for i in 0..16_000u64 {
+            let point_id = PointIdType::NumId(i);
+            forward.push((
+                point_id,
+                tracker.internal_id_with_behavior(point_id, DeferredBehavior::WithDeferred),
+            ));
+        }
+        for i in 0..600u64 {
+            let point_id = PointIdType::Uuid(uuid::Uuid::from_u128(u128::from(i)));
+            forward.push((
+                point_id,
+                tracker.internal_id_with_behavior(point_id, DeferredBehavior::WithDeferred),
+            ));
+        }
+
+        let reverse = (0..tracker.total_point_count() as PointOffsetType)
+            .map(|internal_id| {
+                (
+                    internal_id,
+                    tracker.external_id(internal_id),
+                    tracker.internal_version(internal_id),
+                    tracker.is_deleted_point(internal_id),
+                )
+            })
+            .collect();
+
+        let iteration = tracker.point_mappings().iter_from(None).collect();
+
+        tracker.mapping_flusher()().unwrap();
+        tracker.versions_flusher()().unwrap();
+
+        let files = tracker
+            .files()
+            .into_iter()
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, fs_err::read(&path).unwrap())
+            })
+            .collect();
+
+        Snapshot {
+            total_points: tracker.total_point_count(),
+            available_points: tracker.available_point_count(),
+            deleted_points: tracker.deleted_point_count(),
+            forward,
+            reverse,
+            iteration,
+            files,
+            ram: tracker.ram_usage_bytes(),
+        }
+    }
+
+    let on = {
+        let _guard = ToggleGuard::set(true);
+        assert!(external_id_filter::is_enabled());
+        let dir = Builder::new().prefix("filter_on").tempdir().unwrap();
+        run(dir.path())
+    };
+    let off = {
+        let _guard = ToggleGuard::set(false);
+        assert!(!external_id_filter::is_enabled());
+        let dir = Builder::new().prefix("filter_off").tempdir().unwrap();
+        run(dir.path())
+    };
+
+    // Guards against a vacuous pass: the runs must genuinely differ internally,
+    // or the comparisons below prove nothing about the toggle.
+    assert!(
+        on.ram > off.ram,
+        "toggle had no effect: both runs used {} bytes, so the filter was never \
+         actually enabled and this comparison is vacuous",
+        on.ram,
+    );
+
+    assert_eq!(
+        on.total_points, off.total_points,
+        "total point count differs"
+    );
+    assert_eq!(
+        on.available_points, off.available_points,
+        "available point count differs",
+    );
+    assert_eq!(
+        on.deleted_points, off.deleted_points,
+        "deleted point count differs"
+    );
+
+    assert_eq!(
+        on.forward.len(),
+        off.forward.len(),
+        "probed a different number of ids",
+    );
+    for ((id_on, got_on), (id_off, got_off)) in on.forward.iter().zip(&off.forward) {
+        assert_eq!(id_on, id_off);
+        assert_eq!(got_on, got_off, "external->internal differs for {id_on}");
+    }
+
+    for (on_slot, off_slot) in on.reverse.iter().zip(&off.reverse) {
+        assert_eq!(
+            on_slot, off_slot,
+            "slot state differs (internal, external, version, deleted)",
+        );
+    }
+    assert_eq!(on.reverse.len(), off.reverse.len(), "slot count differs");
+
+    assert_eq!(
+        on.iteration, off.iteration,
+        "ordered iteration differs, which would change optimizer merge results",
+    );
+
+    assert_eq!(
+        on.files.keys().collect::<Vec<_>>(),
+        off.files.keys().collect::<Vec<_>>(),
+        "different files persisted",
+    );
+    for (name, on_bytes) in &on.files {
+        let off_bytes = &off.files[name];
+        assert!(
+            on_bytes == off_bytes,
+            "persisted bytes of {name} differ ({} vs {} bytes)",
+            on_bytes.len(),
+            off_bytes.len(),
+        );
+    }
+}

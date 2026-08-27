@@ -1,5 +1,6 @@
 pub mod compressed;
 pub mod disk_id_tracker;
+pub mod external_id_filter;
 pub mod format_detection;
 pub mod id_tracker_base;
 pub mod immutable_id_tracker;
