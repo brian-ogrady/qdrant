@@ -148,6 +148,7 @@ async fn delete_named_vector_then_reload_loses_points() {
         None,
         ResourceBudget::default(),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -366,6 +367,7 @@ async fn delete_named_vector_after_flush_survives_reload() {
         None,
         ResourceBudget::default(),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -534,6 +536,7 @@ async fn repeated_create_then_delete_vector_name_with_flush_survives_reload() {
         None,
         None,
         ResourceBudget::default(),
+        None,
         None,
     )
     .await

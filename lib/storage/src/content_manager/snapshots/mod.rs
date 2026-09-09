@@ -1,3 +1,4 @@
+pub mod adopt;
 pub mod download;
 pub mod download_result;
 pub mod download_tar;

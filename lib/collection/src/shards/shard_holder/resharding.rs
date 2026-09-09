@@ -113,6 +113,21 @@ impl ShardHolder {
                         "shard holder does not contain shard {shard_id} replica set",
                     )));
                 }
+                // The shard being removed is the migration transfer *source*; a valid source must
+                // be able to serve. If its only replica is parked or dead (e.g. a failed adoption
+                // left it `Dead`, or an adopted shard is still `ManualRecovery`), the migration can
+                // never start and resharding would wedge half-committed. Refuse up front.
+                let has_active = self
+                    .shards
+                    .get(shard_id)
+                    .is_some_and(|shard| shard.peers().values().any(|state| state.is_active()));
+                if !has_active {
+                    return Err(CollectionError::bad_request(format!(
+                        "cannot reshard down shard {shard_id}: it has no active replica to migrate \
+                         its data from (all replicas are parked or dead). Recover or drop the \
+                         shard first.",
+                    )));
+                }
             }
         }
 

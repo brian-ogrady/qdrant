@@ -361,7 +361,24 @@ impl ShardReplicaSet {
                 match res {
                     Ok(shard) => Shard::Local(shard),
                     Err(err) => {
-                        if !shared_storage_config.handle_collection_load_errors {
+                        // An adopted shard (one carrying an adoption marker) must never panic the
+                        // node on a reload failure: that would crash-loop the whole node on every
+                        // restart because of one bad operator-supplied artifact. Load it as a
+                        // `Dummy(LoadFailed)` regardless of `handle_collection_load_errors`, so the
+                        // adoption reconciler can drive it `ManualRecovery -> Dead` (activate marker
+                        // present + not a `LocalShard`) instead of crashing. The in-progress marker
+                        // (an adoption interrupted mid-load) counts too, so its corrupt/partial data
+                        // is loaded as a Dummy here and then resolved by the reconciliation below.
+                        // For non-adopted shards the flag keeps its existing meaning.
+                        let is_adopted = crate::shards::has_adopt_activate_marker(shard_path)
+                            || crate::shards::has_adopt_failed_marker(shard_path)
+                            || shard_path.parent().is_some_and(|collection_path| {
+                                crate::shards::has_adopt_in_progress_marker(
+                                    collection_path,
+                                    shard_id,
+                                )
+                            });
+                        if !shared_storage_config.handle_collection_load_errors && !is_adopted {
                             panic!("Failed to load local shard {shard_path:?}: {err}")
                         }
 
@@ -384,6 +401,155 @@ impl ShardReplicaSet {
         } else {
             None
         };
+
+        // H1: reconcile an adoption interrupted before it recorded a terminal marker. The
+        // in-progress marker (collection dir, keyed by shard id) means Phase B began installing this
+        // shard and never reached activate/failed — a crash or panic mid-load. Left untouched the
+        // shard would sit in `ManualRecovery` forever, indistinguishable from a healthy transient
+        // re-park (which is why the reconciler deliberately ignores marker-less `ManualRecovery`).
+        // Resolve it here, at load, uniformly for single-node and cluster.
+        //
+        // NOT in `recovery_mode`: there `local` was forced to `Dummy(RecoveryMode)` above,
+        // unconditionally and WITHOUT attempting a load — so it carries no information about the
+        // shard's true on-disk state. H1's salvage test (`matches!(local, Some(Shard::Local(_)))`)
+        // would then read the deliberate Dummy as "did not load / unsalvageable" and stamp a durable
+        // `.adopt_failed` on a shard whose data is actually intact, condemning it to `Dead` on the
+        // next normal boot (with RF=1 there is no replica to recover from). So skip H1 entirely in
+        // recovery mode — mirroring `sync_local_state`, which also abstains — and leave the
+        // in-progress marker for the next normal boot, where `local` reflects a real load attempt and
+        // H1 can classify correctly.
+        if let Some(collection_path) = shard_path.parent()
+            && crate::shards::has_adopt_in_progress_marker(collection_path, shard_id)
+            && shared_storage_config.recovery_mode.is_none()
+        {
+            // A genuine interrupted adoption is always born `ManualRecovery`. If this shard is in any
+            // other state, the in-progress marker is stale — it outlived its adoption (the shard was
+            // already healed by transfer or per-shard recovery, or its id was reused). In that case
+            // H1 must NOT act: it would stamp a spurious `.adopt_activate_pending`/`.adopt_failed`
+            // onto a healthy shard. The `resolved` expression below drops the stale marker instead.
+            let is_manual_recovery = matches!(
+                replica_state.read().get_peer_state(this_peer_id),
+                Some(ReplicaState::ManualRecovery)
+            );
+
+            // Set this peer's local replica state, but ONLY when it is currently `ManualRecovery`
+            // (defense-in-depth alongside the gate above). Returns whether the persist succeeded (a
+            // guarded no-op still counts as success).
+            let set_if_manual = |state: ReplicaState| -> bool {
+                match replica_state.write(|rs| {
+                    if matches!(
+                        rs.get_peer_state(this_peer_id),
+                        Some(ReplicaState::ManualRecovery)
+                    ) {
+                        rs.set_peer_state(this_peer_id, state);
+                    }
+                }) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        log::error!(
+                            "adopted shard {collection_id}:{shard_id}: could not persist state \
+                             {state:?} while resolving an interrupted adoption ({err})",
+                        );
+                        false
+                    }
+                }
+            };
+
+            let has_activate = crate::shards::has_adopt_activate_marker(shard_path);
+            let has_failed = crate::shards::has_adopt_failed_marker(shard_path);
+
+            // `resolved` is true once the shard's outcome is durably recorded — a terminal marker on
+            // a cluster, or the local state on single-node. The in-progress marker is removed ONLY
+            // when resolved: if the durable write failed, it is kept so a restart's `load` retries,
+            // rather than dropping the only trigger and stranding the shard.
+            let resolved = if !is_manual_recovery {
+                // Stale in-progress marker over a non-`ManualRecovery` (already-resolved) shard:
+                // drop it, taking no other action.
+                true
+            } else if has_activate || has_failed {
+                // A terminal marker was already written (the crash landed after it). On a cluster,
+                // `sync_local_state` drives the outcome through consensus; on single-node there is no
+                // reconciler, so resolve it here — otherwise the shard strands in `ManualRecovery`,
+                // the exact bug H1 exists to prevent. Failure outranks activation, matching the
+                // reconciler's own precedence.
+                if shared_storage_config.is_distributed {
+                    true // the terminal marker + reconciler own the outcome
+                } else if has_failed {
+                    set_if_manual(ReplicaState::Dead)
+                } else if matches!(local, Some(Shard::Local(_))) {
+                    set_if_manual(ReplicaState::Active)
+                } else {
+                    // Activate marker but the shard did not load as a `LocalShard` (e.g. a `Dummy`
+                    // after a restart-reload failure): it cannot be activated, so drive it `Dead`
+                    // for recovery rather than stranding it in `ManualRecovery`.
+                    set_if_manual(ReplicaState::Dead)
+                }
+            } else {
+                // Salvageable only if the install actually completed: the dirty flag is clear AND the
+                // shard loaded as a clean `LocalShard`. The dirty flag is written before the install
+                // (including while the load task is still queued, when no data has moved) and cleared
+                // only on a fully successful move+load, so a clean load with no dirty flag means all
+                // data is present — only the terminal-marker write was lost.
+                let salvageable = !is_dirty_shard && matches!(local, Some(Shard::Local(_)));
+                if salvageable {
+                    log::warn!(
+                        "adopted shard {collection_id}:{shard_id}: recovering a load that completed \
+                         but crashed before activation was recorded",
+                    );
+                    if shared_storage_config.is_distributed {
+                        // Cluster: hand to the reconciler via the durable activation marker, which
+                        // it drives to `Active` through the leader-guarded consensus path.
+                        match crate::shards::write_adopt_activate_marker(shard_path) {
+                            Ok(()) => true,
+                            Err(err) => {
+                                log::error!(
+                                    "adopted shard {collection_id}:{shard_id}: could not write \
+                                     activation marker while salvaging ({err}); left parked",
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        // Single node: no reconciler runs — activate directly (guarded).
+                        set_if_manual(ReplicaState::Active)
+                    }
+                } else {
+                    // Not salvageable: interrupted mid-move (partial/dirty) or the data will not
+                    // load. Drive the shard `Dead` so recovery kicks in rather than stranding it in
+                    // `ManualRecovery`. Always record the durable failure marker. On a cluster the
+                    // reconciler (`should_fail_adopted`, gated on `ManualRecovery`) then proposes
+                    // `Dead` through consensus so every peer converges — setting local `Dead`
+                    // directly there would bypass consensus AND disable that very reconciler (it no
+                    // longer sees `ManualRecovery`), leaving a lasting local/consensus divergence. On
+                    // single-node there is no reconciler, so set `Dead` locally (guarded).
+                    log::error!(
+                        "adopted shard {collection_id}:{shard_id}: load was interrupted before \
+                         completion; marking Dead for recovery",
+                    );
+                    let failed_written = crate::shards::write_adopt_failed_marker(
+                        shard_path,
+                        "adoption interrupted before completion",
+                    )
+                    .is_ok();
+                    if shared_storage_config.is_distributed {
+                        // Cluster: the failed marker is the durable signal the reconciler drives
+                        // `Dead` from — resolved iff it was written.
+                        failed_written
+                    } else {
+                        // Single-node: the local `Dead` state resolves it, but the failure marker is
+                        // ALSO the panic-suppressor (`is_adopted`) that keeps a later reload failure
+                        // from crash-looping the node — so require BOTH. If the marker write failed,
+                        // do NOT set `Dead`: keep the in-progress marker (also a panic-suppressor)
+                        // so the next restart retries, rather than leaving a `Dead`, marker-less
+                        // shard that would panic on the next failed load.
+                        failed_written && set_if_manual(ReplicaState::Dead)
+                    }
+                }
+            };
+            if resolved {
+                crate::shards::remove_adopt_in_progress_marker(collection_path, shard_id);
+            }
+        }
 
         let replica_set = Self {
             shard_id,
@@ -880,6 +1046,37 @@ impl ShardReplicaSet {
         Ok(())
     }
 
+    /// Whether the reconciler should drive this adopted shard to `Active`: it carries the durable
+    /// [`crate::shards::ADOPT_ACTIVATE_MARKER_FILE`] (data installed) AND its local replica is a
+    /// real, loaded `LocalShard`. The `LocalShard` requirement is a hard safety gate: a `Dummy`
+    /// here means a failed/interrupted load or a shard mid-clear during snapshot recovery —
+    /// activating that would flip an empty/partial replica to `Active`. This is also what keeps a
+    /// leftover marker from spuriously activating a shard snapshot recovery re-parked.
+    pub async fn should_activate_adopted(&self) -> bool {
+        crate::shards::has_adopt_activate_marker(&self.shard_path)
+            && matches!(&*self.local.read().await, Some(Shard::Local(_)))
+    }
+
+    /// Whether the reconciler should drive this adopted shard to `Dead` — a terminal failure that
+    /// must be surfaced rather than left looking like a healthy in-progress load. True when either:
+    /// * it carries the [`crate::shards::ADOPT_FAILED_MARKER_FILE`] (load failed at create time), or
+    /// * it carries the *pending* marker (data was installed) but its local replica is NOT a loaded
+    ///   `LocalShard` — a `Dummy` from a failed/interrupted reload after a restart, whose installed
+    ///   data will never load. Without this second case such a shard would sit in `ManualRecovery`
+    ///   forever (the activate gate refuses the `Dummy`, and no `.adopt_failed` marker was written).
+    pub async fn should_fail_adopted(&self) -> bool {
+        if crate::shards::has_adopt_failed_marker(&self.shard_path) {
+            return true;
+        }
+        crate::shards::has_adopt_activate_marker(&self.shard_path)
+            && !matches!(&*self.local.read().await, Some(Shard::Local(_)))
+    }
+
+    /// The recorded failure reason for a failed adoption, if any (for logging).
+    pub fn adopt_activation_failure_reason(&self) -> Option<String> {
+        crate::shards::read_adopt_failed_marker(&self.shard_path)
+    }
+
     pub async fn set_replica_state(
         &self,
         peer_id: PeerId,
@@ -915,6 +1112,15 @@ impl ShardReplicaSet {
     /// - there is no local shard
     /// - the local shard is removed
     async fn on_local_state_updated(&self, new_state: ReplicaState) -> CollectionResult<()> {
+        // Once an (adopted) shard is active, clear any adoption markers: the reconciler must stop
+        // (re)proposing activation, and a later legitimate re-park (e.g. snapshot recovery of this
+        // collection) must not be spuriously re-activated. The `.adopt_failed` marker is cleared
+        // too — a shard that is now active plainly did not fail.
+        if new_state.is_active() {
+            crate::shards::remove_adopt_activate_marker(&self.shard_path);
+            crate::shards::remove_adopt_failed_marker(&self.shard_path);
+        }
+
         // Update newest clocks snapshot on each state change
         if let Some(local_shard) = self.local.read().await.as_ref() {
             if new_state.is_active() {

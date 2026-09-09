@@ -1,3 +1,4 @@
+mod adopt;
 pub mod recovery_guard;
 mod resharding;
 pub(crate) mod shard_mapping;
@@ -238,7 +239,22 @@ impl ShardHolder {
             }
             sync_parent_dir_async(&shard_config_path).await?;
 
-            tokio_fs::remove_dir_all(shard_path).await?;
+            tokio_fs::remove_dir_all(&shard_path).await?;
+
+            // Also remove this shard id's collection-level adoption in-progress marker and dirty
+            // flag (both live in the collection dir, not the shard dir, so `remove_dir_all` above
+            // does not touch them). Otherwise a shard id later reused by resharding or a
+            // drop+recreate would inherit a stale marker/flag and be mistaken for an interrupted
+            // adoption or a dirty shard on the next restart.
+            if let Some(collection_path) = shard_path.parent() {
+                crate::shards::remove_adopt_in_progress_marker(collection_path, shard_id);
+                let flag = crate::shards::shard_initializing_flag_path(collection_path, shard_id);
+                if let Err(err) = tokio_fs::remove_file(&flag).await
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    log::warn!("Failed to remove initializing flag {flag:?} on shard drop: {err}");
+                }
+            }
         }
         Ok(())
     }
@@ -976,10 +992,13 @@ impl ShardHolder {
             async move {
                 let shard_key_for_add = shard_key.clone();
 
-                // Check if shard is fully initialized on disk
+                // Check if shard is fully initialized on disk. A stat *error* (not "absent") is
+                // treated as dirty: it is fail-safe. For an adopted shard the dirty flag also gates
+                // the load-time salvage decision, and reading it as "clean" on an IO error could
+                // salvage-activate an incomplete/empty shard — so an unknown result must mean dirty.
                 let is_dirty_shard = tokio_fs::try_exists(&initializing_flag)
                     .await
-                    .unwrap_or(false);
+                    .unwrap_or(true);
 
                 // Validate that shard exists on disk
                 let shard_path = check_shard_path(collection_path, shard_id)
@@ -1350,17 +1369,24 @@ impl ShardHolder {
             .prefix(&format!("{collection_name}-shard-{shard_id}"))
             .tempdir_in(temp_dir)?;
 
+        // An adopted directory is the operator's artifact, consumed by rename — remember
+        // where it came from so any failure below returns it instead of deleting it (the
+        // `TempDir` cleanup that is correct for downloaded data would destroy it).
+        let adopted_source = match &snapshot_data {
+            SnapshotData::Adopted(source) => Some(source.clone()),
+            SnapshotData::Packed(_) | SnapshotData::Unpacked(_) => None,
+        };
+
         // Set unpacking stage
         if let Some(recovery_progress) = &recovery_progress {
             recovery_progress.lock().set_stage(RecoveryStage::Unpacking);
         }
 
-        let extract = {
-            let snapshot_temp_dir = snapshot_temp_dir.path().to_path_buf();
+        let restore_result: CollectionResult<()> = async {
+            let extract_task = {
+                let snapshot_temp_dir = snapshot_temp_dir.path().to_path_buf();
 
-            cancel::blocking::spawn_cancel_on_token(
-                cancel.child_token(),
-                move |cancel| -> CollectionResult<_> {
+                move |cancel: cancel::CancellationToken| -> CollectionResult<_> {
                     match snapshot_data {
                         SnapshotData::Packed(snapshot_path) => {
                             if cancel.is_cancelled() {
@@ -1371,6 +1397,16 @@ impl ShardHolder {
                         }
                         SnapshotData::Unpacked(snapshot_dir) => {
                             move_all(snapshot_dir.path(), &snapshot_temp_dir)?;
+                        }
+                        // One atomic whole-directory rename: after a crash the artifact
+                        // is either untouched at its staging path or fully in the temp
+                        // dir — never half-moved, which matters because the source is
+                        // consumed and there is no pristine copy to retry from.
+                        SnapshotData::Adopted(source) => {
+                            if cancel.is_cancelled() {
+                                return Err(cancel::Error::Cancelled.into());
+                            }
+                            adopt::rename_into(&source, &snapshot_temp_dir)?;
                         }
                     }
 
@@ -1386,42 +1422,72 @@ impl ShardHolder {
                     common::fs::bulk_sync_dir(&snapshot_temp_dir)?;
 
                     Ok(())
-                },
-            )
-        };
+                }
+            };
 
-        extract.await??;
+            // An adopted install consumes the operator's ONLY copy by rename, and `rescue` (in the
+            // match below) does destructive temp-dir cleanup on failure. `spawn_cancel_on_token`
+            // returns early on cancel while leaving the blocking closure running detached (abort is
+            // a no-op once it has started) — so it could let `rescue` delete the temp dir WHILE the
+            // closure renames the artifact into it, then report the source "not consumed", silently
+            // destroying it. For the adopted path we therefore JOIN the closure to completion rather
+            // than abort-detaching: it still honors cancellation promptly at its internal
+            // checkpoints (its token is a child of `cancel`), and by the time any rescue runs the
+            // filesystem has settled — the artifact is either back at its staging path or wholly in
+            // the temp dir, never mid-rename.
+            //
+            // Packed/Unpacked keep the original snapshot and have no destructive rescue, so
+            // abort-on-cancel for prompt cancellation stays safe there.
+            if adopted_source.is_some() {
+                let cancel = cancel.child_token();
+                tokio::task::spawn_blocking(move || extract_task(cancel))
+                    .await
+                    .map_err(|err| {
+                        CollectionError::service_error(format!("adopt extract task panicked: {err}"))
+                    })??;
+            } else {
+                cancel::blocking::spawn_cancel_on_token(cancel.child_token(), extract_task)
+                    .await??;
+            }
 
-        // Set restoring stage
-        if let Some(recovery_progress) = &recovery_progress {
-            recovery_progress.lock().set_stage(RecoveryStage::Restoring);
+            // Set restoring stage
+            if let Some(recovery_progress) = &recovery_progress {
+                recovery_progress.lock().set_stage(RecoveryStage::Restoring);
+            }
+
+            // `ShardHolder::recover_local_shard_from` is *not* cancel safe
+            // (see `ShardReplicaSet::restore_local_replica_from`)
+            let recovered = self
+                .recover_local_shard_from(
+                    snapshot_temp_dir.path(),
+                    recovery_type,
+                    collection_path,
+                    shard_id,
+                    cancel,
+                )
+                .await?;
+
+            if !recovered {
+                return Err(CollectionError::bad_request("Invalid snapshot"));
+            }
+
+            if recovery_type.is_partial() {
+                self.update_payload_index_schema().await.map_err(|err| {
+                    CollectionError::service_error(format!(
+                        "failed to update payload index schema after recovering partial snapshot: {err}"
+                    ))
+                })?;
+            }
+
+            Ok(())
         }
+        .await;
 
-        // `ShardHolder::recover_local_shard_from` is *not* cancel safe
-        // (see `ShardReplicaSet::restore_local_replica_from`)
-        let recovered = self
-            .recover_local_shard_from(
-                snapshot_temp_dir.path(),
-                recovery_type,
-                collection_path,
-                shard_id,
-                cancel,
-            )
-            .await?;
-
-        if !recovered {
-            return Err(CollectionError::bad_request("Invalid snapshot"));
+        match (restore_result, adopted_source) {
+            (Ok(()), _) => Ok(()),
+            (Err(err), Some(source)) => Err(adopt::rescue(snapshot_temp_dir, &source, err)),
+            (Err(err), None) => Err(err),
         }
-
-        if recovery_type.is_partial() {
-            self.update_payload_index_schema().await.map_err(|err| {
-                CollectionError::service_error(format!(
-                    "failed to update payload index schema after recovering partial snapshot: {err}"
-                ))
-            })?;
-        }
-
-        Ok(())
     }
 
     /// # Cancel safety

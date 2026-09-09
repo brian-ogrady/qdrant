@@ -88,6 +88,9 @@ pub struct StorageConfig {
     #[validate(custom(function = validate_path))]
     #[serde(default)]
     pub temp_path: Option<PathBuf>,
+    /// Root directory from which fully built shard directories may be adopted
+    #[serde(default)]
+    pub shard_adoption_path: Option<PathBuf>,
     /// Deprecated: use `payload.memory` instead.
     #[serde(default = "default_on_disk_payload")]
     #[deprecated(since = "1.19.0", note = "Use `payload.memory` instead")]

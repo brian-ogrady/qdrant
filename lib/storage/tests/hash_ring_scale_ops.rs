@@ -68,6 +68,9 @@ fn try_create_op(
                 uuid: None,
                 metadata: None,
                 hash_ring_shard_scale,
+                shard_placement: None,
+                adopt_shards_from: None,
+                adopt_allow_config_rebuild: None,
             },
         )?,
     ))
@@ -104,6 +107,7 @@ fn hash_ring_shard_scale_create_and_immutability() {
         snapshots_path: storage_dir.path().join("snapshots"),
         snapshots_config: Default::default(),
         temp_path: None,
+        shard_adoption_path: None,
         on_disk_payload: false,
         payload: None,
         optimizers: OptimizersConfig {

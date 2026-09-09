@@ -4,6 +4,7 @@ use std::hash::{BuildHasherDefault, Hash};
 use std::sync::LazyLock;
 
 use bytemuck::TransparentWrapper as _;
+use common::defaults;
 use common::stable_hash::{StableHash, StableHashed};
 use itertools::Itertools as _;
 use segment::index::field_index::CardinalityEstimation;
@@ -38,12 +39,45 @@ pub const MAX_HASH_RING_VIRTUAL_NODES: u64 = 1_000_000;
 /// for `100_000`.
 const _: () = assert!(MAX_HASH_RING_SHARD_SCALE == 100_000);
 
-/// Minimum Qdrant version required for `hash_ring_shard_scale`.
+/// Release part of the fork build that introduced both gates below. Upstream names its gates
+/// `X.Y.Z-dev` because upstream's own in-development builds report that pre-release; this fork
+/// reports [`defaults::QDRANT_VERSION_STRING`] (`1.19.1+qdrant-labs`), so the gates name the fork
+/// build that shipped the feature instead of an upstream pre-release.
+const SHARD_SCALE_AND_ADOPTION_RELEASE: &str = "1.19.1";
+
+/// Parse `<release>+<fork build tag>`, e.g. `1.19.1+qdrant-labs`.
 ///
-/// Prevents mixed-version clusters from using inconsistent hash-ring mappings
-/// when older peers do not understand this collection parameter.
+/// The tag comes from [`defaults::QDRANT_FORK_BUILD_TAG`] so renaming the fork tag cannot leave a
+/// stale literal here.
+fn fork_version(release: &str) -> Version {
+    Version::parse(&format!("{release}+{}", defaults::QDRANT_FORK_BUILD_TAG))
+        .expect("valid version string")
+}
+
+/// Minimum fork version required for `hash_ring_shard_scale`.
+///
+/// Prevents clusters with a peer that predates the field from using inconsistent hash-ring
+/// mappings: Raft entries are CBOR maps without `deny_unknown_fields`, so such a peer drops the
+/// parameter and builds its ring at the default — one collection, two point-to-shard mappings.
+///
+/// SemVer ignores build metadata when ordering, so the `+qdrant-labs` tag documents where the gate
+/// comes from and shows up in operator-facing errors; it does not by itself keep a non-fork peer
+/// out. Keeping non-fork builds out is the job of [`ChannelService::all_peers_are_fork`].
+///
+/// [`ChannelService::all_peers_are_fork`]: crate::shards::channel_service::ChannelService::all_peers_are_fork
 pub static HASH_RING_SHARD_SCALE_VERSION: LazyLock<Version> =
-    LazyLock::new(|| Version::parse("1.19.1-dev").expect("valid version string"));
+    LazyLock::new(|| fork_version(SHARD_SCALE_AND_ADOPTION_RELEASE));
+
+/// Minimum fork version required for the shard-adoption fields (`shard_placement`,
+/// `adopt_shards_from`, `adopt_allow_config_rebuild`).
+///
+/// Same build-metadata caveat as [`HASH_RING_SHARD_SCALE_VERSION`]: the version gate is paired with
+/// [`ChannelService::all_peers_are_fork`] in `Dispatcher::shard_adoption_fields_supported`, and that
+/// pairing — not the tag in this string — is what refuses a non-fork peer.
+///
+/// [`ChannelService::all_peers_are_fork`]: crate::shards::channel_service::ChannelService::all_peers_are_fork
+pub static SHARD_ADOPTION_VERSION: LazyLock<Version> =
+    LazyLock::new(|| fork_version(SHARD_SCALE_AND_ADOPTION_RELEASE));
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HashRingRouter<T: Eq + StableHash + Hash = ShardId> {
@@ -380,6 +414,23 @@ impl CustomIdCheckerCondition for HashRingFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This binary must satisfy its own feature gates, and the gates must carry the fork tag.
+    ///
+    /// Catches a gate pinned above the version this fork actually reports (a typo, or a gate
+    /// written for a release that never shipped), which would disable the feature everywhere
+    /// instead of only on old peers.
+    #[test]
+    fn this_build_satisfies_the_fork_gates() {
+        for gate in [&*HASH_RING_SHARD_SCALE_VERSION, &*SHARD_ADOPTION_VERSION] {
+            assert!(
+                *defaults::QDRANT_VERSION >= *gate,
+                "this build ({}) does not satisfy its own gate ({gate})",
+                *defaults::QDRANT_VERSION,
+            );
+            assert_eq!(gate.build.as_str(), defaults::QDRANT_FORK_BUILD_TAG);
+        }
+    }
 
     #[test]
     fn test_non_seq_keys() {

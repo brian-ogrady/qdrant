@@ -183,6 +183,15 @@ impl Collection {
                 let snapshot_dir_path = snapshot_dir.path();
                 move_all(snapshot_dir_path, target_dir)?;
             }
+            // Adoption is a *shard*-level operation: an adopted directory holds one shard,
+            // not a collection snapshot, and consuming it here would silently misfile it.
+            SnapshotData::Adopted(path) => {
+                return Err(CollectionError::bad_input(format!(
+                    "adopted directory {} is only valid for shard snapshot recovery, \
+                     not collection restore",
+                    path.display(),
+                )));
+            }
         }
 
         let config = CollectionConfigInternal::load(target_dir)?;

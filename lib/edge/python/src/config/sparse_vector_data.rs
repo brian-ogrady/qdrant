@@ -41,6 +41,8 @@ impl PyEdgeSparseVectorParams {
         Self(EdgeSparseVectorParams {
             full_scan_threshold,
             on_disk,
+            // Not exposed to Python yet; see the `memory` notes in quantization.rs.
+            memory: None,
             modifier: modifier.map(Modifier::from),
             datatype: datatype.map(VectorStorageDatatype::from),
         })

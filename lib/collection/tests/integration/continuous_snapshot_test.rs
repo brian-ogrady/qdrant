@@ -88,6 +88,7 @@ async fn test_continuous_snapshot() {
         None,
         ResourceBudget::default(),
         None,
+        None,
     )
     .await
     .unwrap();

@@ -102,6 +102,24 @@ impl CollectionContainer for TableOfContent {
                     ReplicaState::Active,
                     Some(ReplicaState::Listener),
                 );
+                // Activate an adopted shard once its data is installed (marker present). Retried
+                // every reconcile tick until it commits — the durable activation path for adopted
+                // shards. `from` is `ManualRecovery`, the state adopted shards are born in.
+                let activate_adopted_callback = Self::change_peer_state_callback(
+                    self.consensus_proposal_sender.clone(),
+                    collection.name().to_string(),
+                    ReplicaState::Active,
+                    Some(ReplicaState::ManualRecovery),
+                );
+                // Mark an adopted shard whose load FAILED (`.adopt_failed` marker) as `Dead`, so the
+                // failure is surfaced rather than sitting in `ManualRecovery`. Same retried,
+                // leader-guarded path; `from` is `ManualRecovery`.
+                let fail_adopted_callback = Self::change_peer_state_callback(
+                    self.consensus_proposal_sender.clone(),
+                    collection.name().to_string(),
+                    ReplicaState::Dead,
+                    Some(ReplicaState::ManualRecovery),
+                );
 
                 collection
                     .sync_local_state(
@@ -110,6 +128,8 @@ impl CollectionContainer for TableOfContent {
                         finish_shard_initialize,
                         convert_to_listener_callback,
                         convert_from_listener_to_active_callback,
+                        activate_adopted_callback,
+                        fail_adopted_callback,
                     )
                     .await?;
             }
@@ -214,6 +234,9 @@ impl TableOfContent {
                         Some(self.update_runtime.handle().clone()),
                         self.optimizer_resource_budget.clone(),
                         self.storage_config.optimizers_overwrite.clone(),
+                        // Loading from disk: each shard's persisted replica state is
+                        // restored, so no build-time override.
+                        None,
                     )
                     .await?;
                     existing_collections.validate_collection_not_exists(id)?;

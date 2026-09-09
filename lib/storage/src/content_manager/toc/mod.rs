@@ -100,6 +100,14 @@ pub struct TableOfContent {
     ///
     /// If not defined - no rate limiting is applied.
     update_rate_limiter: Option<Semaphore>,
+    /// Bounds concurrent off-thread loads of adopted shards during one-call restore
+    /// (`adopt_shards_from`), so a create does not spawn an unbounded number of heavy
+    /// `LocalShard::load`s at once. Sized from the same config value as startup shard-load
+    /// concurrency (`load_concurrency.get_concurrent_shards()`), but it is a **separate,
+    /// process-wide** limiter: startup loading uses its own per-collection `buffer_unordered`
+    /// bound, not this semaphore. Being process-wide, this also serializes adoption loads across
+    /// different collections on the node.
+    adopt_load_semaphore: Arc<Semaphore>,
     /// A lock to prevent concurrent collection creation.
     /// Effectively, this lock ensures that `create_collection` is called sequentially.
     collection_create_lock: Mutex<()>,
@@ -278,6 +286,14 @@ impl TableOfContent {
             }
         };
 
+        let adopt_load_semaphore = Arc::new(Semaphore::new(
+            storage_config
+                .performance
+                .load_concurrency
+                .get_concurrent_shards()
+                .get(),
+        ));
+
         Ok(TableOfContent {
             collections: Arc::new(RwLock::new(collections)),
             storage_config: Arc::new(storage_config.clone()),
@@ -293,6 +309,7 @@ impl TableOfContent {
             consensus_proposal_sender,
             toc_dispatcher: Default::default(),
             update_rate_limiter: rate_limiter,
+            adopt_load_semaphore,
             collection_create_lock: Default::default(),
             collection_hw_metrics: DashMap::new(),
             telemetry,
@@ -365,6 +382,17 @@ impl TableOfContent {
 
     pub fn storage_path(&self) -> &Path {
         &self.storage_config.storage_path
+    }
+
+    /// Staging root for `adopt://` shard recovery, when this node enables it.
+    pub fn shard_adoption_path(&self) -> Option<&Path> {
+        self.storage_config.shard_adoption_path.as_deref()
+    }
+
+    /// The directory holding every collection's data — what adoption's same-filesystem
+    /// check compares the staging directory against.
+    pub fn collections_dir_path(&self) -> PathBuf {
+        self.storage_config.storage_path.join(COLLECTIONS_DIR)
     }
 
     /// List of all collections to which the user has access

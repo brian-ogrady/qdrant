@@ -41,7 +41,7 @@ use crate::common::collection_size_stats::{
     CollectionSizeAtomicStats, CollectionSizeStats, CollectionSizeStatsCache,
 };
 use crate::common::is_ready::IsReady;
-use crate::config::{CollectionConfigInternal, ShardingMethod};
+use crate::config::{CollectionConfigInternal, CollectionParams, ShardingMethod};
 use crate::operations::OperationWithClockTag;
 use crate::operations::config_diff::{DiffConfig, OptimizersConfigDiff};
 use crate::operations::shared_storage_config::SharedStorageConfig;
@@ -52,7 +52,7 @@ use crate::shards::collection_shard_distribution::CollectionShardDistribution;
 use crate::shards::local_shard::clock_map::RecoveryPoint;
 use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::replica_set::replica_set_state::ReplicaState::{
-    Active, Dead, Initializing, Listener,
+    Active, Dead, Initializing, Listener, ManualRecovery,
 };
 use crate::shards::replica_set::{ChangePeerFromState, ChangePeerState, ShardReplicaSet};
 use crate::shards::shard::{PeerId, ShardId};
@@ -96,6 +96,11 @@ pub struct Collection {
     // Coordinates background optimizer recreation: at most one runs at a time, and requests that
     // arrive while one is running are coalesced into a single re-run.
     recreate_optimizers_state: Arc<RecreateOptimizersState>,
+    // Cancels this collection's in-flight one-call adoption (Phase B) loads. Each adoption load
+    // uses a child of this token; `stop_gracefully` (collection drop / delete) fires it so queued
+    // and pre-load loads abort promptly and release the shard-holder read guard, instead of the
+    // delete's `stop_gracefully` write-lock acquisition stalling behind hour-long loads.
+    adopt_cancel: cancel::CancellationToken,
 }
 
 pub type RequestShardTransfer = Arc<dyn Fn(ShardTransfer) + Send + Sync>;
@@ -122,6 +127,11 @@ impl Collection {
         update_runtime: Option<Handle>,
         optimizer_resource_budget: ResourceBudget,
         optimizers_overwrite: Option<OptimizersConfigDiff>,
+        // Initial state for freshly-built local replicas. `None` means the default
+        // (`Initializing`, which `sync_local_state` then auto-activates). Passed as
+        // e.g. `ManualRecovery` when the shards will be populated by adoption before
+        // being activated, so they are never auto-activated empty.
+        init_replica_state: Option<ReplicaState>,
     ) -> CollectionResult<Self> {
         let start_time = std::time::Instant::now();
 
@@ -168,7 +178,7 @@ impl Collection {
                     .clone()
                     .unwrap_or_else(AdaptiveSearchHandle::current),
                 optimizer_resource_budget.clone(),
-                None,
+                init_replica_state,
             )
             .await?;
 
@@ -210,6 +220,7 @@ impl Collection {
             collection_stats_cache,
             shard_clean_tasks: Default::default(),
             recreate_optimizers_state: Default::default(),
+            adopt_cancel: cancel::CancellationToken::new(),
         })
     }
 
@@ -334,10 +345,33 @@ impl Collection {
             collection_stats_cache,
             shard_clean_tasks: Default::default(),
             recreate_optimizers_state: Default::default(),
+            adopt_cancel: cancel::CancellationToken::new(),
         }
     }
 
+    /// A child of this collection's adoption-cancellation token. One-call adoption (Phase B) loads
+    /// use it, so [`Self::stop_gracefully`] (collection drop / delete) can abort them.
+    pub fn adopt_cancel_token(&self) -> cancel::CancellationToken {
+        self.adopt_cancel.child_token()
+    }
+
     pub async fn stop_gracefully(&self) {
+        // Cancel any in-flight one-call adoption loads FIRST, before contending for the shard-holder
+        // write lock. A Phase B restore holds a shard-holder read guard across its (long) load; on
+        // delete, waiting for that write lock would otherwise stall the caller — and the consensus
+        // apply thread, for `delete_collection` — for the duration of the in-flight loads. Firing
+        // the token makes queued and pre-load adoptions abort and release the read guard promptly.
+        //
+        // Scope + residuals (accepted): this only cancels ONE-CALL ADOPTION loads — an ordinary
+        // shard-snapshot recovery holds the same read guard across a non-cancel-safe load with an
+        // API-supplied token this does not fire, so a delete can still stall behind those. And a
+        // load already inside the non-cancel-safe segment (`LocalShard::load`) runs to completion,
+        // bounded by the load-concurrency limit. KNOWN LIMITATION: firing the token mid-`extract`
+        // makes the adoption restore's cancel path race `adopt::rescue`; in a narrow interleaving a
+        // delete during that window can leave the staged artifact in an orphaned temp dir rather
+        // than back at its staging path (recoverable — the adoption doctrine is "rebuild from the
+        // source of truth"). Fully closing these needs a cancel-safe load / rescue rework.
+        self.adopt_cancel.cancel();
         let mut owned_holder = self.shards_holder.write().await;
         owned_holder.stop_gracefully().await;
     }
@@ -713,6 +747,131 @@ impl Collection {
             .await
     }
 
+    /// Mark an adopted shard's data as installed and awaiting activation (writes the durable
+    /// [`crate::shards::ADOPT_ACTIVATE_MARKER_FILE`]). In a cluster, `sync_local_state` then drives
+    /// it to `Active` — see the reconciler branch there. Called by the one-call adoption path once
+    /// the shard has finished loading.
+    pub async fn mark_shard_adopt_activation_pending(
+        &self,
+        shard_id: ShardId,
+    ) -> CollectionResult<()> {
+        let replica_set = self
+            .shards_holder
+            .read()
+            .await
+            .get_shard(shard_id)
+            .cloned()
+            .ok_or_else(|| {
+                CollectionError::service_error(format!(
+                    "shard {shard_id} not found while marking adopt activation pending",
+                ))
+            })?;
+        crate::shards::write_adopt_activate_marker(&replica_set.shard_path).map_err(|err| {
+            CollectionError::service_error(format!(
+                "failed to write adopt activation marker for shard {shard_id}: {err}",
+            ))
+        })
+    }
+
+    /// Remove BOTH adoption markers (`.adopt_activate_pending` / `.adopt_failed`) from a shard's
+    /// directory. Called by full-collection snapshot recovery when it re-parks a shard to
+    /// `ManualRecovery` before clearing+reloading it: without this, a stale marker on the shard
+    /// (e.g. a persistent `.adopt_failed` on a `Dead` shard) could make `sync_local_state` propose
+    /// `Active`/`Dead` during the recovery's pre-clear window — briefly serving stale data or racing
+    /// the recovery's own state proposals. No-op if the shard is absent locally.
+    pub async fn remove_adopt_markers(&self, shard_id: ShardId) {
+        if let Some(replica_set) = self.shards_holder.read().await.get_shard(shard_id) {
+            crate::shards::remove_adopt_activate_marker(&replica_set.shard_path);
+            crate::shards::remove_adopt_failed_marker(&replica_set.shard_path);
+        }
+        // The in-progress marker lives in the collection dir (keyed by shard id), so clear it
+        // regardless of whether the shard is present locally — a stale one could otherwise make the
+        // load-time salvage/`Dead` logic act on a shard this re-park is about to clear and reload.
+        crate::shards::remove_adopt_in_progress_marker(&self.path, shard_id);
+    }
+
+    /// Mark an adopted shard's install as **in progress** (writes the durable, collection-level
+    /// [`crate::shards::adopt_in_progress_marker_path`]). Armed in Phase A, as soon as the shard is
+    /// staged and before the data is moved into place, so a crash/panic mid-install leaves a signal
+    /// that `ShardReplicaSet::load`
+    /// resolves on the next start (salvage or `Dead`) instead of stranding the shard in
+    /// `ManualRecovery`. Best-effort: a write failure is only logged (the shard would then fall
+    /// back to the pre-H1 behavior of a possible strand, no worse than before).
+    pub fn mark_shard_adopt_in_progress(&self, shard_id: ShardId) {
+        if let Err(err) = crate::shards::write_adopt_in_progress_marker(&self.path, shard_id) {
+            log::warn!(
+                "failed to write adopt in-progress marker for shard {shard_id} of `{}`: {err}",
+                self.id,
+            );
+        }
+    }
+
+    /// Durably mark shard `shard_id`'s data as not-yet-complete (writes the `.initializing` dirty
+    /// flag). Adoption calls this in Phase A, as soon as a shard is staged and *before* arming the
+    /// in-progress marker, so a crash before
+    /// completion — including while the load task is still queued (no data moved yet) — leaves the
+    /// shard dirty and the load-time salvage check drives it `Dead` instead of activating an empty
+    /// shard. Restore clears the flag on full success.
+    ///
+    /// Returns `true` if the flag is durably written. The caller MUST NOT arm the in-progress marker
+    /// when this returns `false`: an in-progress marker without the dirty flag is exactly the state
+    /// the salvage check would mistake for a completed load and activate empty.
+    #[must_use]
+    pub fn mark_shard_initializing(&self, shard_id: ShardId) -> bool {
+        match crate::shards::write_shard_initializing_flag(&self.path, shard_id) {
+            Ok(()) => true,
+            Err(err) => {
+                log::warn!(
+                    "failed to write initializing flag for shard {shard_id} of `{}`: {err}",
+                    self.id,
+                );
+                false
+            }
+        }
+    }
+
+    /// Remove the in-progress marker for `shard_id`. Durable. Called only when Phase B **succeeds**
+    /// AND this is still the registered collection instance — NOT on a handled failure (a failure
+    /// leaves the marker so a restart's `ShardReplicaSet::load` resolves the shard rather than
+    /// dropping the only trigger), and NOT when the collection was deleted/recreated mid-load (the
+    /// caller's `Arc`-identity gate skips the clear, so a straggler can't remove a recreated
+    /// collection's marker). It is also removed by the load-time resolution, by
+    /// `drop_and_remove_shard`, and by a transfer rebuild.
+    pub fn clear_shard_adopt_in_progress(&self, shard_id: ShardId) {
+        crate::shards::remove_adopt_in_progress_marker(&self.path, shard_id);
+    }
+
+    /// Mark an adopted shard's load as definitively failed (writes the durable
+    /// [`crate::shards::ADOPT_FAILED_MARKER_FILE`] with `reason`). In a cluster, `sync_local_state`
+    /// then drives it to `Dead` so the failure is surfaced. Called by the one-call adoption path
+    /// when Phase B's load errors. Best-effort: a failure to write the marker is only logged (the
+    /// shard stays parked, the pre-existing behavior).
+    ///
+    /// Returns whether the marker was durably written. The single-node caller uses this to avoid
+    /// setting the replica `Dead` while the marker (which is also the reload-panic suppressor) is
+    /// missing — a `Dead`, marker-less shard could crash-loop the node on a later failed load.
+    pub async fn mark_shard_adopt_activation_failed(
+        &self,
+        shard_id: ShardId,
+        reason: &str,
+    ) -> bool {
+        let replica_set = self.shards_holder.read().await.get_shard(shard_id).cloned();
+        let Some(replica_set) = replica_set else {
+            return false;
+        };
+        match crate::shards::write_adopt_failed_marker(&replica_set.shard_path, reason) {
+            Ok(()) => true,
+            Err(err) => {
+                log::warn!(
+                    "failed to write adopt failure marker for shard {shard_id} of `{}`: {err}",
+                    self.id,
+                );
+                false
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn sync_local_state(
         &self,
         on_transfer_failure: OnTransferFailure,
@@ -720,6 +879,8 @@ impl Collection {
         on_finish_init: ChangePeerState,
         on_convert_to_listener: ChangePeerState,
         on_convert_from_listener: ChangePeerState,
+        on_activate_adopted: ChangePeerState,
+        on_fail_adopted: ChangePeerState,
     ) -> CollectionResult<()> {
         // Check for disabled replicas
         let shard_holder = self.shards_holder.read().await;
@@ -812,6 +973,40 @@ impl Collection {
 
             // Don't automatically recover replicas if started in recovery mode
             if self.shared_storage_config.recovery_mode.is_some() {
+                continue;
+            }
+
+            // Adopted shard: its data is installed (the activation marker is present) but it is
+            // still parked in `ManualRecovery` because its one-shot activation was lost (this peer
+            // was not leader when it fired) or a restart landed after the load but before the
+            // `Active` transition committed. Re-propose `Active`. The callback goes through the
+            // leader-guarded consensus path, and this reconciler runs every tick, so it is retried
+            // until it commits — the single, durable activation path for adopted shards. Scoped by
+            // the marker: a shard whose data is NOT installed (a failed or mid-crash adoption) has
+            // no marker and is left parked rather than activated empty, and a shard another flow
+            // parks in `ManualRecovery` transiently (e.g. snapshot recovery) is untouched.
+            // Adopted shard whose load definitively FAILED (the `.adopt_failed` marker is present):
+            // it will never activate. Drive it to `Dead` so it is surfaced as unhealthy/queryable
+            // rather than sitting in `ManualRecovery`, indistinguishable from a healthy in-progress
+            // load. Leader-guarded + retried every tick, like activation. Checked before the
+            // activation branch (a failed shard is a `Dummy`, so the activation branch's
+            // `LocalShard` gate would skip it anyway, but ordering makes the intent explicit).
+            if this_peer_state == Some(ManualRecovery) && replica_set.should_fail_adopted().await {
+                let reason = replica_set
+                    .adopt_activation_failure_reason()
+                    .unwrap_or_else(|| "installed data failed to load on restart".to_string());
+                log::debug!(
+                    "marking failed adopted shard {}:{shard_id} Dead: {reason}",
+                    self.name(),
+                );
+                on_fail_adopted(this_peer_id, shard_id);
+                continue;
+            }
+
+            if this_peer_state == Some(ManualRecovery)
+                && replica_set.should_activate_adopted().await
+            {
+                on_activate_adopted(this_peer_id, shard_id);
                 continue;
             }
 
@@ -965,6 +1160,85 @@ impl Collection {
             optimizers_status,
             params: self.collection_config.read().await.params.clone(),
         })
+    }
+
+    /// A clone of the collection's current parameters (topology, vectors, replication, …).
+    pub async fn collection_params(&self) -> CollectionParams {
+        self.collection_config.read().await.params.clone()
+    }
+
+    /// Collection-level HNSW and quantization config. Used by the adoption path to warn when an
+    /// artifact was built for a different config (which would make the optimizer rebuild segments).
+    pub async fn hnsw_and_quantization_config(
+        &self,
+    ) -> (
+        segment::types::HnswConfig,
+        Option<segment::types::QuantizationConfig>,
+    ) {
+        let config = self.collection_config.read().await;
+        (config.hnsw_config, config.quantization_config.clone())
+    }
+
+    /// Verify a staged adopted shard directory (`source`) is compatible with this collection
+    /// before installing it as `shard_id`. Shared by BOTH adoption entry points — the
+    /// `adopt_shards_from` create path and `adopt://` shard-snapshot recovery — so the manifest
+    /// guard is enforced identically on each.
+    ///
+    /// **Refuses** (`Err`, a `bad_request`) a missing `adopt_manifest.json` or a routing /
+    /// vector-shape mismatch: installing either would silently serve a wrong or misrouted subset
+    /// of the keyspace. Returns `Ok(Some(reason))` when only the index config differs (the
+    /// optimizer would rebuild the segments — the caller decides whether to refuse or warn), and
+    /// `Ok(None)` when fully compatible.
+    pub async fn check_adopted_shard_compatible(
+        &self,
+        shard_id: ShardId,
+        source: &std::path::Path,
+    ) -> CollectionResult<Option<String>> {
+        use crate::shards::adopt_manifest::{ADOPT_MANIFEST_FILE, AdoptManifest};
+
+        let manifest_path = AdoptManifest::path_in(source);
+        // This opens the one fixed-name manifest file, and the create path runs it in Phase A —
+        // *before* the Phase B symlink walk — so guard that single read: refuse if the manifest is
+        // itself a symlink (it could point out of the staging root). A missing file is fine (the
+        // `load_opt` below reports it as the missing-manifest refusal).
+        if let Ok(meta) = fs_err::symlink_metadata(&manifest_path)
+            && meta.file_type().is_symlink()
+        {
+            return Err(CollectionError::bad_request(format!(
+                "adopt manifest {} is a symlink; stage a directory of regular files only",
+                manifest_path.display(),
+            )));
+        }
+        let manifest = AdoptManifest::load_opt(&manifest_path)
+            // A manifest that exists but cannot be read/parsed is bad *input* (operator-supplied),
+            // not an internal fault — return `bad_request` (400) rather than a service error (500).
+            .map_err(|err| {
+                CollectionError::bad_request(format!(
+                    "adopt manifest {} could not be read: {err}",
+                    manifest_path.display(),
+                ))
+            })?
+            .ok_or_else(|| {
+                CollectionError::bad_request(format!(
+                    "the artifact for shard {shard_id} has no {ADOPT_MANIFEST_FILE}, so its \
+                     topology and vector shapes cannot be verified against the collection and it \
+                     could serve a misrouted subset. Rebuild the shard with a current tool \
+                     version (which stamps the manifest).",
+                ))
+            })?;
+
+        let params = self.collection_params().await;
+        if let Err(mismatch) = manifest.check_compatible(shard_id, &params) {
+            return Err(CollectionError::bad_request(format!(
+                "the artifact for shard {shard_id} was built for a different collection than this \
+                 one, so adopting it would serve wrong data: {mismatch}. Rebuild the shard for \
+                 this collection's configuration, or create the collection with the configuration \
+                 the artifact was built for.",
+            )));
+        }
+
+        let (hnsw, quant) = self.hnsw_and_quantization_config().await;
+        Ok(manifest.config_rebuild_warning(&params, &hnsw, quant.as_ref()))
     }
 
     pub async fn effective_optimizers_config(&self) -> CollectionResult<OptimizersConfig> {

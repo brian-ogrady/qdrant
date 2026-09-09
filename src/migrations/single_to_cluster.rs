@@ -88,6 +88,9 @@ pub async fn handle_existing_collections(
                 // would let the resolution in `submit_collection_meta_op` substitute this node's
                 // environment value, silently remapping a collection that already has data.
                 hash_ring_shard_scale: Some(params.hash_ring_shard_scale),
+                shard_placement: None,
+                adopt_shards_from: None,
+                adopt_allow_config_rebuild: None,
             },
         )
         .expect("Failed to create collection operation");

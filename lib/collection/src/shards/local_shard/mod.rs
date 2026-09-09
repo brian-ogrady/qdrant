@@ -245,6 +245,15 @@ impl LocalShard {
             tokio_fs::remove_file(applied_seq_path).await?;
         }
 
+        // Clearing the shard's data invalidates the adoption markers: the data the activation
+        // marker vouched for ("installed, awaiting activation") is gone, and a re-adoption of a
+        // previously-failed shard (via `adopt://` recovery, which clears first) should start with a
+        // clean slate. Clearing the activate marker also closes the window where snapshot recovery
+        // re-parks an adopted shard in `ManualRecovery` and a stale marker could make the reconciler
+        // activate it mid-recovery (recovery clears before it moves the new data in).
+        crate::shards::remove_adopt_activate_marker(shard_path);
+        crate::shards::remove_adopt_failed_marker(shard_path);
+
         Ok(())
     }
 

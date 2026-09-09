@@ -232,6 +232,7 @@ pub(super) async fn fixture(
         None,
         ResourceBudget::default(),
         None,
+        None,
     )
     .await
     .unwrap();

@@ -110,6 +110,7 @@ pub async fn new_local_collection(
         None,
         ResourceBudget::default(),
         None,
+        None,
     )
     .await;
 

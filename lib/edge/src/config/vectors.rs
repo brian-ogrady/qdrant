@@ -7,8 +7,9 @@
 use segment::data_types::modifier::Modifier;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use segment::types::{
-    Distance, HnswConfig, Indexes, MultiVectorConfig, QuantizationConfig, SparseVectorDataConfig,
-    SparseVectorStorageType, VectorDataConfig, VectorStorageDatatype, VectorStorageType,
+    Distance, HnswConfig, Indexes, Memory, MultiVectorConfig, QuantizationConfig,
+    SparseVectorDataConfig, SparseVectorStorageType, VectorDataConfig, VectorStorageDatatype,
+    VectorStorageType,
 };
 use serde::{Deserialize, Serialize};
 use shard::optimizers::config::DenseVectorOptimizerConfig;
@@ -132,6 +133,12 @@ pub struct EdgeSparseVectorParams {
     /// If true, sparse index is on disk (mmap); otherwise in RAM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_disk: Option<bool>,
+    /// Memory placement of the sparse index (cold/cached/pinned). Takes precedence over
+    /// the deprecated `on_disk` flag, which cannot express the cold/cached distinction.
+    /// The explicitly requested value is persisted into the built index config, matching
+    /// what a serving node's optimizer records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Memory>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modifier: Option<Modifier>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,6 +155,7 @@ impl EdgeSparseVectorParams {
         let EdgeSparseVectorParams {
             full_scan_threshold,
             on_disk: _,
+            memory,
             modifier,
             datatype,
         } = self;
@@ -156,7 +164,9 @@ impl EdgeSparseVectorParams {
                 full_scan_threshold: *full_scan_threshold,
                 index_type: SparseIndexType::default(),
                 datatype: *datatype,
-                memory: None,
+                // The raw requested placement, matching what the serving optimizer's plain
+                // config carries; the structural decision lives in `index_type`.
+                memory: *memory,
                 // Edge does not expose `wand_pruning`; `None` keeps the default (enabled).
                 wand_pruning: None,
             },
@@ -171,12 +181,13 @@ impl EdgeSparseVectorParams {
         let EdgeSparseVectorParams {
             full_scan_threshold: _,
             on_disk,
+            memory,
             modifier: _,
             datatype: _,
         } = self;
         shard::optimizers::config::SparseVectorOptimizerConfig {
             on_disk: *on_disk,
-            memory: None,
+            memory: *memory,
         }
     }
 
@@ -190,12 +201,13 @@ impl EdgeSparseVectorParams {
             full_scan_threshold,
             index_type,
             datatype,
-            memory: _,
+            memory,
             wand_pruning: _, // not exposed by edge
         } = index;
         Self {
             full_scan_threshold: *full_scan_threshold,
             on_disk: Some(index_type.is_on_disk()),
+            memory: *memory,
             modifier: *modifier,
             datatype: *datatype,
         }

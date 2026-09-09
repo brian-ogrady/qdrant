@@ -92,6 +92,7 @@ async fn new_collection(path: &Path) -> Collection {
         None,
         ResourceBudget::default(),
         None,
+        None,
     )
     .await
     .unwrap()

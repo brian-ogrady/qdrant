@@ -276,9 +276,14 @@ async fn _do_recover_from_snapshot(
 
     // Deactivate collection local shards during recovery
     for (shard_id, shard_info) in &state.shards {
-        let local_shard_state = shard_info.replicas.get(&this_peer_id);
-        match local_shard_state {
-            Some(state) if state != &recovery_state => {
+        // Only local shards (present on this peer) are re-parked; a shard not on this node is
+        // skipped.
+        if let Some(state) = shard_info.replicas.get(&this_peer_id) {
+            // Clear any stale adoption markers before this shard spends the recovery window in
+            // `ManualRecovery`: otherwise the reconciler could see a lingering marker and propose
+            // `Active` (serving stale pre-recovery data) or `Dead`, racing the recovery.
+            collection.remove_adopt_markers(*shard_id).await;
+            if state != &recovery_state {
                 toc.send_set_replica_state_proposal(
                     collection_pass.to_string(),
                     this_peer_id,
@@ -287,7 +292,6 @@ async fn _do_recover_from_snapshot(
                     None,
                 )?;
             }
-            Some(_) | None => {} // Shard is not on this node, skip
         }
     }
 

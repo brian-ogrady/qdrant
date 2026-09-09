@@ -1257,6 +1257,7 @@ impl From<&edge::EdgeConfig> for EdgeConfig {
                     // Storage placement is fixed by the FFI write path and not
                     // surfaced back.
                     on_disk: _,
+                    memory: _,
                     modifier,
                     datatype,
                 } = p;

@@ -215,6 +215,48 @@ pub async fn recover_shard_snapshot(
                 snapshot,
                 hash
             } = match snapshot_location {
+                // Adopt a fully built local shard directory: consumed by rename, no copy.
+                // Gated by `storage.shard_adoption_path` and validated (containment,
+                // same filesystem) before anything is touched. No download, no checksum —
+                // there is no transfer whose integrity a checksum would attest.
+                ShardSnapshotLocation::Url(url) if url.scheme() == "adopt" => {
+                    if checksum.is_some() {
+                        return Err(StorageError::bad_input(
+                            "adopt:// locations do not support checksums: nothing is \
+                             transferred, the local directory is installed as-is",
+                        ));
+                    }
+
+                    let collections_dir = toc.collections_dir_path();
+                    let source = snapshots::adopt::resolve_adoption_source(
+                        toc.shard_adoption_path(),
+                        &url,
+                        &[&download_dir, &collections_dir],
+                    )?;
+
+                    // Enforce the same adopt-manifest guard as the `adopt_shards_from` create
+                    // path: refuse a missing manifest or a routing / vector-shape mismatch (either
+                    // would install a misrouted subset). An index-config difference is only
+                    // expensive (an optimizer rebuild), and this recovery API has no
+                    // `adopt_allow_config_rebuild` override, so it is warned rather than refused.
+                    if let Some(consequence) = collection
+                        .check_adopted_shard_compatible(shard_id, &source)
+                        .await?
+                    {
+                        log::warn!(
+                            "recovering shard {shard_id} of `{}` via adopt:// with a different \
+                             index config than the artifact was built for; the optimizer will \
+                             rebuild the adopted segments: {consequence}",
+                            collection.name(),
+                        );
+                    }
+
+                    DownloadResult {
+                        snapshot: SnapshotData::Adopted(source),
+                        hash: None,
+                    }
+                }
+
                 ShardSnapshotLocation::Url(url) => {
                     if !matches!(url.scheme(), "http" | "https") {
                         let description = format!(

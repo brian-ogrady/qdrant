@@ -599,13 +599,26 @@ impl Collection {
                 );
                 replica_set.init_empty_local_shard().await?;
 
+                // Clear any lingering collection-level adoption in-progress marker BEFORE removing
+                // the dirty flag. This shard is being rebuilt by transfer, so a marker left over
+                // from a prior interrupted adoption is stale and must not make a later restart's
+                // load-time resolution act on this now-healthy shard. The ORDER is load-bearing: if
+                // a crash lands between the two removals, losing the marker first leaves (marker
+                // gone + flag present) — a dirty dummy → Dead → retransfer, which is safe. The
+                // reverse (marker present + flag gone) over the freshly-emptied local shard is
+                // exactly the salvage-empty state the load-time resolution must never see.
+                crate::shards::remove_adopt_in_progress_marker(&collection_path, shard_id);
+
                 let shard_flag = shard_initializing_flag_path(&collection_path, shard_id);
 
-                if tokio_fs::try_exists(&shard_flag).await.is_ok() {
-                    // We can delete initializing flag without waiting for transfer to finish
-                    // because if transfer fails in between, Qdrant will retry it.
-                    tokio_fs::remove_file(&shard_flag).await?;
-                    log::debug!("Removed shard initializing flag {shard_flag:?}");
+                // Remove the dirty flag if present, tolerating its absence (a flag-less dummy) and a
+                // concurrent removal (e.g. a racing drop) rather than failing the transfer on a
+                // spurious `NotFound`. We can delete it without waiting for the transfer to finish:
+                // if the transfer fails in between, Qdrant retries it.
+                match tokio_fs::remove_file(&shard_flag).await {
+                    Ok(()) => log::debug!("Removed shard initializing flag {shard_flag:?}"),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err.into()),
                 }
             }
 

@@ -179,12 +179,15 @@ impl ChannelService {
         let id_to_address = self.id_to_address.read();
         let id_to_metadata = self.id_to_metadata.read();
 
-        // Ensure there aren't more peer addresses than metadata
-        if id_to_address.len() > id_to_metadata.len() {
-            let peers_without_metadata: HashMap<_, _> = id_to_address
-                .iter()
-                .filter(|(id, _uri)| !id_to_metadata.contains_key(id))
-                .collect();
+        // Every known peer address must have published metadata. A pure length comparison is not
+        // sufficient: a departed peer's lingering metadata (pruned only at restart) can numerically
+        // balance a freshly-joined peer that has an address but no metadata yet, letting an unproven
+        // peer slip through. Require per-key coverage instead.
+        let peers_without_metadata: HashMap<_, _> = id_to_address
+            .iter()
+            .filter(|(id, _uri)| !id_to_metadata.contains_key(id))
+            .collect();
+        if !peers_without_metadata.is_empty() {
             log::info!(
                 "Not all peers at version:{version} because there are peers without metadata:{peers_without_metadata:?}"
             );
@@ -230,6 +233,41 @@ impl ChannelService {
             .read()
             .get(&peer_id)
             .is_some_and(|metadata| &metadata.version >= version)
+    }
+
+    /// Whether every known peer is running THIS research fork
+    pub fn all_peers_are_fork(&self) -> bool {
+        let our_build = common::defaults::QDRANT_VERSION.build.as_str();
+        if our_build.is_empty() {
+            return false;
+        }
+
+        let id_to_address = self.id_to_address.read();
+        let id_to_metadata = self.id_to_metadata.read();
+
+        // Every known peer address must have published metadata — a pure length comparison can be
+        // masked by a departed peer's lingering metadata balancing a metadata-less (possibly
+        // non-fork) peer, so require per-key coverage.
+        let peers_without_metadata: HashMap<_, _> = id_to_address
+            .iter()
+            .filter(|(id, _uri)| !id_to_metadata.contains_key(id))
+            .collect();
+        if !peers_without_metadata.is_empty() {
+            log::info!(
+                "Not all peers are the fork build `{our_build}`: peers without metadata:{peers_without_metadata:?}",
+            );
+            return false;
+        }
+
+        let all = id_to_metadata
+            .values()
+            .all(|metadata| metadata.version.build.as_str() == our_build);
+        if !all {
+            log::info!(
+                "Not all peers are the fork build `{our_build}` — a peer is running a different build: {id_to_metadata:?}",
+            );
+        }
+        all
     }
 
     /// Get the REST address for the current peer.

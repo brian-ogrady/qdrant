@@ -86,6 +86,7 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
         None,
         ResourceBudget::default(),
         None,
+        None,
     )
     .await
     .unwrap();

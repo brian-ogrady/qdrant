@@ -148,6 +148,7 @@ async fn test_wal_less_snapshot_clocks_not_ahead_of_data() {
         None,
         ResourceBudget::default(),
         None,
+        None,
     )
     .await
     .unwrap();

@@ -152,3 +152,34 @@ impl AdvanceStatus {
         assert_eq!(expected_status, self.accepted);
     }
 }
+
+#[test]
+fn adopt_in_progress_marker_roundtrip() {
+    use crate::shards::{
+        adopt_in_progress_marker_path, has_adopt_in_progress_marker,
+        remove_adopt_in_progress_marker, write_adopt_in_progress_marker,
+    };
+
+    let collection_dir = tempfile::Builder::new()
+        .prefix("adopt-inprogress")
+        .tempdir()
+        .unwrap();
+    let cp = collection_dir.path();
+
+    // Keyed by shard id, lives in the collection dir (not a shard dir).
+    assert_eq!(
+        adopt_in_progress_marker_path(cp, 3),
+        cp.join(".adopt_in_progress_3"),
+    );
+
+    // Absent by default; independent per shard id.
+    assert!(!has_adopt_in_progress_marker(cp, 3));
+    write_adopt_in_progress_marker(cp, 3).unwrap();
+    assert!(has_adopt_in_progress_marker(cp, 3));
+    assert!(!has_adopt_in_progress_marker(cp, 4));
+
+    // Removal is idempotent and scoped to the one shard id.
+    remove_adopt_in_progress_marker(cp, 3);
+    assert!(!has_adopt_in_progress_marker(cp, 3));
+    remove_adopt_in_progress_marker(cp, 3); // no-op, must not panic
+}

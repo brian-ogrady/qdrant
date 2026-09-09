@@ -38,6 +38,7 @@ fn test_storage_config(storage_path: &Path) -> StorageConfig {
         snapshots_path: storage_path.join("snapshots"),
         snapshots_config: SnapshotsConfig::default(),
         temp_path: None,
+        shard_adoption_path: None,
         on_disk_payload: false,
         payload: None,
         optimizers: OptimizersConfig {

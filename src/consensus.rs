@@ -1707,6 +1707,9 @@ mod tests {
                                 uuid: None,
                                 metadata: None,
                                 hash_ring_shard_scale: None,
+                                shard_placement: None,
+                                adopt_shards_from: None,
+                                adopt_allow_config_rebuild: None,
                             },
                         )
                         .unwrap(),

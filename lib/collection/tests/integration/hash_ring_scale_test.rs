@@ -105,6 +105,7 @@ async fn new_custom_collection(path: &Path, config: &CollectionConfigInternal) -
         None,
         ResourceBudget::default(),
         None,
+        None,
     )
     .await
     .unwrap()

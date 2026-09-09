@@ -6,6 +6,13 @@ pub enum SnapshotData {
     Packed(MaybeTempPath),
     /// Directory containing the unpacked snapshot
     Unpacked(TempDir),
+    /// Local unpacked shard directory to be **consumed by rename** — no copy.
+    ///
+    /// The adopt recovery path (`adopt://` snapshot locations): the directory is renamed
+    /// into the recovery area atomically, so it must live on the same filesystem as the
+    /// storage. On failure the recovery path renames it back rather than deleting it —
+    /// unlike the variants above, this data is the operator's artifact, not our download.
+    Adopted(std::path::PathBuf),
 }
 
 impl SnapshotData {
@@ -18,6 +25,7 @@ impl SnapshotData {
         match self {
             SnapshotData::Packed(maybe_path) => maybe_path,
             SnapshotData::Unpacked(temp_dir) => temp_dir.path(),
+            SnapshotData::Adopted(path) => path,
         }
     }
 }

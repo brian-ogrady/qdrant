@@ -4,7 +4,7 @@
 //! field to the target struct forces a compile error here.
 
 use segment::data_types::modifier::Modifier;
-use segment::types::VectorStorageDatatype;
+use segment::types::{Memory, VectorStorageDatatype};
 
 use crate::config::vectors::EdgeSparseVectorParams;
 
@@ -16,6 +16,7 @@ use crate::config::vectors::EdgeSparseVectorParams;
 pub struct EdgeSparseVectorParamsBuilder {
     full_scan_threshold: Option<usize>,
     on_disk: Option<bool>,
+    memory: Option<Memory>,
     modifier: Option<Modifier>,
     datatype: Option<VectorStorageDatatype>,
 }
@@ -36,6 +37,13 @@ impl EdgeSparseVectorParamsBuilder {
         self
     }
 
+    /// Memory placement of the sparse index (cold/cached/pinned). Takes precedence over
+    /// the deprecated [`Self::on_disk`] flag.
+    pub fn memory(mut self, memory: Memory) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
     pub fn modifier(mut self, modifier: Modifier) -> Self {
         self.modifier = Some(modifier);
         self
@@ -52,12 +60,14 @@ impl EdgeSparseVectorParamsBuilder {
         let Self {
             full_scan_threshold,
             on_disk,
+            memory,
             modifier,
             datatype,
         } = self;
         EdgeSparseVectorParams {
             full_scan_threshold,
             on_disk,
+            memory,
             modifier,
             datatype,
         }

@@ -192,6 +192,7 @@ fn requested_vector_params(config: &VectorNameConfig) -> RequestedVectorParams {
             RequestedVectorParams::Sparse(EdgeSparseVectorParams {
                 full_scan_threshold: None,
                 on_disk: None,
+                memory: None,
                 modifier: wrapper.sparse.modifier,
                 datatype: wrapper.sparse.datatype,
             })
