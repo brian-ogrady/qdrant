@@ -131,7 +131,7 @@ pub fn bytes_per_point(config: &LoadedConfig) -> Result<u64> {
     Ok(total)
 }
 
-/// Build the plan for every shard that has scattered data.
+/// Build the plan for every configured shard.
 /// How a plan run is tuned.
 pub struct PlanOptions {
     /// Threads reading part metadata.
@@ -206,22 +206,46 @@ pub fn build(
             .partition(|shard_id| !ShardPlan::path_in(work, *shard_id).exists())
     };
 
+    // The unit of progress is a part file, not a shard: there are ten shards and a hundred thousand
+    // parts, so shard granularity would report almost nothing for almost all of the run.
+    let part_names = discover_part_names(layout, &pending)?;
+
+    // An adoption artifact is a shard, not merely a bag of non-empty segments. Omitting an empty
+    // shard here used to let scatter -> plan -> build -> assemble report success for only the
+    // populated subset of `shard_number`; the missing shard then had no artifact to install.
+    //
+    // Fail before writing *any* plans for this invocation. That makes the condition obvious and
+    // prevents a partial plan directory from looking like a usable collection. A distributed
+    // `--slice` checks its own assigned shards, so every planner reaches the same conclusion for
+    // the shard it owns.
+    let empty_shards: Vec<ShardId> = pending
+        .iter()
+        .copied()
+        .filter(|shard_id| part_names.get(shard_id).is_none_or(Vec::is_empty))
+        .collect();
+    if !empty_shards.is_empty() {
+        bail!(
+            "cannot build a complete shard set: configured shard(s) {empty_shards:?} contain no \
+             scattered points. The shard builder requires every shard to be non-empty; reduce \
+             params.shard_number, supply more data, or use Qdrant's normal empty-shard creation \
+             path instead of offline adoption."
+        );
+    }
+
     let plan_dir = work.join("plan");
     fs_err::create_dir_all(&plan_dir)
         .with_context(|| format!("cannot create {}", plan_dir.display()))?;
 
-    // The unit of progress is a part file, not a shard: there are ten shards and a hundred thousand
-    // parts, so shard granularity would report almost nothing for almost all of the run.
-    let part_names = discover_part_names(layout, &pending)?;
     let total_parts: usize = part_names.values().map(Vec::len).sum();
     let progress = crate::progress::Progress::new("plan", "part", total_parts as u64);
 
     let mut plans = Vec::new();
     for shard_id in &pending {
-        let names = part_names.get(shard_id).cloned().unwrap_or_default();
-        if names.is_empty() {
-            continue;
-        }
+        // Checked non-empty above, before this invocation wrote any plans.
+        let names = part_names
+            .get(shard_id)
+            .expect("empty shards rejected before planning")
+            .clone();
 
         let parts = read_part_metas(config, layout, *shard_id, names, workers, &progress)?;
         let segments = group_into_segments(
@@ -683,6 +707,35 @@ mod tests {
         .unwrap();
         assert_eq!(forced.plans.len(), 4, "--replan redoes them");
         assert_eq!(forced.shards_skipped, 0);
+    }
+
+    /// Offline adoption needs an artifact for every configured shard. A shard with no parts
+    /// cannot produce one, so fail before leaving a partial set of plans behind.
+    #[test]
+    fn planning_refuses_an_empty_shard_before_writing_plans() {
+        let config = planning_config(4);
+        let router = ShardRouter::new(&config).unwrap();
+        let dir = work_dir(4, 2, 50);
+        fs_err::remove_dir_all(dir.path().join("shard_2")).unwrap();
+        let layout = crate::scatter::ScatterLayout::new(dir.path());
+
+        let err = build(
+            &config,
+            &router,
+            &layout,
+            dir.path(),
+            &options(2, None, false),
+        )
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("shard(s) [2] contain no scattered points"),
+            "{text}"
+        );
+        assert!(
+            !dir.path().join("plan").exists(),
+            "an empty shard must fail before any plans are written"
+        );
     }
 
     /// Slices divide the shards, so several machines can plan one work directory.
