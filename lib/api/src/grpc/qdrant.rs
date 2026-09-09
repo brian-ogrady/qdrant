@@ -1259,6 +1259,50 @@ pub struct CreateCollection {
     /// Immutable once the collection exists. If unset, the service default is used.
     #[prost(uint32, optional, tag = "20")]
     pub hash_ring_shard_scale: ::core::option::Option<u32>,
+    /// Explicit shard placement: shard id -> peers, one entry per replica. Overrides the automatic
+    /// even distribution so shards are created on the peers that already hold their data (see
+    /// adopt_shards_from). Requires cluster mode, sharding_method AUTO, and explicit shard_number
+    /// and replication_factor matching the placement.
+    #[prost(map = "uint32, message", tag = "21")]
+    pub shard_placement: ::std::collections::HashMap<u32, ShardPlacement>,
+    /// Adopt fully built shard directories at creation instead of creating empty shards: each peer
+    /// installs `<storage.shard_adoption_path>/<this value>/shard_{id}` for every local replica it
+    /// is assigned, consumed by an atomic rename (no copy). A relative path under each peer's
+    /// configured staging root.
+    #[prost(string, optional, tag = "22")]
+    pub adopt_shards_from: ::core::option::Option<::prost::alloc::string::String>,
+    /// Override for adopt_shards_from: proceed even when the collection's HNSW/quantization config
+    /// differs from what the artifacts were built with. Such a mismatch is refused by default
+    /// because it makes the optimizer rebuild every adopted segment (expensive at scale) and is
+    /// usually accidental. Set true only when reconfiguration-on-adopt is intended.
+    #[prost(bool, optional, tag = "23")]
+    pub adopt_allow_config_rebuild: ::core::option::Option<bool>,
+}
+/// The peers holding one shard's replicas, for explicit CreateCollection placement.
+#[derive(serde::Serialize)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShardPlacement {
+    #[prost(message, repeated, tag = "1")]
+    pub peers: ::prost::alloc::vec::Vec<ShardPlacementPeer>,
+}
+/// A single replica's peer, named either by numeric id or by the p2p URI it was started with
+/// (as reported by the /cluster endpoint).
+#[derive(serde::Serialize)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ShardPlacementPeer {
+    #[prost(oneof = "shard_placement_peer::Peer", tags = "1, 2")]
+    pub peer: ::core::option::Option<shard_placement_peer::Peer>,
+}
+/// Nested message and enum types in `ShardPlacementPeer`.
+pub mod shard_placement_peer {
+    #[derive(serde::Serialize)]
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Peer {
+        #[prost(uint64, tag = "1")]
+        PeerId(u64),
+        #[prost(string, tag = "2")]
+        Uri(::prost::alloc::string::String),
+    }
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]

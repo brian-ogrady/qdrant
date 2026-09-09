@@ -34,7 +34,7 @@ use validator::Validate;
 #[cfg(feature = "staging")]
 pub use super::staging::{TestSlowDown, TestTransientError};
 use crate::content_manager::errors::{StorageError, StorageResult};
-use crate::content_manager::shard_distribution::ShardDistributionProposal;
+use crate::content_manager::shard_distribution::{PeerRef, ShardDistributionProposal};
 
 // *Operation wrapper structure is only required for better OpenAPI generation
 
@@ -197,6 +197,28 @@ pub struct CreateCollection {
     #[serde(default)]
     #[validate(range(min = 1, max = 100_000))]
     pub hash_ring_shard_scale: Option<u32>,
+    /// Explicit shard placement that overrides the automatic even
+    /// distribution. Requires cluster mode, `sharding_method: auto`,
+    /// and explicit `shard_number` and `replication_factor` matching
+    /// the placement exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_placement: Option<std::collections::BTreeMap<ShardId, Vec<PeerRef>>>,
+
+    /// A relative path for fully built shard directories
+    /// under each peer's configured staging root; every peer
+    /// that is assigned a replica must have the matching artifact staged, or
+    /// its part of the creation fails (the artifact, if any, is left in
+    /// place). Combine with `shard_placement` to put shards where their data
+    /// already is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopt_shards_from: Option<String>,
+    /// Opt-in override for `adopt_shards_from`: proceed even when the collection's HNSW /
+    /// quantization config differs from what the artifacts were built with. By default such a
+    /// mismatch is refused, because it makes the optimizer rebuild every adopted segment
+    /// (expensive at scale) and is usually an accidental config change. Set to `true` only when
+    /// the reconfiguration-on-adopt is intended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopt_allow_config_rebuild: Option<bool>,
 }
 
 /// Operation for creating new collection and (optionally) specify index params
@@ -223,6 +245,51 @@ impl CreateCollectionOperation {
         create_collection.validate().map_err(|errs| {
             StorageError::bad_input(validation::label_errors("Validation error in body", &errs))
         })?;
+
+        // Syntactic check only
+        if let Some(staging_subdir) = &create_collection.adopt_shards_from {
+            crate::content_manager::snapshots::adopt::validate_staging_subdir(staging_subdir)?;
+
+            // Adoption requires auto sharding
+            if create_collection.sharding_method.unwrap_or_default() != ShardingMethod::Auto {
+                return Err(StorageError::bad_input(
+                    "`adopt_shards_from` requires `sharding_method: auto`: adoption installs \
+                     hash-ring-routed shards built for auto sharding, and a custom-sharding \
+                     collection creates its shards later via the shard-key API rather than \
+                     adopting pre-built artifacts."
+                        .to_string(),
+                ));
+            }
+
+            // Require a single replica per shard for the adoption path
+            if create_collection
+                .replication_factor
+                .is_some_and(|rf| rf > 1)
+            {
+                return Err(StorageError::bad_input(
+                    "`adopt_shards_from` requires `replication_factor` of 1: adopted shards are \
+                     not reconciled between replicas, so a higher replication factor could leave \
+                     replicas of the same shard serving different data. Restore with \
+                     `replication_factor` 1, then raise it afterwards — the new replicas are \
+                     filled by transfer from the adopted one."
+                        .to_string(),
+                ));
+            }
+            // Require a single peer per shard for the adoption path
+            if let Some(placement) = &create_collection.shard_placement
+                && let Some((shard_id, peers)) = placement.iter().find(|(_, peers)| peers.len() > 1)
+            {
+                return Err(StorageError::bad_input(format!(
+                    "`adopt_shards_from` requires a single peer per shard, but shard \
+                     {shard_id} is placed on {} peers: adopted shards are not reconciled \
+                     between replicas, so multiple replicas of one shard could serve \
+                     different data. Place one peer per shard, then raise the replication \
+                     factor afterwards — the new replicas are filled by transfer from the \
+                     adopted one.",
+                    peers.len(),
+                )));
+            }
+        }
 
         // Apply the same vector-name validation that the
         // `PUT /collections/{name}/vectors/{vector_name}` endpoint enforces
@@ -564,6 +631,122 @@ impl From<CollectionConfigInternal> for CreateCollection {
             // Carried over rather than left for the environment to fill in: this conversion exists
             // to reproduce an existing collection's config, and the scale is part of it.
             hash_ring_shard_scale: Some(hash_ring_shard_scale),
+            // One-shot creation directives, not collection config: nothing to reproduce.
+            shard_placement: None,
+            adopt_shards_from: None,
+            adopt_allow_config_rebuild: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod adoption_guard_tests {
+    use super::*;
+
+    fn create_op(value: serde_json::Value) -> StorageResult<CreateCollectionOperation> {
+        let create: CreateCollection =
+            serde_json::from_value(value).expect("valid CreateCollection json");
+        CreateCollectionOperation::new("c".to_string(), create)
+    }
+
+    /// A minimal request that passes the derived `Validate` checks, so tests exercise the
+    /// adoption guard rather than tripping unrelated validation.
+    fn base() -> serde_json::Value {
+        serde_json::json!({ "vectors": { "size": 4, "distance": "Cosine" } })
+    }
+
+    #[test]
+    fn adoption_refuses_replication_factor_above_one() {
+        let mut v = base();
+        v["adopt_shards_from"] = "web".into();
+        v["replication_factor"] = 2.into();
+        let err = create_op(v).expect_err("rf>1 with adoption must be refused");
+        assert!(err.to_string().contains("replication_factor"), "got: {err}");
+    }
+
+    #[test]
+    fn adoption_allows_replication_factor_one() {
+        let mut v = base();
+        v["adopt_shards_from"] = "web".into();
+        v["replication_factor"] = 1.into();
+        create_op(v).expect("rf=1 with adoption is allowed");
+    }
+
+    #[test]
+    fn adoption_allows_default_replication_factor() {
+        let mut v = base();
+        v["adopt_shards_from"] = "web".into();
+        create_op(v).expect("default rf (1) with adoption is allowed");
+    }
+
+    #[test]
+    fn adoption_refuses_placement_with_multiple_peers_on_a_shard() {
+        let mut v = base();
+        v["adopt_shards_from"] = "web".into();
+        v["shard_number"] = 1.into();
+        // Untagged PeerRef: bare numbers are peer ids. Two peers on shard 0.
+        v["shard_placement"] = serde_json::json!({ "0": [1, 2] });
+        let err = create_op(v).expect_err("multi-peer placement with adoption must be refused");
+        assert!(
+            err.to_string().contains("single peer per shard"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn adoption_allows_placement_with_one_peer_per_shard() {
+        let mut v = base();
+        v["adopt_shards_from"] = "web".into();
+        v["shard_number"] = 2.into();
+        v["shard_placement"] = serde_json::json!({ "0": [1], "1": [2] });
+        create_op(v).expect("one peer per shard with adoption is allowed");
+    }
+
+    #[test]
+    fn multi_peer_placement_without_adoption_is_not_this_guard_s_business() {
+        // Without `adopt_shards_from` the guard does not fire; a multi-peer placement is validated
+        // later during placement resolution, not here.
+        let mut v = base();
+        v["shard_number"] = 1.into();
+        v["replication_factor"] = 2.into();
+        v["shard_placement"] = serde_json::json!({ "0": [1, 2] });
+        create_op(v).expect("no adoption => adoption guard is inert");
+    }
+
+    #[test]
+    fn adoption_refuses_custom_sharding() {
+        // Custom sharding creates no shards at create time, so `adopt_shards_from` would silently
+        // adopt nothing; it must be refused up front.
+        let mut v = base();
+        v["adopt_shards_from"] = "web".into();
+        v["sharding_method"] = "custom".into();
+        let err = create_op(v).expect_err("custom sharding with adoption must be refused");
+        assert!(
+            err.to_string().contains("sharding_method: auto"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn adoption_allows_auto_sharding() {
+        let mut v = base();
+        v["adopt_shards_from"] = "web".into();
+        v["sharding_method"] = "auto".into();
+        create_op(v).expect("auto sharding with adoption is allowed");
+    }
+
+    #[test]
+    fn adoption_allows_default_sharding_method() {
+        // Omitted `sharding_method` defaults to auto, which adoption allows.
+        let mut v = base();
+        v["adopt_shards_from"] = "web".into();
+        create_op(v).expect("default (auto) sharding with adoption is allowed");
+    }
+
+    #[test]
+    fn custom_sharding_without_adoption_is_not_this_guard_s_business() {
+        let mut v = base();
+        v["sharding_method"] = "custom".into();
+        create_op(v).expect("no adoption => sharding-method guard is inert");
     }
 }

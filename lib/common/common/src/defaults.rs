@@ -6,8 +6,11 @@ use semver::Version;
 
 use crate::cpu;
 
-/// Current Qdrant version string
-pub const QDRANT_VERSION_STRING: &str = "1.19.1";
+/// Build-metadata tag that marks this research fork's binaries.
+pub const QDRANT_FORK_BUILD_TAG: &str = "qdrant-labs";
+
+/// Current Qdrant version string. Carries the fork build tag ([`QDRANT_FORK_BUILD_TAG`])
+pub const QDRANT_VERSION_STRING: &str = "1.19.1+qdrant-labs";
 
 /// Current Qdrant semver version
 pub static QDRANT_VERSION: LazyLock<Version> =

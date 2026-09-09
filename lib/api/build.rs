@@ -6,11 +6,26 @@ use common::defaults;
 use tonic_prost_build::Builder;
 
 fn main() -> std::io::Result<()> {
-    // Ensure Qdrant version is configured correctly
+    // Ensure Qdrant version is configured correctly.
+    //
+    // `defaults::QDRANT_VERSION_STRING` carries this research fork's SemVer *build metadata* tag
+    // (e.g. `1.19.1+qdrant-labs`), while the crate version in Cargo.toml deliberately does not —
+    // Cargo tooling is unhappy with build metadata in a package version. So compare only the
+    // release part (major.minor.patch and any pre-release, i.e. everything before `+`) against the
+    // crate version, then separately assert the build tag is exactly the fork tag.
+    let release = defaults::QDRANT_VERSION_STRING
+        .split('+')
+        .next()
+        .expect("version string is non-empty");
     assert_eq!(
-        defaults::QDRANT_VERSION.to_string(),
+        release,
         env!("CARGO_PKG_VERSION"),
-        "crate version does not match with defaults.rs",
+        "crate version does not match with defaults.rs (release part, ignoring build metadata)",
+    );
+    assert_eq!(
+        defaults::QDRANT_VERSION.build.as_str(),
+        defaults::QDRANT_FORK_BUILD_TAG,
+        "defaults.rs QDRANT_VERSION_STRING must carry the fork build tag as build metadata",
     );
 
     // Since `tonic` 0.14 (when `tonic-build` was refactored into `tonic-prost-build`),

@@ -579,6 +579,35 @@ message CreateCollection {
   // evenly across shards, at the cost of more memory per ring and slightly slower shard lookup.
   // Immutable once the collection exists. If unset, the service default is used.
   optional uint32 hash_ring_shard_scale = 20;
+  // Explicit shard placement: shard id -> peers, one entry per replica. Overrides the automatic
+  // even distribution so shards are created on the peers that already hold their data (see
+  // adopt_shards_from). Requires cluster mode, sharding_method AUTO, and explicit shard_number
+  // and replication_factor matching the placement.
+  map<uint32, ShardPlacement> shard_placement = 21;
+  // Adopt fully built shard directories at creation instead of creating empty shards: each peer
+  // installs `<storage.shard_adoption_path>/<this value>/shard_{id}` for every local replica it
+  // is assigned, consumed by an atomic rename (no copy). A relative path under each peer's
+  // configured staging root.
+  optional string adopt_shards_from = 22;
+  // Override for adopt_shards_from: proceed even when the collection's HNSW/quantization config
+  // differs from what the artifacts were built with. Such a mismatch is refused by default
+  // because it makes the optimizer rebuild every adopted segment (expensive at scale) and is
+  // usually accidental. Set true only when reconfiguration-on-adopt is intended.
+  optional bool adopt_allow_config_rebuild = 23;
+}
+
+// The peers holding one shard's replicas, for explicit CreateCollection placement.
+message ShardPlacement {
+  repeated ShardPlacementPeer peers = 1;
+}
+
+// A single replica's peer, named either by numeric id or by the p2p URI it was started with
+// (as reported by the /cluster endpoint).
+message ShardPlacementPeer {
+  oneof peer {
+    uint64 peer_id = 1;
+    string uri = 2;
+  }
 }
 
 message UpdateCollection {

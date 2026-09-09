@@ -74,6 +74,16 @@ impl Dispatcher {
                 .all_known_peers_at_version(&collection::hash_ring::HASH_RING_SHARD_SCALE_VERSION)
     }
 
+    /// Whether the fields `shard_placement` and `adopt_shards_from` can safely go
+    /// into consensus
+    pub fn shard_adoption_fields_supported(&self) -> bool {
+        self.consensus_state.is_none() || {
+            let channel_service = self.toc.get_channel_service();
+            channel_service.all_peers_at_version(&collection::hash_ring::SHARD_ADOPTION_VERSION)
+                && channel_service.all_peers_are_fork()
+        }
+    }
+
     /// Reject a *client-requested* non-default scale that consensus cannot carry safely yet.
     pub fn check_hash_ring_shard_scale_requestable(
         &self,
@@ -173,6 +183,16 @@ impl Dispatcher {
             op.create_collection.hash_ring_shard_scale = Some(scale);
         }
 
+        // Refuse the one-call restore fields when any peer is too old to understand them.
+        if let CollectionMetaOperations::CreateCollection(op) = &operation {
+            check_shard_adoption_fields_requestable(
+                &op.collection_name,
+                op.create_collection.shard_placement.is_some(),
+                op.create_collection.adopt_shards_from.is_some(),
+                self.shard_adoption_fields_supported(),
+            )?;
+        }
+
         // if distributed deployment is enabled
         if let Some(state) = self.consensus_state.as_ref() {
             let start = Instant::now();
@@ -180,8 +200,34 @@ impl Dispatcher {
             // List of operations to await for collection to be operational
             let mut expect_operations: Vec<ConsensusOperations> = vec![];
 
+            // Set for a one-call restore (`adopt_shards_from`): after the create commits, the
+            // adopted replicas are activated per-peer (see `activate_adopted_shard`), and this
+            // peer must not report a clean success while a shard on any peer is still parked.
+            // Captured here because `op` is moved into the consensus op below.
+            let mut adopted_collection: Option<String> = None;
+
             let op = match operation {
                 CollectionMetaOperations::CreateCollection(mut op) => {
+                    if op.create_collection.adopt_shards_from.is_some() {
+                        adopted_collection = Some(op.collection_name.clone());
+
+                        // In a cluster, `adopt_shards_from` REQUIRES explicit `shard_placement`.
+                        // Without it the create falls through to randomized auto-distribution, which
+                        // on any nontrivial cluster assigns some shard to a peer that does not hold
+                        // its staged artifact — that shard is then parked and the create reports a
+                        // (misleading) success. Requiring placement makes every shard land on a peer
+                        // that staged it. (Single-node takes a different code path and needs no
+                        // placement — every shard is local.)
+                        if op.create_collection.shard_placement.is_none() {
+                            return Err(StorageError::bad_request(
+                                "`adopt_shards_from` requires `shard_placement` in a cluster: \
+                                 without it, shards are distributed randomly across peers and will \
+                                 not land on the peers holding their staged artifacts. Map each \
+                                 shard to the peer(s) that staged it via `shard_placement`."
+                                    .to_string(),
+                            ));
+                        }
+                    }
                     // Only resolve the shard distribution if it is not already set
                     if !op.is_distribution_set() {
                         if let Some(placement) = &op.create_collection.shard_placement {
@@ -193,15 +239,23 @@ impl Dispatcher {
                                     op.create_collection.sharding_method.unwrap_or_default(),
                                     &state.0.peer_address_by_id(),
                                 )?;
-                            for (shard_id, peer_ids) in &explicit.distribution {
-                                for peer_id in peer_ids {
-                                    expect_operations.push(
-                                        ConsensusOperations::initialize_replica(
-                                            op.collection_name.clone(),
-                                            *shard_id,
-                                            *peer_id,
-                                        ),
-                                    );
+                            // Await activation only when the shards are built `Initializing`
+                            // and activated via `initialize_replica`. With `adopt_shards_from`
+                            // the shards are built parked (`ManualRecovery`) and activated via
+                            // a different transition once their data lands — and a shard whose
+                            // artifact is missing is meant to stay parked — so awaiting
+                            // `initialize_replica` here would only ever time out.
+                            if op.create_collection.adopt_shards_from.is_none() {
+                                for (shard_id, peer_ids) in &explicit.distribution {
+                                    for peer_id in peer_ids {
+                                        expect_operations.push(
+                                            ConsensusOperations::initialize_replica(
+                                                op.collection_name.clone(),
+                                                *shard_id,
+                                                *peer_id,
+                                            ),
+                                        );
+                                    }
                                 }
                             }
                             op.set_distribution(explicit);
@@ -220,16 +274,28 @@ impl Dispatcher {
                                         number_of_peers,
                                     );
 
-                                    // Expect all replicas to become active eventually
-                                    for (shard_id, peer_ids) in &shard_distribution.distribution {
-                                        for peer_id in peer_ids {
-                                            expect_operations.push(
-                                                ConsensusOperations::initialize_replica(
-                                                    op.collection_name.clone(),
-                                                    *shard_id,
-                                                    *peer_id,
-                                                ),
-                                            );
+                                    // Expect all replicas to become active eventually — but only when
+                                    // they are built `Initializing` and activated via
+                                    // `initialize_replica`. With `adopt_shards_from` the shards are
+                                    // built parked (`ManualRecovery`) and activated by a different
+                                    // transition once their data lands (a missing artifact stays
+                                    // parked on purpose), so awaiting `initialize_replica` here would
+                                    // only ever time out — burning the whole `wait_timeout` and
+                                    // starving the adoption activation-and-parked-shard check that
+                                    // runs afterwards. Same reasoning as the explicit-placement branch
+                                    // above.
+                                    if op.create_collection.adopt_shards_from.is_none() {
+                                        for (shard_id, peer_ids) in &shard_distribution.distribution
+                                        {
+                                            for peer_id in peer_ids {
+                                                expect_operations.push(
+                                                    ConsensusOperations::initialize_replica(
+                                                        op.collection_name.clone(),
+                                                        *shard_id,
+                                                        *peer_id,
+                                                    ),
+                                                );
+                                            }
                                         }
                                     }
 
@@ -389,8 +455,34 @@ impl Dispatcher {
                 }
             }
 
+            // After a restore, wait (best-effort) for the placed replicas to activate. This does
+            // NOT fail the create if some are still parked: a large adopted shard may still be
+            // loading, and failing would report a still-loading restore as broken. Instead it warns
+            // and names the not-yet-Active replicas (see `report_parked_adopted_shards`); the caller
+            // polls `GET /collections/{name}/cluster` for readiness. Note this only observes the
+            // proposing peer's view of replica states; a remote peer whose Phase A failed surfaces
+            // its error in that peer's log, not in this request's result.
+            if let Some(collection_name) = adopted_collection {
+                let remaining_timeout =
+                    wait_timeout.map(|timeout| timeout.saturating_sub(start.elapsed()));
+                self.report_parked_adopted_shards(&collection_name, remaining_timeout)
+                    .await?;
+            }
+
             Ok(res)
         } else {
+            // Single node: there is no distribution to steer, so a placement request is a
+            // misunderstanding — refuse it rather than silently create everything locally.
+            // `adopt_shards_from` still works: every shard is local.
+            if let CollectionMetaOperations::CreateCollection(op) = &operation
+                && op.create_collection.shard_placement.is_some()
+            {
+                return Err(StorageError::bad_request(
+                    "`shard_placement` requires cluster mode; on a single node every shard \
+                     is local and there is no placement to choose",
+                ));
+            }
+
             let toc = self.toc.clone();
             tokio::task::spawn(async move { toc.perform_collection_meta_op(operation).await })
                 .await?
@@ -475,6 +567,121 @@ impl Dispatcher {
         Ok(())
     }
 
+    /// After a one-call restore, wait (best-effort) for the adopted replicas to activate, so a
+    /// small restore returns fully green in the single create call.
+    ///
+    /// Adoption loads each replica off the apply thread and `sync_local_state` drives it from
+    /// `ManualRecovery` to `Active` once its data is in place (see the reconciler and the
+    /// activation marker). A large (10B-scale) load can outlast any request budget, so if the wait
+    /// elapses with replicas still parked this does **not** fail the create — that would report a
+    /// still-loading restore as broken, exactly the mistake the manual restore path avoids by
+    /// loading at startup and verifying by polling. Instead it logs a warning naming the
+    /// not-yet-`Active` replicas and returns `Ok`: the collection is created and the background
+    /// reconciler finishes activation. The caller verifies readiness by polling
+    /// `GET /collections/{name}/cluster` until every shard reports `Active` — NOT by the overall
+    /// collection status, which for an adopted collection may rest at `grey` (if no optimizer has
+    /// run on the pre-built segments it does not necessarily reach `green`), so the status color is
+    /// not a reliable readiness signal. A still-parked shard is therefore visible via its state,
+    /// never silently serving part of the keyspace. Genuinely un-adoptable artifacts — missing or
+    /// topology/shape-mismatched — already fail synchronously in Phase A.
+    async fn report_parked_adopted_shards(
+        &self,
+        collection_name: &str,
+        timeout: Option<Duration>,
+    ) -> Result<(), StorageError> {
+        // Floor the wait: the caller passes the operation's *remaining* budget, which an earlier
+        // `await_consensus_sync` on a busy cluster can drive to (near) zero. Adoption now loads
+        // off the apply thread, so this check is the *only* wait for activation — a near-zero or
+        // tiny-but-nonzero budget must not make every `wait_for_state` return instantly and report
+        // a still-loading (healthy) replica as parked. Floor to a real minimum, and keep any
+        // larger remaining budget (which is how a large restore gets enough time: pass a
+        // correspondingly large operation timeout for big adopted shards).
+        let timeout = timeout
+            .map(|budget| budget.max(CONSENSUS_META_OP_WAIT))
+            .unwrap_or(CONSENSUS_META_OP_WAIT);
+
+        // If the collection was deleted between the committed create and this post-check, there is
+        // nothing to report — the create still happened, so report success rather than surfacing a
+        // "collection not found" as the create's outcome.
+        let collection = match self
+            .toc
+            .get_collection(&CollectionMultipass.issue_pass(collection_name))
+            .await
+        {
+            Ok(collection) => collection,
+            Err(StorageError::NotFound { .. }) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+
+        // Collect the wait futures under the read lock, then drop it before awaiting so consensus
+        // apply can keep updating replica states while we wait.
+        let mut wait_for_active = FuturesUnordered::new();
+        {
+            let shard_holder = collection.shards_holder().read_owned().await;
+            for (_shard_id, replica_set) in shard_holder.get_shards() {
+                for (peer_id, replica_state) in replica_set.peers() {
+                    // Only wait on replicas that can still reach `Active` on their own — a still-
+                    // loading `ManualRecovery` shard. A `Dead` replica (a definitively-failed
+                    // adoption) will not self-activate, so waiting on it would burn the entire
+                    // (large) timeout for nothing; it is reported as parked directly in the re-read
+                    // below. This also bounds how many `wait_for_state` waiters are spawned.
+                    if replica_state != ReplicaState::Active && replica_state != ReplicaState::Dead
+                    {
+                        wait_for_active.push(replica_set.wait_for_state(
+                            peer_id,
+                            ReplicaState::Active,
+                            timeout,
+                        ));
+                    }
+                }
+            }
+        }
+        // Best-effort: a missing artifact never activates, so ignore individual timeouts and let
+        // the re-read below decide.
+        while let Some(_result) = wait_for_active.next().await {}
+
+        // Re-read the (now-updated) states and report anything still parked.
+        let mut parked = Vec::new();
+        {
+            let shard_holder = collection.shards_holder().read_owned().await;
+            for (shard_id, replica_set) in shard_holder.get_shards() {
+                for (peer_id, replica_state) in replica_set.peers() {
+                    if replica_state != ReplicaState::Active {
+                        parked.push(format!(
+                            "shard {shard_id} on peer {peer_id} ({replica_state:?})"
+                        ));
+                    }
+                }
+            }
+        }
+
+        if parked.is_empty() {
+            return Ok(());
+        }
+
+        // Do not fail the create: a large adopted shard may still be loading, and the background
+        // reconciler will activate it. Warn (so the operator sees which replicas are not yet
+        // serving) and return success — the collection's status stays non-green until every shard
+        // is `Active`, so a partial restore is visible via polling rather than a false failure.
+        parked.sort();
+        log::warn!(
+            "collection `{collection_name}` was created, but {} shard replica(s) across the \
+             cluster are not yet Active after waiting {}s: {}. Adopted shards load off the apply \
+             thread and are activated in the background, so for a large shard this is expected \
+             while the load finishes — poll `GET /collections/{collection_name}/cluster` until \
+             every shard reports `Active` (the overall collection status may rest at `grey` for an \
+             adopted collection rather than reaching `green`, so watch the per-shard states, not \
+             the status color). A replica that stays parked indefinitely has a missing artifact (from \
+             its peer's `storage.shard_adoption_path`) or a failed load: stage the artifact and \
+             recover the shard via `adopt://` snapshot recovery, or drop and recreate the \
+             collection from a fully-staged source.",
+            parked.len(),
+            timeout.as_secs(),
+            parked.join("; "),
+        );
+        Ok(())
+    }
+
     pub fn all_hw_metrics(&self) -> HashMap<String, HardwareUsage> {
         self.toc.all_hw_metrics()
     }
@@ -512,9 +719,60 @@ fn check_hash_ring_shard_scale_requestable(
     )))
 }
 
+/// Reject explicit shard placement until every cluster peer supports it.
+fn check_shard_adoption_fields_requestable(
+    collection_name: &str,
+    has_placement: bool,
+    has_adopt: bool,
+    supported: bool,
+) -> Result<(), StorageError> {
+    if supported || (!has_placement && !has_adopt) {
+        return Ok(());
+    }
+
+    let fields = match (has_placement, has_adopt) {
+        (true, true) => "`shard_placement` and `adopt_shards_from`",
+        (true, false) => "`shard_placement`",
+        (false, true) => "`adopt_shards_from`",
+        (false, false) => unreachable!("guarded above"),
+    };
+    Err(StorageError::bad_request(format!(
+        "{fields} for collection {collection_name} require every peer to run this Qdrant fork \
+         (build `{}`) at version >= {}.  Ensure every peer runs the fork build, then retry.",
+        common::defaults::QDRANT_FORK_BUILD_TAG,
+        *collection::hash_ring::SHARD_ADOPTION_VERSION,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one-call-restore fields are refused on a not-fully-upgraded cluster, allowed once
+    /// every peer supports them, and never get in the way when unset.
+    #[test]
+    fn shard_adoption_fields_gate() {
+        // Supported everywhere → always allowed.
+        for (p, a) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert!(
+                check_shard_adoption_fields_requestable("c", p, a, true).is_ok(),
+                "supported cluster must allow ({p}, {a})",
+            );
+        }
+        // Not supported, but neither field set → allowed (nothing to carry).
+        assert!(check_shard_adoption_fields_requestable("c", false, false, false).is_ok());
+        // Not supported, a field set → refused, naming the field(s).
+        let err = check_shard_adoption_fields_requestable("c", true, false, false).unwrap_err();
+        assert!(err.to_string().contains("shard_placement"), "got: {err}");
+        let err = check_shard_adoption_fields_requestable("c", false, true, false).unwrap_err();
+        assert!(err.to_string().contains("adopt_shards_from"), "got: {err}");
+        let err = check_shard_adoption_fields_requestable("c", true, true, false).unwrap_err();
+        assert!(
+            err.to_string().contains("shard_placement")
+                && err.to_string().contains("adopt_shards_from"),
+            "got: {err}",
+        );
+    }
 
     /// A create request must be refused only when it asks for a scale that consensus cannot carry
     /// safely yet. Getting any cell of this wrong is either a silent split-brain (accepting when it

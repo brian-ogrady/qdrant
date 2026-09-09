@@ -26,6 +26,7 @@ use crate::content_manager::collection_meta_ops::{
     UpdateCollection, UpdateCollectionOperation,
 };
 use crate::content_manager::errors::StorageError;
+use crate::content_manager::shard_distribution::PeerRef;
 use crate::types::{ConsensusThreadStatus, StateRole};
 
 impl From<StorageError> for Status {
@@ -101,6 +102,9 @@ impl TryFrom<grpc::CreateCollection> for CollectionMetaOperations {
             strict_mode_config,
             metadata,
             hash_ring_shard_scale,
+            shard_placement,
+            adopt_shards_from,
+            adopt_allow_config_rebuild,
         } = value;
         let op = CreateCollectionOperation::new(
             collection_name,
@@ -132,6 +136,25 @@ impl TryFrom<grpc::CreateCollection> for CollectionMetaOperations {
                 // `None` leaves it for `submit_collection_meta_op` to fill in from the service
                 // default, resolved once there so every peer applies the same number.
                 hash_ring_shard_scale,
+                // gRPC uses an empty map to mean "no explicit placement" (proto3 maps aren't
+                // optional); translate that to `None` so it takes the auto distribution.
+                shard_placement: (!shard_placement.is_empty())
+                    .then(|| {
+                        shard_placement
+                            .into_iter()
+                            .map(|(shard_id, placement)| {
+                                let peers = placement
+                                    .peers
+                                    .into_iter()
+                                    .map(peer_ref_from_proto)
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                Ok((shard_id, peers))
+                            })
+                            .collect::<Result<std::collections::BTreeMap<_, _>, Status>>()
+                    })
+                    .transpose()?,
+                adopt_shards_from,
+                adopt_allow_config_rebuild,
                 metadata: if metadata.is_empty() {
                     None
                 } else {
@@ -140,6 +163,19 @@ impl TryFrom<grpc::CreateCollection> for CollectionMetaOperations {
             },
         )?;
         Ok(CollectionMetaOperations::CreateCollection(op))
+    }
+}
+
+/// Convert one gRPC placement peer (a `peer_id`-or-`uri` oneof) to a `PeerRef`. A peer with
+/// neither set is a malformed request.
+fn peer_ref_from_proto(peer: grpc::ShardPlacementPeer) -> Result<PeerRef, Status> {
+    use grpc::shard_placement_peer::Peer;
+    match peer.peer {
+        Some(Peer::PeerId(id)) => Ok(PeerRef::Id(id)),
+        Some(Peer::Uri(uri)) => Ok(PeerRef::Uri(uri)),
+        None => Err(Status::invalid_argument(
+            "shard_placement peer must set either peer_id or uri",
+        )),
     }
 }
 
@@ -466,6 +502,81 @@ mod tests {
     fn test_grpc_update_collection_rejects_pinned_memory() {
         assert_rejected(update_request(Some(grpc::Memory::Pinned), None).try_into());
         assert_rejected(update_request(None, Some(grpc::Memory::Pinned)).try_into());
+    }
+
+    /// gRPC `shard_placement` (map of shard -> peers, each a peer_id-or-uri oneof) and
+    /// `adopt_shards_from` must reach the create operation, or a gRPC one-call restore would
+    /// silently ignore them and fall back to auto-distribution + empty shards.
+    #[test]
+    fn test_grpc_create_collection_carries_placement_and_adoption() {
+        use grpc::shard_placement_peer::Peer;
+
+        let mut req = create_request(None, None);
+        req.shard_number = Some(2);
+        req.replication_factor = Some(1);
+        req.adopt_shards_from = Some("web".to_string());
+        req.shard_placement = std::collections::HashMap::from([
+            (
+                0,
+                grpc::ShardPlacement {
+                    peers: vec![grpc::ShardPlacementPeer {
+                        peer: Some(Peer::PeerId(42)),
+                    }],
+                },
+            ),
+            (
+                1,
+                grpc::ShardPlacement {
+                    peers: vec![grpc::ShardPlacementPeer {
+                        peer: Some(Peer::Uri("http://n:6335".into())),
+                    }],
+                },
+            ),
+        ]);
+
+        let op: CollectionMetaOperations = req.try_into().unwrap();
+        let CollectionMetaOperations::CreateCollection(op) = op else {
+            panic!("expected CreateCollection");
+        };
+        assert_eq!(
+            op.create_collection.adopt_shards_from.as_deref(),
+            Some("web")
+        );
+        let placement = op
+            .create_collection
+            .shard_placement
+            .expect("placement carried");
+        assert_eq!(placement[&0], vec![PeerRef::Id(42)]);
+        assert_eq!(
+            placement[&1],
+            vec![PeerRef::Uri("http://n:6335".to_string())]
+        );
+    }
+
+    /// An empty gRPC map means "no explicit placement" (proto3 maps aren't optional), and a
+    /// peer with neither id nor uri is malformed.
+    #[test]
+    fn test_grpc_placement_empty_is_none_and_blank_peer_rejected() {
+        let none: CollectionMetaOperations = create_request(None, None).try_into().unwrap();
+        let CollectionMetaOperations::CreateCollection(op) = none else {
+            unreachable!()
+        };
+        assert!(
+            op.create_collection.shard_placement.is_none(),
+            "empty map -> None"
+        );
+
+        let mut req = create_request(None, None);
+        req.shard_number = Some(1);
+        req.replication_factor = Some(1);
+        req.shard_placement = std::collections::HashMap::from([(
+            0,
+            grpc::ShardPlacement {
+                peers: vec![grpc::ShardPlacementPeer { peer: None }],
+            },
+        )]);
+        let err = TryInto::<CollectionMetaOperations>::try_into(req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     /// The scale has to survive this conversion rather than being dropped on the floor, because the

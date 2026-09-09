@@ -9768,6 +9768,27 @@
             "maximum": 100000,
             "minimum": 1,
             "nullable": true
+          },
+          "shard_placement": {
+            "description": "Explicit shard placement that overrides the automatic even distribution. Requires cluster mode, `sharding_method: auto`, and explicit `shard_number` and `replication_factor` matching the placement exactly.",
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/PeerRef"
+              }
+            },
+            "nullable": true
+          },
+          "adopt_shards_from": {
+            "description": "A relative path for fully built shard directories under each peer's configured staging root; every peer that is assigned a replica must have the matching artifact staged, or its part of the creation fails (the artifact, if any, is left in place). Combine with `shard_placement` to put shards where their data already is.",
+            "type": "string",
+            "nullable": true
+          },
+          "adopt_allow_config_rebuild": {
+            "description": "Opt-in override for `adopt_shards_from`: proceed even when the collection's HNSW / quantization config differs from what the artifacts were built with. By default such a mismatch is refused, because it makes the optimizer rebuild every adopted segment (expensive at scale) and is usually an accidental config change. Set to `true` only when the reconfiguration-on-adopt is intended.",
+            "type": "boolean",
+            "nullable": true
           }
         }
       },
@@ -10076,6 +10097,19 @@
             "nullable": true
           }
         }
+      },
+      "PeerRef": {
+        "description": "A peer named in an explicit `shard_placement`: by numeric id, or by the p2p URI the peer was started with (`--uri`, as listed by the `/cluster` endpoint).",
+        "anyOf": [
+          {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          {
+            "type": "string"
+          }
+        ]
       },
       "UpdateCollection": {
         "description": "Operation for updating parameters of the existing collection",
