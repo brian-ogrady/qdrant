@@ -1130,6 +1130,7 @@ impl SegmentBuilder {
                     payload_index: payload_index_arc.clone(),
                     path: &vector_index_path,
                     stopped,
+                    num_threads: permit.num_cpus as usize,
                     tick_progress: || (),
                 })?;
 

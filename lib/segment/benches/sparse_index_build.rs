@@ -94,6 +94,7 @@ fn sparse_vector_index_build_benchmark(c: &mut Criterion) {
                     payload_index: wrapped_payload_index.clone(),
                     path: index_dir.path(),
                     stopped: &stopped,
+                    num_threads: 1,
                     tick_progress: || (),
                 })
                 .unwrap();
@@ -111,6 +112,7 @@ fn sparse_vector_index_build_benchmark(c: &mut Criterion) {
             payload_index: wrapped_payload_index,
             path: index_dir.path(),
             stopped: &stopped,
+            num_threads: 1,
             tick_progress: || (),
         })
         .unwrap();

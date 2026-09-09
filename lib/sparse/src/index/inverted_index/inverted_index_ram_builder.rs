@@ -2,6 +2,7 @@ use std::cmp::max;
 
 use common::types::PointOffsetType;
 use log::debug;
+use rayon::prelude::*;
 
 use crate::common::sparse_vector::RemappedSparseVector;
 use crate::index::inverted_index::inverted_index_ram::InvertedIndexRam;
@@ -47,6 +48,14 @@ impl InvertedIndexBuilder {
 
     /// Consumes the builder and returns an InvertedIndexRam
     pub fn build(self) -> InvertedIndexRam {
+        self.build_with_threads(1)
+    }
+
+    /// Finalize independent posting lists using at most `num_threads` workers.
+    ///
+    /// Indexed Rayon collection retains the dimension order, so this produces the same inverted
+    /// index as [`Self::build`] while parallelizing the per-posting sort and WAND-bound pass.
+    pub fn build_with_threads(self, num_threads: usize) -> InvertedIndexRam {
         if self.posting_builders.is_empty() {
             return InvertedIndexRam {
                 postings: vec![],
@@ -65,10 +74,24 @@ impl InvertedIndexBuilder {
             self.posting_builders.len(),
         );
 
-        let mut postings = Vec::with_capacity(self.posting_builders.len());
-        for posting_builder in self.posting_builders {
-            postings.push(posting_builder.build());
-        }
+        let threads = num_threads.clamp(1, self.posting_builders.len());
+        let postings = if threads == 1 {
+            self.posting_builders
+                .into_iter()
+                .map(PostingBuilder::build)
+                .collect()
+        } else {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("a positive sparse-index thread count must create a Rayon pool")
+                .install(|| {
+                    self.posting_builders
+                        .into_par_iter()
+                        .map(PostingBuilder::build)
+                        .collect()
+                })
+        };
 
         let vector_count = self.vector_count;
         let total_sparse_size = self.total_sparse_size;

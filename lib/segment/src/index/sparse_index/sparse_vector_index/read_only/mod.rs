@@ -165,6 +165,7 @@ impl<S: UniversalReadExt> ReadOnlySparseVectorIndex<S, InvertedIndexRam> {
             &*id_tracker.borrow(),
             &*vector_storage.borrow(),
             &stopped,
+            1,
             || (),
         )?;
         // Mirroring `plan()` means mirroring the `wand_pruning` policy too, not just the rebuild.

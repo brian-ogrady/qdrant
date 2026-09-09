@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 use atomic_refcell::AtomicRefCell;
 #[cfg(feature = "testing")]
@@ -75,6 +76,7 @@ pub struct SparseVectorIndexOpenArgs<'a, Fs: UniversalReadFs, F: FnMut()> {
     pub payload_index: Arc<AtomicRefCell<StructPayloadIndex>>,
     pub path: &'a Path,
     pub stopped: &'a AtomicBool,
+    pub num_threads: usize,
     pub tick_progress: F,
 }
 
@@ -109,6 +111,7 @@ fn build_ram_index(
     id_tracker: &impl IdTrackerRead,
     vector_storage: &impl VectorStorageRead,
     stopped: &AtomicBool,
+    num_threads: usize,
     mut tick_progress: impl FnMut(),
 ) -> OperationResult<(InvertedIndexRam, IndicesTracker)> {
     let deleted_bitslice = vector_storage.deleted_vector_bitslice();
@@ -123,6 +126,8 @@ fn build_ram_index(
 
     let mut ram_index_builder = InvertedIndexBuilder::new();
     let mut indices_tracker = IndicesTracker::default();
+    let scan_started = Instant::now();
+    let mut vectors_read = 0usize;
 
     // One batched, ascending pass over the stored vectors.
     //
@@ -152,11 +157,21 @@ fn build_ram_index(
             let vector = indices_tracker.remap_vector(vector.to_owned());
             ram_index_builder.add(id, vector);
         }
+        vectors_read += 1;
         tick_progress();
     });
     result?;
 
-    Ok((ram_index_builder.build(), indices_tracker))
+    let scan_elapsed = scan_started.elapsed();
+    let finalize_started = Instant::now();
+    let ram_index = ram_index_builder.build_with_threads(num_threads);
+    log::info!(
+        "sparse index build: scanned/remapped {vectors_read} vector(s) into {} posting list(s) in {scan_elapsed:.1?}; finalized postings in {:.1?}",
+        ram_index.postings.len(),
+        finalize_started.elapsed(),
+    );
+
+    Ok((ram_index, indices_tracker))
 }
 
 impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
@@ -173,6 +188,7 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
             payload_index,
             path,
             stopped,
+            num_threads,
             tick_progress,
         } = args;
 
@@ -182,6 +198,7 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
             &vector_storage,
             path,
             stopped,
+            num_threads,
             tick_progress,
         )?;
         let (inverted_index, config, indices_tracker, persist) = match plan {
@@ -200,7 +217,12 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
                 indices_tracker,
                 persist,
             } => (
-                TInvertedIndex::from_ram_index(fs, Cow::Owned(ram_index), path)?,
+                TInvertedIndex::from_ram_index_parallel(
+                    fs,
+                    Cow::Owned(ram_index),
+                    path,
+                    num_threads,
+                )?,
                 config,
                 indices_tracker,
                 persist,
@@ -244,6 +266,7 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
         vector_storage: &AtomicRefCell<VectorStorageEnum>,
         path: &Path,
         stopped: &AtomicBool,
+        num_threads: usize,
         tick_progress: impl FnMut(),
     ) -> OperationResult<SparseOpenPlan> {
         if !config.index_type.is_persisted() {
@@ -253,6 +276,7 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
                 &*id_tracker.borrow(),
                 &*vector_storage.borrow(),
                 stopped,
+                num_threads,
                 tick_progress,
             )?;
             // The mutable RAM index is the only sparse index that maintains `max_next_weight`,
@@ -292,6 +316,7 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
             &*id_tracker.borrow(),
             &*vector_storage.borrow(),
             stopped,
+            num_threads,
             tick_progress,
         )?;
         Ok(SparseOpenPlan::Build {

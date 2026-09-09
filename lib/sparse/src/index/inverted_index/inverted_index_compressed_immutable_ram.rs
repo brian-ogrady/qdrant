@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::path::Path;
+use std::time::Instant;
 
 use blink_alloc::Blink;
 use common::counter::hardware_counter::HardwareCounterCell;
@@ -8,6 +9,7 @@ use common::types::PointOffsetType;
 use common::universal_io::{
     MmapFs, UioResult, UniversalRead, UniversalReadFs, UniversalWrite, UserData,
 };
+use rayon::prelude::*;
 
 use super::inverted_index_compressed_mmap::InvertedIndexCompressedMmap;
 use super::inverted_index_ram::InvertedIndexRam;
@@ -20,6 +22,7 @@ use crate::index::compressed_posting_list::{
 };
 use crate::index::inverted_index::inverted_index_compressed_mmap::Version;
 use crate::index::inverted_index::{InvertedIndexReadOnly, InvertedIndexReadWrite};
+use crate::index::posting_list::PostingList;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct InvertedIndexCompressedImmutableRam<W: Weight> {
@@ -51,15 +54,29 @@ impl<W: Weight, S: UniversalWrite + 'static> InvertedIndexReadWrite<S>
         _fs: &S::Fs,
         ram_index: Cow<InvertedIndexRam>,
         _path: P,
+        num_threads: usize,
     ) -> UioResult<Self> {
-        let mut postings = Vec::with_capacity(ram_index.postings.len());
-        for old_posting_list in &ram_index.postings {
-            let mut new_posting_list = CompressedPostingBuilder::new();
-            for elem in &old_posting_list.elements {
-                new_posting_list.add(elem.record_id, elem.weight);
-            }
-            postings.push(new_posting_list.build());
-        }
+        let compression_started = Instant::now();
+        let threads = num_threads.clamp(1, ram_index.postings.len().max(1));
+        let postings: Vec<CompressedPostingList<W>> = if threads == 1 {
+            ram_index
+                .postings
+                .iter()
+                .map(compress_posting::<W>)
+                .collect()
+        } else {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("a positive sparse-index thread count must create a Rayon pool")
+                .install(|| {
+                    ram_index
+                        .postings
+                        .par_iter()
+                        .map(compress_posting::<W>)
+                        .collect()
+                })
+        };
 
         let hw_counter = HardwareCounterCell::disposable();
 
@@ -68,12 +85,27 @@ impl<W: Weight, S: UniversalWrite + 'static> InvertedIndexReadWrite<S>
             .map(|p| p.view(&hw_counter).store_size().total)
             .sum();
 
+        log::info!(
+            "sparse index build: compressed {} posting list(s) in {:.1?}",
+            postings.len(),
+            compression_started.elapsed(),
+        );
+
         Ok(InvertedIndexCompressedImmutableRam {
             postings,
             vector_count: ram_index.vector_count,
             total_sparse_size,
         })
     }
+}
+
+/// Compress one independent posting list. The caller preserves the outer dimension order.
+fn compress_posting<W: Weight>(old_posting_list: &PostingList) -> CompressedPostingList<W> {
+    let mut new_posting_list = CompressedPostingBuilder::new();
+    for elem in &old_posting_list.elements {
+        new_posting_list.add(elem.record_id, elem.weight);
+    }
+    new_posting_list.build()
 }
 
 impl<W: Weight> InvertedIndex for InvertedIndexCompressedImmutableRam<W> {
@@ -198,11 +230,17 @@ impl<W: Weight> InvertedIndexCompressedImmutableRam<W> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
+    use common::universal_io::MmapFile;
+    use rand::SeedableRng as _;
+    use rand::rngs::SmallRng;
     use tempfile::Builder;
 
     use super::*;
     use crate::common::sparse_vector_fixture::random_sparse_vector;
     use crate::common::types::QuantizedU8;
+    use crate::index::inverted_index::INDEX_FILE_NAME;
     use crate::index::inverted_index::inverted_index_ram_builder::InvertedIndexBuilder;
 
     #[test]
@@ -233,6 +271,161 @@ mod tests {
         check_save_load::<half::f16>(&inverted_index_ram);
         check_save_load::<u8>(&inverted_index_ram);
         check_save_load::<QuantizedU8>(&inverted_index_ram);
+    }
+
+    #[test]
+    fn parallel_finalization_and_compression_match_single_threaded_output() {
+        let build_ram_index = |num_threads| {
+            let mut builder = InvertedIndexBuilder::new();
+            for point_id in 0..1_024 {
+                builder.add(
+                    point_id,
+                    vec![
+                        (point_id % 11, point_id as f32),
+                        (32 + (point_id % 31), point_id as f32 / 2.0),
+                    ]
+                    .try_into()
+                    .unwrap(),
+                );
+            }
+            builder.build_with_threads(num_threads)
+        };
+
+        let single_threaded = build_ram_index(1);
+        let parallel = build_ram_index(4);
+        assert_eq!(single_threaded, parallel);
+
+        let output_dir = Builder::new()
+            .prefix("sparse-parallel-output")
+            .tempdir()
+            .unwrap();
+        let single_threaded = InvertedIndexCompressedImmutableRam::<f32>::from_ram_index(
+            &MmapFs,
+            Cow::Borrowed(&single_threaded),
+            output_dir.path(),
+        )
+        .unwrap();
+        let parallel = InvertedIndexCompressedImmutableRam::<f32>::from_ram_index_parallel(
+            &MmapFs,
+            Cow::Borrowed(&parallel),
+            output_dir.path(),
+            4,
+        )
+        .unwrap();
+        assert_eq!(single_threaded, parallel);
+    }
+
+    /// Local sizing/profile aid for the shard builder's immutable sparse-index path.
+    ///
+    /// Run with:
+    /// `cargo test -p sparse --release profile_sparse_index_build_scaling -- --ignored --nocapture`
+    ///
+    /// This deliberately starts with `(point id, sparse vector)` pairs, after the segment layer
+    /// has read storage and remapped dimensions. It therefore profiles the one-pass posting
+    /// build, compression, and mmap persistence — the phases relevant to deciding whether
+    /// posting-list parallelism is worthwhile — but not storage scan/remapping.
+    #[test]
+    #[ignore = "local performance profile; run explicitly in release mode"]
+    fn profile_sparse_index_build_scaling() {
+        const MAX_DIMENSION: usize = 10_000;
+
+        for vector_count in [25_000usize, 100_000, 200_000] {
+            let mut rng = SmallRng::seed_from_u64(0x5A17_5EED);
+
+            let generate_started = Instant::now();
+            let vectors = (0..vector_count)
+                .map(|_| random_sparse_vector(&mut rng, MAX_DIMENSION).into_remapped())
+                .collect::<Vec<_>>();
+            let generate_elapsed = generate_started.elapsed();
+
+            let build = |num_threads| {
+                let accumulate_started = Instant::now();
+                let mut builder = InvertedIndexBuilder::new();
+                for (point_id, vector) in vectors.iter().cloned().enumerate() {
+                    builder.add(point_id as u32, vector);
+                }
+                let accumulate_elapsed = accumulate_started.elapsed();
+
+                let finalize_started = Instant::now();
+                let ram_index = builder.build_with_threads(num_threads);
+                (ram_index, accumulate_elapsed, finalize_started.elapsed())
+            };
+
+            let (single_threaded_ram, single_accumulate, single_finalize) = build(1);
+            let compress_started = Instant::now();
+            let single_threaded = InvertedIndexCompressedImmutableRam::<f32>::from_ram_index(
+                &MmapFs,
+                Cow::Borrowed(&single_threaded_ram),
+                Builder::new()
+                    .prefix("sparse-profile-ram")
+                    .tempdir()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap();
+            let single_compress = compress_started.elapsed();
+            drop(single_threaded);
+            drop(single_threaded_ram);
+
+            let (ram_index, parallel_accumulate, parallel_finalize) = build(4);
+            let compress_started = Instant::now();
+            let immutable = InvertedIndexCompressedImmutableRam::<f32>::from_ram_index_parallel(
+                &MmapFs,
+                Cow::Borrowed(&ram_index),
+                Builder::new()
+                    .prefix("sparse-profile-ram")
+                    .tempdir()
+                    .unwrap()
+                    .path(),
+                4,
+            )
+            .unwrap();
+            let parallel_compress = compress_started.elapsed();
+
+            drop(immutable);
+            drop(ram_index);
+
+            let (ram_index, parallel_16_accumulate, parallel_16_finalize) = build(16);
+            let compress_started = Instant::now();
+            let immutable = InvertedIndexCompressedImmutableRam::<f32>::from_ram_index_parallel(
+                &MmapFs,
+                Cow::Borrowed(&ram_index),
+                Builder::new()
+                    .prefix("sparse-profile-ram")
+                    .tempdir()
+                    .unwrap()
+                    .path(),
+                16,
+            )
+            .unwrap();
+            let parallel_16_compress = compress_started.elapsed();
+
+            let output = Builder::new()
+                .prefix("sparse-profile-mmap")
+                .tempdir()
+                .unwrap();
+            let write_started = Instant::now();
+            InvertedIndexCompressedMmap::<f32, MmapFile>::convert_and_save(
+                &MmapFs,
+                &immutable,
+                output.path(),
+            )
+            .unwrap();
+            let write_elapsed = write_started.elapsed();
+            let bytes = fs_err::metadata(output.path().join(INDEX_FILE_NAME))
+                .unwrap()
+                .len();
+
+            eprintln!(
+                "sparse profile: vectors={vector_count}, postings={}, bytes={bytes}, \
+                 generate={generate_elapsed:.3?}, \
+                 single(accumulate={single_accumulate:.3?}, finalize={single_finalize:.3?}, compress={single_compress:.3?}), \
+                 parallel-4(accumulate={parallel_accumulate:.3?}, finalize={parallel_finalize:.3?}, compress={parallel_compress:.3?}), \
+                 parallel-16(accumulate={parallel_16_accumulate:.3?}, finalize={parallel_16_finalize:.3?}, compress={parallel_16_compress:.3?}), \
+                 write={write_elapsed:.3?}",
+                ram_index.postings.len(),
+            );
+        }
     }
 
     fn check_save_load<W: Weight>(inverted_index_ram: &InvertedIndexRam) {

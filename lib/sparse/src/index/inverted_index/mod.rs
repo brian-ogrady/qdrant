@@ -40,6 +40,7 @@ pub trait InvertedIndexReadWrite<S: UniversalWrite>: InvertedIndex {
         fs: &S::Fs,
         ram_index: Cow<InvertedIndexRam>,
         path: P,
+        num_threads: usize,
     ) -> UioResult<Self>;
 }
 
@@ -128,7 +129,22 @@ pub trait InvertedIndex: Sized + Debug + 'static {
         Self: InvertedIndexReadWrite<Fs::File>,
         Fs::File: UniversalWrite<Fs = Fs>,
     {
-        Self::from_ram_index_impl(fs, ram_index, path)
+        Self::from_ram_index_impl(fs, ram_index, path, 1)
+    }
+
+    /// Like [`Self::from_ram_index`], but permits independent posting lists to be compressed in
+    /// parallel. The persisted order remains unchanged.
+    fn from_ram_index_parallel<P: AsRef<Path>, Fs: UniversalReadFs>(
+        fs: &Fs,
+        ram_index: Cow<InvertedIndexRam>,
+        path: P,
+        num_threads: usize,
+    ) -> UioResult<Self>
+    where
+        Self: InvertedIndexReadWrite<Fs::File>,
+        Fs::File: UniversalWrite<Fs = Fs>,
+    {
+        Self::from_ram_index_impl(fs, ram_index, path, num_threads.max(1))
     }
 
     /// Number of indexed vectors

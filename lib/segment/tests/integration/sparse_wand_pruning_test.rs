@@ -81,6 +81,7 @@ fn open_index(
         payload_index: wrapped_payload_index,
         path: index_dir,
         stopped: &stopped,
+        num_threads: 1,
         tick_progress: || (),
     })
 }

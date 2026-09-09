@@ -189,6 +189,7 @@ fn sparse_index_discover_test() {
         payload_index: payload_index_ptr,
         path: index_dir.path(),
         stopped: &stopped,
+        num_threads: 1,
         tick_progress: || (),
     })
     .unwrap();
@@ -311,6 +312,7 @@ fn sparse_index_hardware_measurement_test() {
         payload_index: payload_index_ptr,
         path: index_dir.path(),
         stopped: &stopped,
+        num_threads: 1,
         tick_progress: || (),
     })
     .unwrap();

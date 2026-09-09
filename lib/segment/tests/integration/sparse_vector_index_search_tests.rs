@@ -233,6 +233,7 @@ fn sparse_vector_index_consistent_with_storage() {
             payload_index: sparse_vector_ram_index.payload_index().clone(),
             path: mmap_index_dir.path(),
             stopped: &stopped,
+            num_threads: 1,
             tick_progress: || (),
         })
         .unwrap();
@@ -260,6 +261,7 @@ fn sparse_vector_index_consistent_with_storage() {
             payload_index: sparse_vector_ram_index.payload_index().clone(),
             path: mmap_index_dir.path(),
             stopped: &stopped,
+            num_threads: 1,
             tick_progress: || (),
         })
         .unwrap();
@@ -705,6 +707,7 @@ fn check_persistence<TInvertedIndex: InvertedIndexReadWrite<MmapFile>>(
             payload_index: segment.payload_index.clone(),
             path: inverted_index_dir.path(),
             stopped: &stopped,
+            num_threads: 1,
             tick_progress: || (),
         })
         .unwrap()

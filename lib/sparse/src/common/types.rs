@@ -9,8 +9,17 @@ pub type DimId = u32;
 pub type DimId64 = u64;
 pub type DimWeight = f32;
 
-pub trait Weight: PartialEq + Copy + Debug + FromBytes + Immutable + KnownLayout + 'static {
-    type QuantizationParams: Copy + PartialEq + Debug + FromBytes + Immutable + KnownLayout;
+pub trait Weight:
+    PartialEq + Copy + Debug + FromBytes + Immutable + KnownLayout + Send + Sync + 'static
+{
+    type QuantizationParams: Copy
+        + PartialEq
+        + Debug
+        + FromBytes
+        + Immutable
+        + KnownLayout
+        + Send
+        + Sync;
 
     #[cfg(feature = "testing")]
     const NAME: &'static str;

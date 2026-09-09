@@ -114,6 +114,7 @@ fn sparse_vector_index_search_benchmark_impl(
             payload_index: sparse_vector_index.payload_index().clone(),
             path: mmap_index_dir.path(),
             stopped: &stopped,
+            num_threads: 1,
             tick_progress: || pb.inc(1),
         })
         .unwrap();

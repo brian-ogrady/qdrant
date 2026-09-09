@@ -252,6 +252,7 @@ fn open_sparse_vector_data(
             payload_index: payload_index.clone(),
             path: &vector_index_path,
             stopped,
+            num_threads: 1,
             tick_progress: || (),
         },
     )?);

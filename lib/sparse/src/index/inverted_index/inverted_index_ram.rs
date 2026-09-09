@@ -53,6 +53,7 @@ impl<S: UniversalWrite> InvertedIndexReadWrite<S> for InvertedIndexRam {
         _fs: &<S as UniversalRead>::Fs,
         ram_index: Cow<InvertedIndexRam>,
         _path: P,
+        _num_threads: usize,
     ) -> UioResult<Self> {
         Ok(ram_index.into_owned())
     }

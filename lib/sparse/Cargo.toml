@@ -29,6 +29,7 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 ordered-float = { workspace = true }
 rand = { workspace = true }
+rayon = { workspace = true }
 validator = { workspace = true }
 itertools = { workspace = true }
 parking_lot = { workspace = true }

@@ -4,6 +4,7 @@ use std::io::{BufWriter, Write as _};
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use blink_alloc::Blink;
 use common::counter::hardware_counter::HardwareCounterCell;
@@ -156,11 +157,16 @@ impl<W: Weight, S: UniversalWrite + 'static> InvertedIndexReadWrite<S>
         fs: &<S as UniversalRead>::Fs,
         ram_index: Cow<InvertedIndexRam>,
         path: P,
+        num_threads: usize,
     ) -> UioResult<Self> {
         // The intermediate RAM index is built in memory; its no-op `MmapFs` is
         // irrelevant. The conversion writes through the real `fs`.
-        let index =
-            InvertedIndexCompressedImmutableRam::<W>::from_ram_index(&MmapFs, ram_index, &path)?;
+        let index = InvertedIndexCompressedImmutableRam::<W>::from_ram_index_parallel(
+            &MmapFs,
+            ram_index,
+            &path,
+            num_threads,
+        )?;
         Self::convert_and_save(fs, &index, path)
     }
 }
@@ -470,6 +476,7 @@ impl<W: Weight, S: UniversalRead + Debug + 'static> InvertedIndexCompressedMmap<
         index: &InvertedIndexCompressedImmutableRam<W>,
         path: P,
     ) -> UioResult<Self> {
+        let write_started = Instant::now();
         let total_posting_headers_size =
             index.postings.as_slice().len() * size_of::<PostingListFileHeader<W>>();
 
@@ -544,12 +551,21 @@ impl<W: Weight, S: UniversalRead + Debug + 'static> InvertedIndexCompressedMmap<
             Default::default(),
         )?;
 
-        Ok(Self {
+        let result = Self {
             path: path.as_ref().to_owned(),
             storage,
             file_header,
             _phantom: PhantomData,
-        })
+        };
+
+        log::info!(
+            "sparse index build: wrote {} posting list(s), {} byte(s), in {:.1?}",
+            result.file_header.posting_count,
+            file_length,
+            write_started.elapsed(),
+        );
+
+        Ok(result)
     }
 
     fn calculate_total_sparse_size(&self, hw_counter: &HardwareCounterCell) -> UioResult<usize> {

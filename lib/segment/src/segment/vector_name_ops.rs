@@ -186,6 +186,7 @@ impl Segment {
             payload_index: self.payload_index.clone(),
             path: &vector_index_path,
             stopped: &stopped,
+            num_threads: 1,
             tick_progress: || (),
         })?;
 
