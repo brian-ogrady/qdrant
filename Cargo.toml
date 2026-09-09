@@ -215,6 +215,9 @@ bytemuck = { version = "1.25.0", features = [
     "transparentwrapper_extra",
 ] }
 bytes = "1.11.1"
+# Only the offline shard builder (tools/shard-builder) reads Parquet; kept minimal.
+arrow = { version = "59", default-features = false }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd", "brotli", "lz4", "flate2-rust_backend"] }
 cc = "1.2"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
@@ -374,6 +377,7 @@ members = [
     "lib/trififo",
     "lib/uio-grpc-client",
     "lib/wal",
+    "tools/shard-builder",
 ]
 
 [profile.release]

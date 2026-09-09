@@ -1,0 +1,54 @@
+[package]
+name = "shard-builder"
+version = "0.1.0"
+authors = ["Qdrant Team <info@qdrant.tech>"]
+license = "Apache-2.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "qdrant-shard-builder"
+path = "src/main.rs"
+
+# Ported from the reference repo. Still to come: the S3 input backend adds `object_store`.
+[dependencies]
+# `collection` is depended on directly, rather than reimplementing the hash ring or
+# the config types, so that shard routing is computed by exactly the same code the
+# server uses. Build time is irrelevant for an offline tool; divergence is not.
+collection = { path = "../../lib/collection" }
+common = { path = "../../lib/common/common" }
+edge = { path = "../../lib/edge" }
+segment = { path = "../../lib/segment" }
+shard = { path = "../../lib/shard" }
+sparse = { path = "../../lib/sparse" }
+wal = { path = "../../lib/wal" }
+
+anyhow = { workspace = true }
+arrow = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+env_logger = { workspace = true }
+fs-err = { workspace = true }
+half = { workspace = true }
+indicatif = { workspace = true }
+log = { workspace = true }
+parquet = { workspace = true }
+# Needed by `SegmentBuilder::build`, which takes an RNG for HNSW level assignment.
+rand = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+serde = { workspace = true }
+# CBOR, not bincode: part-file records contain `#[serde(untagged)]` enums and
+# `serde_json::Value`, both of which need `deserialize_any`. Same reason Qdrant's WAL uses it.
+serde_cbor = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+# `v5` for deterministic segment UUIDs: a replan of the same inputs must name the same
+# segment directories, or a resumed build would redo finished work.
+uuid = { workspace = true, features = ["v5"] }
+validator = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
